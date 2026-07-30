@@ -1,10 +1,11 @@
 """
 FabricPC Transformer V2 Execution Script
 
-Trains the decomposed PC Transformer model on the Tiny Shakespeare dataset,
-evaluates its performance, and generates sample text using temperature sampling.
+Trains the decomposed PC Transformer model on WikiText-103 (BPE tokenization)
+or Tiny Shakespeare (Character-level tokenization), evaluates its performance,
+and generates sample text using temperature sampling.
 
-Architecture (each transformer block decomposed into separate PC nodes)::
+Architecture (each transformer block decomposed into separate PC nodes):
 
     input ──→ Embedding ──→ MhaResidual_0 ──→ LnMlp1_0 ──→ Mlp2Residual_0 ──→ ... ──→ VocabProjection
                                   ↑                              ↑
@@ -12,31 +13,24 @@ Architecture (each transformer block decomposed into separate PC nodes)::
 
     Each block: MhaResidual(in + mask) ──→ LnMlp1 ──→ Mlp2Residual(in + skip)
 
-Supports two training modes:
-  - Predictive Coding (PC): Local Hebbian learning with multi-GPU pmap support
-  - Backpropagation: Standard end-to-end gradient training (single device)
+Benchmark Results (WikiText-103, 2M-token slice, BPE tokenizer):
+------------------------------------------------------------------
+Configuration:
+  embed_dim=64, num_heads=8, mlp_dim=256, depth=2, seq_len=128,
+  batch_size=16, lr=1.35e-4, weight_init_std=0.01296, dropout_rate=0.175
+  PC-only: infer_steps=10, eta_infer=0.01381
+
+Empirical Performance (Predictive Coding vs Backprop Transformer):
+  Final train perplexity: 196.35 vs 68.57
+  Final test perplexity:  240.08 vs 106.07
+  Test accuracy:          12.71% vs 21.45%
+  Test CE loss:           5.4810 vs 4.6641
+  Training time:          15,686 s vs 3,189 s
 
 Usage:
-    PYTHONPATH=. python examples/transformer_v2_demo.py
-    PYTHONPATH=. python examples/transformer_v2_demo.py --mode backprop --lr 1e-3
-    PYTHONPATH=. python examples/transformer_v2_demo.py --mode pc --depth 6 --num_epochs 10
-
-
-Results (default call):
-Model parameters: 108,353
-Vocab Size: 65
-Train Epoch 1/5, Energy: 274.3637, Loss: 2.1401, Perplexity: 8.50
-Train Epoch 2/5, Energy: 260.0219, Loss: 2.0280, Perplexity: 7.60
-Train Epoch 3/5, Energy: 250.6280, Loss: 1.9546, Perplexity: 7.06
-Train Epoch 4/5, Energy: 244.7030, Loss: 1.9089, Perplexity: 6.75
-Train Epoch 5/5, Energy: 242.0046, Loss: 1.8878, Perplexity: 6.61
-Training completed in 8772.4s
-Evaluation completed in 55.2s
-Test Accuracy:   35.92%
-Test CE Loss:    2.2108
-Test Perplexity: 9.12
---- Generating ---
-ROMEO: whou sarone the bro beariers thas tray sucas a st my lo the to ate.
+    PYTHONPATH=. python examples/transformer_v2_demo.py --tokenizer bpe
+    PYTHONPATH=. python examples/transformer_v2_demo.py --mode backprop --tokenizer bpe
+    PYTHONPATH=. python examples/transformer_v2_demo.py --tokenizer char --num_epochs 5
 """
 
 from jax_setup import set_jax_flags_before_importing_jax
@@ -59,29 +53,27 @@ from fabricpc.nodes.transformer_v2 import create_deep_transformer
 from fabricpc.utils.data import CharDataLoader, BpeDataLoader
 import optax
 import time
+import os
+import json
+from diagnostics.plot_history import plot_single
 
-# Tuned on Tiny Shakespeare, BPE tokenizer (50k-sequence subset, val PPL ~1133).
-# NOTE: severe overfitting on this small corpus (train PPL ~85 vs test ~721),
-# from two compounding causes: BPE needs a larger corpus than Tiny Shakespeare,
-# and the model has no regularization (dropout / weight decay) yet. Placeholder
-# default, not a strong config; char-level remains recommended here. See Future
-# Work (regularization, larger BPE-suited datasets).
+# Tuned on WikiText-103 (2M-token slice), BPE tokenizer (vocab_size=8000).
 BPE_DEFAULTS = {
-    "embed_dim": 128,
-    "num_heads": 4,
-    "mlp_dim": 512,
-    "depth": 4,
-    "seq_len": 64,
-    "batch_size": 32,
+    "embed_dim": 64,
+    "num_heads": 8,
+    "mlp_dim": 256,
+    "depth": 2,
+    "seq_len": 128,
+    "batch_size": 16,
     "num_epochs": 5,
-    "infer_steps": 23,
-    "lr": 1.676456563307537e-05,
-    "eta_infer": 0.06558512264378524,
-    "weight_init_std": 0.039890499730518045,
+    "infer_steps": 10,
+    "lr": 0.0001345863556572305,
+    "eta_infer": 0.013807634865926306,
+    "weight_init_std": 0.012956684480545929,
+    "dropout_rate": 0.175,
 }
 
 # Tuned on Tiny Shakespeare, char tokenizer (two-phase search, val PPL 12.22).
-# Phase 1 fixed the architecture; Phase 2 refined lr / eta_infer / infer_steps.
 CHAR_DEFAULTS = {
     "embed_dim": 64,
     "num_heads": 8,
@@ -94,12 +86,13 @@ CHAR_DEFAULTS = {
     "lr": 0.00012108621644524519,
     "eta_infer": 0.0174852165627398,
     "weight_init_std": 0.015166293102182283,
+    "dropout_rate": 0.0,
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Decomposed PC Transformer on Tiny Shakespeare"
+        description="Decomposed PC Transformer on WikiText-103 or Tiny Shakespeare"
     )
     parser.add_argument(
         "--mode",
@@ -170,12 +163,24 @@ def parse_args():
         default=None,
         help="Weight init std (default: tuned per --tokenizer)",
     )
+    parser.add_argument(
+        "--dropout_rate",
+        type=float,
+        default=None,
+        help="Residual-branch dropout rate for transformer v2 (default: tuned per --tokenizer)",
+    )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help="Cap training sequences (e.g. 2000000) to bound a large BPE corpus",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--tokenizer",
         choices=["char", "bpe"],
         default="char",
-        help="Tokenizer to use",
+        help="Tokenizer to use (char: Tiny Shakespeare, bpe: WikiText-103)",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Print per-batch training energy"
@@ -215,6 +220,7 @@ def main(args=None):
             batch_size=batch_size,
             shuffle=True,
             seed=args.seed,
+            max_samples=args.max_train_samples,
         )
         test_loader = BpeDataLoader(
             "test", seq_len=args.seq_len, batch_size=batch_size, shuffle=False
@@ -233,7 +239,6 @@ def main(args=None):
 
     vocab_size = train_loader.vocab_size
     char_to_ix = train_loader.token_to_idx if use_bpe else train_loader.char_to_idx
-    ix_to_char = train_loader.idx_to_token if use_bpe else train_loader.idx_to_char
 
     # --- Model ---
     structure = create_deep_transformer(
@@ -250,6 +255,7 @@ def main(args=None):
             latent_decay=0.0,
         ),
         weight_init={"type": "normal", "std": args.weight_init_std},
+        dropout_rate=args.dropout_rate,
     )
 
     # --- Train & Evaluate ---
@@ -282,6 +288,27 @@ def main(args=None):
             )
         return energy
 
+    # Per-epoch metric history tracking
+    train_energy_hist = []
+    train_ppl_hist = []
+    test_ppl_hist = []
+    test_metrics_hist = []
+
+    eval_fn = evaluate_autoregressive if use_pc else evaluate_backprop_autoregressive
+
+    def epoch_callback(
+        epoch_idx, cb_params, cb_structure, cb_config, cb_rng, *, energy=None, ce_loss=None
+    ):
+        if energy is not None:
+            train_energy_hist.append(float(energy))
+        if ce_loss is not None:
+            train_ppl_hist.append(float(jnp.exp(ce_loss)))
+        m = eval_fn(cb_params, cb_structure, test_loader, train_config, cb_rng)
+        test_metrics_hist.append(m)
+        test_ppl_hist.append(float(m["perplexity"]))
+        print(f"  [epoch {epoch_idx + 1}] test perplexity: {m['perplexity']:.2f}")
+        return m["perplexity"]
+
     if use_pc:
         trained_params, _, _ = train_autoregressive(
             params,
@@ -292,6 +319,7 @@ def main(args=None):
             train_key,
             verbose=True,
             iter_callback=iter_callback,
+            epoch_callback=epoch_callback,
         )
     else:
         trained_params, _, _ = train_backprop_autoregressive(
@@ -302,25 +330,41 @@ def main(args=None):
             train_config,
             train_key,
             verbose=True,
+            epoch_callback=epoch_callback,
         )
 
     print(f"Training completed in {time.time() - start:.1f}s")
 
     # --- Evaluate ---
     eval_start = time.time()
-    if use_pc:
-        metrics = evaluate_autoregressive(
-            trained_params, structure, test_loader, train_config, eval_key
-        )
-    else:
-        metrics = evaluate_backprop_autoregressive(
-            trained_params, structure, test_loader, train_config, eval_key
-        )
+    metrics = (
+        test_metrics_hist[-1] 
+        if test_metrics_hist 
+        else eval_fn(trained_params, structure, test_loader, train_config, eval_key)
+    )
     print(f"Evaluation completed in {time.time() - eval_start:.1f}s")
 
     print(f"Test Accuracy:   {metrics['accuracy'] * 100:.2f}%")
     print(f"Test CE Loss:    {metrics['loss']:.4f}")
     print(f"Test Perplexity: {metrics['perplexity']:.2f}")
+
+    # Save metrics history & plot curves
+    plot_dir = "runs/plots"
+    os.makedirs(plot_dir, exist_ok=True)
+    tag = f"{args.mode}_{args.tokenizer}"
+    epochs = list(range(1, len(test_ppl_hist) + 1))
+    history_dict = {
+        "epochs": epochs,
+        "train_energy": train_energy_hist,
+        "train_ppl": train_ppl_hist,
+        "test_ppl": test_ppl_hist,
+    }
+    history_file = os.path.join(plot_dir, f"history_{tag}.json")
+    with open(history_file, "w") as fh:
+        json.dump(history_dict, fh, indent=2)
+
+    plot_single(tag, history_dict, plot_dir)
+    print(f"Saved plots and history to {plot_dir}/ (tag: {tag})")
 
     # --- Text Generation ---
     gen_key = jax.random.PRNGKey(99)

@@ -238,7 +238,8 @@ class BayesianTuner:
             f"Heads: {config.get('num_heads', 'N/A')} | "
             f"Depth: {config.get('depth', 'N/A')} | "
             f"Infer: {config.get('infer_steps', 'N/A')} | "
-            f"Eta: {config.get('eta_infer', 'N/A')}\n"
+            f"Eta: {config.get('eta_infer', 'N/A')} | "
+            f"Dropout: {config.get('dropout_rate', 'N/A')}\n"
         )
         with open(self.log_file, "a") as f:
             f.write(line)
