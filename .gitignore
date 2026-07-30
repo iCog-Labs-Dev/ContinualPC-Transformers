@@ -60,7 +60,7 @@ runs/
 .aim/
 
 # Data, checkpoints, and large artifacts
-data/
+/data/
 datasets/
 checkpoints/
 models/

@@ -392,15 +392,14 @@ class CharDataLoader(_TokenSequenceLoader):
 class BpeDataLoader(_TokenSequenceLoader):
     """JAX-compatible BPE tokenized data loader using TFDS.
 
-    Loads pre-encoded Tiny Shakespeare BPE token sequences from .npy files
-    and yields batches of (x_indices, y_indices) for next-token prediction.
-    Targets are integer ids; one-hot encoding happens in the training/eval
-    step (see _TokenSequenceLoader).
+    Loads pre-encoded BPE token sequences from cached .npy files and yields
+    batches of (x_indices, y_indices) for next-token prediction. Targets are
+    integer token ids; one-hot encoding happens in the training/eval step.
 
-    The vocabulary is built from all splits of the Tiny Shakespeare dataset
-    using a BPE tokenizer with vocab_size=11711. On first use, the tokenizer
-    is trained and all splits are encoded and cached to bpe_data_dir.
-    Subsequent runs load directly from cache.
+    On first use the BPE tokenizer (vocab_size=8000 by default) is trained on
+    the corpus and all splits are encoded and cached to bpe_data_dir; later
+    runs load from cache. WikiText-103 is pulled via Hugging Face datasets;
+    other datasets are loaded via TFDS.
 
     Args:
         split: Dataset split ('train', 'validation', or 'test').
@@ -410,8 +409,11 @@ class BpeDataLoader(_TokenSequenceLoader):
         seed: Random seed for reproducible shuffling.
         max_samples: If set, cap the number of sequences to this value.
             Useful for fast hyperparameter tuning on a subset of data.
-        bpe_data_dir: Directory to cache tokenizer and encoded splits.
-        vocab_size: BPE vocabulary size (default: 11711).
+        dataset: Corpus identifier (default: "wikitext103").
+        bpe_data_dir: Cache dir for tokenizer and encoded splits.
+            Defaults to "data/bpe_{dataset}_v{vocab_size}".
+        vocab_size: BPE vocabulary size (default: 8000).
+        verbose: Print progress during dataset download/tokenization.
     """
 
     splits = ["train", "validation", "test"]
@@ -424,8 +426,9 @@ class BpeDataLoader(_TokenSequenceLoader):
         shuffle: bool = True,
         seed: int = None,
         max_samples: int = None,
-        bpe_data_dir: str = "data/bpe_tokenized",
-        vocab_size: int = 11711,
+        dataset: str = "wikitext103",
+        bpe_data_dir: str = None,
+        vocab_size: int = 8000,
         verbose: bool = True,
     ):
         from pathlib import Path
@@ -438,13 +441,16 @@ class BpeDataLoader(_TokenSequenceLoader):
         self.shuffle = shuffle
         self.seed = seed
 
+        if bpe_data_dir is None:
+            bpe_data_dir = f"data/bpe_{dataset}_v{vocab_size}"
+
         bpe_dir = Path(bpe_data_dir)
         tokenizer_path = bpe_dir / "tokenizer.json"
         token_path = bpe_dir / f"{split}.npy"
 
         # Prepare tokenizer and encoded splits if not already cached
         if not tokenizer_path.exists() or not token_path.exists():
-            self._prepare(bpe_dir, vocab_size=vocab_size, verbose=verbose)
+            self._prepare(bpe_dir, dataset=dataset, vocab_size=vocab_size, verbose=verbose)
 
         tok = Tokenizer.from_file(str(tokenizer_path))
         self.vocab_size = tok.get_vocab_size()
@@ -457,8 +463,8 @@ class BpeDataLoader(_TokenSequenceLoader):
         self._init_sequence_indexing(max_samples)
 
     @staticmethod
-    def _prepare(bpe_dir, vocab_size: int = 11711, verbose: bool = True):
-        """Train BPE tokenizer on all splits and encode each split to .npy."""
+    def _prepare(bpe_dir, dataset: str = "wikitext103", vocab_size: int = 8000, verbose: bool = True):
+        """Train BPE tokenizer on splits and encode each split to .npy."""
         import tensorflow_datasets as tfds
         import tensorflow as tf
         from pathlib import Path
@@ -470,13 +476,19 @@ class BpeDataLoader(_TokenSequenceLoader):
         tokenizer_path = bpe_dir / "tokenizer.json"
 
         def load_split(split):
-            ds = tfds.load("tiny_shakespeare", split=split)
-            return next(iter(ds))["text"].numpy().decode("utf-8")
+            if dataset == "wikitext103":
+                from datasets import load_dataset
+                hf_split = {"train": "train", "validation": "validation", "test": "test"}[split]
+                ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=hf_split)
+                return "\n".join(t for t in ds["text"] if t.strip())
+            # default: tfds path (tiny_shakespeare, etc.)
+            ds = tfds.load(dataset, split=split)
+            return "\n".join(ex["text"].numpy().decode("utf-8") for ex in ds)
 
         # Train tokenizer on all splits for full vocabulary coverage
         if not tokenizer_path.exists():
             if verbose:
-                print("BpeDataLoader: training BPE tokenizer on Tiny Shakespeare...")
+                print(f"BpeDataLoader: training BPE tokenizer on {dataset}...")
             tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
             tokenizer.pre_tokenizer = Whitespace()
             trainer = BpeTrainer(
