@@ -17,6 +17,7 @@ from fabricpc.training.train_autoregressive import (
     train_step_autoregressive,
     evaluate_autoregressive,
     generate_autoregressive,
+    create_dropout_clamps,
 )
 from fabricpc.training.train_backprop import (
     compute_loss,
@@ -53,6 +54,7 @@ __all__ = [
     "train_step_autoregressive",
     "evaluate_autoregressive",
     "generate_autoregressive",
+    "create_dropout_clamps",
     # Backprop training
     "compute_loss",
     "train_step_backprop",

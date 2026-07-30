@@ -20,6 +20,7 @@ from fabricpc.graph_initialization.state_initializer import (
 )
 from fabricpc.core.inference import run_inference, InferenceSGDNormClip
 from fabricpc.training import train_step
+from fabricpc.training.train_autoregressive import create_dropout_clamps
 import optax
 from fabricpc.nodes import Linear
 from fabricpc.core.topology import Edge
@@ -348,6 +349,70 @@ class TestTransformerBlock:
             losses.append(loss)
 
         assert losses[-1] < losses[0], "Transformer block failed to learn."
+
+    def test_factory_dropout_structure(self, rng_key):
+        """Dropout adds mask source nodes wired to residual branches only."""
+        depth = 2
+        structure = create_deep_transformer(
+            depth=depth,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=10,
+            vocab_size=10,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+            dropout_rate=0.1,
+        )
+
+        assert structure.config["dropout_rate"] == 0.1
+        assert len(structure.nodes) == 3 + 5 * depth
+        assert len(structure.edges) == 2 + 7 * depth
+
+        for i in range(depth):
+            for suffix, target in (("mha", f"L{i}_mha"), ("mlp2", f"L{i}_mlp2")):
+                task_name = f"dropout_L{i}_{suffix}"
+                assert task_name in structure.task_map
+                mask_node = structure.task_map[task_name]
+                assert mask_node in structure.nodes
+                assert any(
+                    e.source == mask_node
+                    and e.target == target
+                    and e.slot == "dropout_mask"
+                    for e in structure.edges.values()
+                )
+                slot = structure.nodes[target].node_info.slots["dropout_mask"]
+                assert not slot.is_variance_scalable
+                assert not slot.is_skip_connection
+
+    def test_dropout_clamps_training_and_eval(self, rng_key):
+        """Training masks use inverted dropout; eval masks are all ones."""
+        structure = create_deep_transformer(
+            depth=1,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=10,
+            vocab_size=10,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+            dropout_rate=0.25,
+        )
+
+        train_masks = create_dropout_clamps(
+            structure, batch_size=4, rng_key=rng_key, training=True
+        )
+        eval_masks = create_dropout_clamps(
+            structure, batch_size=4, rng_key=rng_key, training=False
+        )
+
+        assert set(train_masks) == {"dropout_L0_mha", "dropout_L0_mlp2"}
+        keep_scaled = 1.0 / (1.0 - structure.config["dropout_rate"])
+        for name, mask in train_masks.items():
+            assert mask.shape == (4, 10, 16)
+            assert jnp.all((mask == 0.0) | jnp.isclose(mask, keep_scaled))
+            assert jnp.any(mask == 0.0), name
+
+        for mask in eval_masks.values():
+            assert jnp.all(mask == 1.0)
 
     def test_factory_structure(self, rng_key):
         """Verify create_deep_transformer generates correct graph topology."""
