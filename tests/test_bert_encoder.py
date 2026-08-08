@@ -49,6 +49,7 @@ def test_encoder_topology_is_bidirectional():
     assert structure.nodes["L0_mha"].node_info.node_config["use_rope"] is False
     assert structure.nodes["position_embeddings"].node_info.node_class is AddPositionEmbeddingNode
     assert structure.nodes["pooler"].node_info.node_class is FirstTokenPoolNode
+    assert structure.nodes["classifier"].node_info.weight_init.config["std"] == 0.02
     assert structure.task_map["x"] == "input_ids"
     assert structure.task_map["y"] == "classifier"
 

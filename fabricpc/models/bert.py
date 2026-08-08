@@ -229,7 +229,7 @@ def create_encoder_sentiment_classifier(
         name="classifier",
         activation=SoftmaxActivation(),
         energy=CrossEntropyEnergy(),
-        weight_init=NormalInitializer(std=float(jnp.sqrt(1.0 / embed_dim))),
+        weight_init=NormalInitializer(std=0.02),
     )
     nodes.extend([pool, classifier])
     edges.extend(
