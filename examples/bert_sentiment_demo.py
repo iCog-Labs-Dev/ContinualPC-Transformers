@@ -4,6 +4,12 @@ The demo uses a tiny built-in dataset and a simple tokenizer so it can run
 without downloading anything. It is intentionally separate from the existing
 autoregressive transformer demos.
 
+Scale note: this demo uses FabricPC graph-mode backprop through
+``compute_forward_pass``, which calls ``initialize_graph_state`` for each
+forward pass. That validates encoder graph semantics, but it is not meant to be
+a production BERT-scale training loop. A future fast JAX execution path could
+bypass graph-state traversal for larger backprop baselines.
+
 Usage:
     PYTHONPATH=. python examples/bert_sentiment_demo.py --num_epochs 5
 """
@@ -99,6 +105,40 @@ def evaluate(params, structure, loader, rng_key):
     return {"accuracy": correct / total, "loss": sum(losses) / len(losses)}
 
 
+def build_optimizer(
+    *,
+    learning_rate: float,
+    weight_decay: float,
+    grad_clip: float,
+    warmup_steps: int,
+    total_steps: int,
+) -> optax.GradientTransformation:
+    """Build the demo optimizer with optional clipping and LR warmup."""
+    total_steps = max(1, total_steps)
+    if warmup_steps > 0:
+        clipped_warmup_steps = min(warmup_steps, max(1, total_steps - 1))
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=learning_rate,
+            warmup_steps=clipped_warmup_steps,
+            decay_steps=total_steps,
+        )
+        adamw_learning_rate: float | optax.Schedule = schedule
+    else:
+        adamw_learning_rate = learning_rate
+
+    transforms = []
+    if grad_clip > 0:
+        transforms.append(optax.clip_by_global_norm(grad_clip))
+    transforms.append(
+        optax.adamw(
+            learning_rate=adamw_learning_rate,
+            weight_decay=weight_decay,
+        )
+    )
+    return optax.chain(*transforms)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Encoder-only transformer sentiment demo")
     parser.add_argument(
@@ -115,6 +155,19 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=1.0,
+        help="Global gradient clipping norm; set <= 0 to disable clipping.",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Optional optimizer warmup steps before cosine decay.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -142,7 +195,13 @@ def main(args=None):
         inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
     )
     params = initialize_params(structure, rng_key)
-    optimizer = optax.adam(args.lr)
+    optimizer = build_optimizer(
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        warmup_steps=args.warmup_steps,
+        total_steps=args.num_epochs * len(train_loader),
+    )
     opt_state = optimizer.init(params)
 
     for epoch in range(args.num_epochs):
