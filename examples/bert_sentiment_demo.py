@@ -101,6 +101,12 @@ def evaluate(params, structure, loader, rng_key):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Encoder-only transformer sentiment demo")
+    parser.add_argument(
+        "--mode",
+        choices=["backprop"],
+        default="backprop",
+        help="Training mode. PC support is intentionally deferred for this demo.",
+    )
     parser.add_argument("--seq_len", type=int, default=8)
     parser.add_argument("--embed_dim", type=int, default=32)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -118,8 +124,10 @@ def main(args=None):
     rng_key = jax.random.PRNGKey(args.seed)
     vocab = build_vocab(DATASET)
 
-    train_data = DATASET[:10]
-    test_data = DATASET[10:]
+    positives = [row for row in DATASET if row[1] == 1]
+    negatives = [row for row in DATASET if row[1] == 0]
+    train_data = positives[:5] + negatives[:5]
+    test_data = positives[5:] + negatives[5:]
     train_loader = SentimentBatcher(train_data, vocab, args.seq_len, args.batch_size)
     test_loader = SentimentBatcher(test_data, vocab, args.seq_len, args.batch_size)
 
