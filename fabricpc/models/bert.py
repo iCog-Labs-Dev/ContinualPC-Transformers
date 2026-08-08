@@ -79,7 +79,11 @@ class AddPositionEmbeddingNode(NodeBase):
         seq_len = config.get("seq_len", node_shape[0])
         embed_dim = config.get("embed_dim", node_shape[-1])
         return NodeParams(
-            weights={"position_embeddings": initialize(key, (seq_len, embed_dim), weight_init)},
+            weights={
+                "position_embeddings": initialize(
+                    key, (seq_len, embed_dim), weight_init
+                )
+            },
             biases={},
         )
 

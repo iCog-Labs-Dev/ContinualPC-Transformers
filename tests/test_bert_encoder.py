@@ -22,8 +22,12 @@ from fabricpc.models.bert import (
 
 
 def load_demo_build_optimizer():
-    demo_path = Path(__file__).resolve().parents[1] / "examples" / "bert_sentiment_demo.py"
-    spec = importlib.util.spec_from_file_location("bert_sentiment_demo_for_test", demo_path)
+    demo_path = (
+        Path(__file__).resolve().parents[1] / "examples" / "bert_sentiment_demo.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "bert_sentiment_demo_for_test", demo_path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -48,7 +52,10 @@ def test_encoder_topology_is_bidirectional():
 
     assert structure.nodes["L0_mha"].node_info.node_config["is_causal"] is False
     assert structure.nodes["L0_mha"].node_info.node_config["use_rope"] is False
-    assert structure.nodes["position_embeddings"].node_info.node_class is AddPositionEmbeddingNode
+    assert (
+        structure.nodes["position_embeddings"].node_info.node_class
+        is AddPositionEmbeddingNode
+    )
     assert structure.nodes["final_layernorm"].node_info.node_class is FinalLayerNormNode
     assert structure.nodes["pooler"].node_info.node_class is FirstTokenPoolNode
     assert structure.nodes["classifier"].node_info.weight_init.config["std"] == 0.02
@@ -100,7 +107,10 @@ def test_future_token_can_affect_first_position_attention():
     )
 
     first_position_delta = jnp.max(
-        jnp.abs(state_base.nodes["L0_mha"].z_mu[:, 0, :] - state_changed.nodes["L0_mha"].z_mu[:, 0, :])
+        jnp.abs(
+            state_base.nodes["L0_mha"].z_mu[:, 0, :]
+            - state_changed.nodes["L0_mha"].z_mu[:, 0, :]
+        )
     )
     assert first_position_delta > 1e-6
 

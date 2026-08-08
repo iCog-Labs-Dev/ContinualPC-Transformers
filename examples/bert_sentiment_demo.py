@@ -32,7 +32,6 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.models import create_encoder_sentiment_classifier
 from fabricpc.training.train_backprop import compute_forward_pass, train_step_backprop
 
-
 PAD_TOKEN = "[PAD]"
 CLS_TOKEN = "[CLS]"
 UNK_TOKEN = "[UNK]"
@@ -68,7 +67,8 @@ class SentimentBatcher:
         for start in range(0, len(self.examples), self.batch_size):
             rows = self.examples[start : start + self.batch_size]
             x = jnp.array(
-                [encode(text, self.vocab, self.seq_len) for text, _ in rows], dtype=jnp.int32
+                [encode(text, self.vocab, self.seq_len) for text, _ in rows],
+                dtype=jnp.int32,
             )
             y = jnp.array([label for _, label in rows], dtype=jnp.int32)
             yield {"x": x, "y": y}
@@ -86,7 +86,9 @@ def build_vocab(examples: Iterable[Tuple[str, int]]) -> dict:
 
 
 def encode(text: str, vocab: dict, seq_len: int) -> List[int]:
-    ids = [vocab[CLS_TOKEN]] + [vocab.get(token, vocab[UNK_TOKEN]) for token in tokenize(text)]
+    ids = [vocab[CLS_TOKEN]] + [
+        vocab.get(token, vocab[UNK_TOKEN]) for token in tokenize(text)
+    ]
     ids = ids[:seq_len]
     return ids + [vocab[PAD_TOKEN]] * (seq_len - len(ids))
 
@@ -101,7 +103,13 @@ def evaluate(params, structure, loader, rng_key):
         preds = jnp.argmax(probs, axis=-1)
         correct += int(jnp.sum(preds == batch["y"]))
         total += int(batch["y"].shape[0])
-        losses.append(float(-jnp.mean(jnp.log(probs[jnp.arange(batch["y"].shape[0]), batch["y"]] + 1e-10))))
+        losses.append(
+            float(
+                -jnp.mean(
+                    jnp.log(probs[jnp.arange(batch["y"].shape[0]), batch["y"]] + 1e-10)
+                )
+            )
+        )
     return {"accuracy": correct / total, "loss": sum(losses) / len(losses)}
 
 
@@ -140,7 +148,9 @@ def build_optimizer(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Encoder-only transformer sentiment demo")
+    parser = argparse.ArgumentParser(
+        description="Encoder-only transformer sentiment demo"
+    )
     parser.add_argument(
         "--mode",
         choices=["backprop"],
