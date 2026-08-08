@@ -15,6 +15,7 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.models.bert import (
     AddPositionEmbeddingNode,
+    FinalLayerNormNode,
     FirstTokenPoolNode,
     create_encoder_sentiment_classifier,
 )
@@ -48,6 +49,7 @@ def test_encoder_topology_is_bidirectional():
     assert structure.nodes["L0_mha"].node_info.node_config["is_causal"] is False
     assert structure.nodes["L0_mha"].node_info.node_config["use_rope"] is False
     assert structure.nodes["position_embeddings"].node_info.node_class is AddPositionEmbeddingNode
+    assert structure.nodes["final_layernorm"].node_info.node_class is FinalLayerNormNode
     assert structure.nodes["pooler"].node_info.node_class is FirstTokenPoolNode
     assert structure.nodes["classifier"].node_info.weight_init.config["std"] == 0.02
     assert structure.task_map["x"] == "input_ids"

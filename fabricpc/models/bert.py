@@ -33,6 +33,7 @@ from fabricpc.nodes import (
     NodeBase,
     SlotSpec,
 )
+from fabricpc.utils.helpers import layernorm
 
 
 class AddPositionEmbeddingNode(NodeBase):
@@ -148,6 +149,60 @@ class FirstTokenPoolNode(NodeBase):
         return node_info.node_class.energy_functional(state, node_info)
 
 
+class FinalLayerNormNode(NodeBase):
+    """Normalize final encoder token representations before pooling."""
+
+    DEFAULT_ENERGY = GaussianEnergy
+    DEFAULT_ACTIVATION = IdentityActivation
+
+    def __init__(
+        self,
+        shape: Tuple[int, int],
+        name: str,
+        embed_dim: int,
+        energy: GaussianEnergy = GaussianEnergy(),
+        **kwargs,
+    ):
+        super().__init__(
+            shape=shape,
+            name=name,
+            embed_dim=embed_dim,
+            energy=energy,
+            **kwargs,
+        )
+
+    @staticmethod
+    def get_slots() -> Dict[str, SlotSpec]:
+        return {"in": SlotSpec("in", is_multi_input=False)}
+
+    @staticmethod
+    def initialize_params(
+        key: jax.Array,
+        node_shape: Tuple[int, ...],
+        input_shapes: Dict[str, Tuple[int, ...]],
+        weight_init: InitializerBase,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> NodeParams:
+        embed_dim = node_shape[-1]
+        return NodeParams(
+            weights={"ln_gamma": jnp.ones((embed_dim,))},
+            biases={"ln_beta": jnp.zeros((embed_dim,))},
+        )
+
+    @staticmethod
+    def forward(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+    ) -> NodeState:
+        x = inputs[next(iter(inputs))]
+        z_mu = layernorm(x, params.weights["ln_gamma"], params.biases["ln_beta"])
+        error = state.z_latent - z_mu
+        state = state._replace(z_mu=z_mu, error=error)
+        return node_info.node_class.energy_functional(state, node_info)
+
+
 def create_encoder_sentiment_classifier(
     *,
     depth: int,
@@ -223,6 +278,11 @@ def create_encoder_sentiment_classifier(
         )
         previous_residual = mlp2
 
+    final_ln = FinalLayerNormNode(
+        shape=(seq_len, embed_dim),
+        name="final_layernorm",
+        embed_dim=embed_dim,
+    )
     pool = FirstTokenPoolNode(shape=(embed_dim,), name="pooler")
     classifier = Linear(
         shape=(num_classes,),
@@ -231,10 +291,11 @@ def create_encoder_sentiment_classifier(
         energy=CrossEntropyEnergy(),
         weight_init=NormalInitializer(std=0.02),
     )
-    nodes.extend([pool, classifier])
+    nodes.extend([final_ln, pool, classifier])
     edges.extend(
         [
-            Edge(source=previous_residual, target=pool.slot("in")),
+            Edge(source=previous_residual, target=final_ln.slot("in")),
+            Edge(source=final_ln, target=pool.slot("in")),
             Edge(source=pool, target=classifier.slot("in")),
         ]
     )
