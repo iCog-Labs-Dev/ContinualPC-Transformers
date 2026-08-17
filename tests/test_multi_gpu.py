@@ -561,3 +561,23 @@ class TestAutoRegressiveMultiGPU:
                 verbose=False,
             )
 
+    def test_autoregressive_evaluation_debug_mode(self, transformer_structure, rng_key):
+        """Test evaluate_autoregressive with debug=True and integer targets."""
+        model_key, eval_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        eval_config = {"use_causal_mask": True}
+        test_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=2, rng_key=data_key
+        )
+
+        metrics = evaluate_autoregressive(
+            params,
+            transformer_structure,
+            test_loader,
+            eval_config,
+            eval_key,
+            debug=True,
+        )
+        assert np.isfinite(metrics["loss"])
+

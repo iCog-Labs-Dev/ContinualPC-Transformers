@@ -974,7 +974,9 @@ def evaluate_autoregressive(
 
             # Debug diagnostics for first batch
             if debug and batch_idx == 0:
-                tgt = batch["y"]  # (batch, seq_len, vocab_size) one-hot
+                tgt = batch["y"]
+                if tgt.ndim == predictions.ndim - 1:
+                    tgt = jax.nn.one_hot(tgt, predictions.shape[-1])
 
                 # Check individual loss components
                 log_preds = jnp.log(predictions + 1e-10)
