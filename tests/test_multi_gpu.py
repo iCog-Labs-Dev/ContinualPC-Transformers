@@ -19,9 +19,10 @@ from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.core.activations import IdentityActivation, ReLUActivation
 from fabricpc.core.initializers import XavierInitializer
-from fabricpc.core.inference import InferenceSGD
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.core.inference import InferenceSGD, InferenceSGDNormClip
+from fabricpc.training import train_pcn, evaluate_pcn, train_autoregressive, evaluate_autoregressive
 from fabricpc.training.train import shard_batch, replicate_params, unshard_energies
+from fabricpc.nodes.transformer_v2 import create_deep_transformer
 
 
 @pytest.fixture
@@ -350,3 +351,193 @@ class TestMultiGPUUtilities:
         avg = unshard_energies(energies)
 
         assert abs(avg - 2.5) < 1e-6, f"Expected 2.5, got {avg}"
+
+
+def _make_token_batches(
+    vocab_size: int,
+    seq_len: int,
+    batch_size: int,
+    num_batches: int,
+    rng_key: jax.Array,
+):
+    """Generate token batches (x, y) for autoregressive testing."""
+    batches = []
+    for _ in range(num_batches):
+        rng_key, x_key, y_key = jax.random.split(rng_key, 3)
+        batches.append(
+            {
+                "x": jax.random.randint(
+                    x_key, (batch_size, seq_len), 0, vocab_size
+                ),
+                "y": jax.random.randint(
+                    y_key, (batch_size, seq_len), 0, vocab_size
+                ),
+            }
+        )
+    return batches
+
+
+class TestAutoRegressiveMultiGPU:
+    """Test suite for autoregressive multi-GPU / pmap training."""
+
+    @pytest.fixture
+    def transformer_structure(self):
+        """Small transformer structure for fast testing."""
+        return create_deep_transformer(
+            depth=1,
+            embed_dim=8,
+            num_heads=2,
+            mlp_dim=16,
+            seq_len=4,
+            vocab_size=10,
+            inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=2, max_norm=5.0),
+        )
+
+    def test_autoregressive_numerical_similarity(self, transformer_structure, rng_key):
+        """Test that autoregressive pmap updates match single-device JIT."""
+        model_key, train_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-3)
+        train_config = {"num_epochs": 1, "use_causal_mask": True}
+        train_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=2, rng_key=data_key
+        )
+
+        params_single = copy.deepcopy(params)
+        params_multi = copy.deepcopy(params)
+
+        trained_single, _, _ = train_autoregressive(
+            params_single,
+            transformer_structure,
+            train_loader,
+            optimizer,
+            train_config,
+            train_key,
+            verbose=False,
+            pmap_single_device=False,
+        )
+
+        trained_multi, _, _ = train_autoregressive(
+            params_multi,
+            transformer_structure,
+            train_loader,
+            optimizer,
+            train_config,
+            train_key,
+            verbose=False,
+            pmap_single_device=True,
+        )
+
+        max_relative_diff = 0.0
+        for node_name in transformer_structure.nodes:
+            if transformer_structure.nodes[node_name].node_info.in_degree > 0:
+                single_node = trained_single.nodes[node_name]
+                multi_node = trained_multi.nodes[node_name]
+
+                for edge_key in single_node.weights:
+                    w_single = single_node.weights[edge_key]
+                    w_multi = multi_node.weights[edge_key]
+                    diff = jnp.abs(w_single - w_multi)
+                    scale = jnp.maximum(jnp.abs(w_single), jnp.abs(w_multi)) + 1e-8
+                    rel_diff = diff / scale
+                    max_rel = float(jnp.max(rel_diff))
+                    max_relative_diff = max(max_relative_diff, max_rel)
+
+        assert max_relative_diff < 1e-5, (
+            f"Autoregressive pmap (single shard) must match JIT! Max rel diff: {max_relative_diff}"
+        )
+
+    def test_autoregressive_pmap_reduces_energy(self, transformer_structure, rng_key):
+        """Test that autoregressive pmap reduces energy over training."""
+        model_key, train_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-2)
+        train_config = {"num_epochs": 2, "use_causal_mask": True}
+        train_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=4, rng_key=data_key
+        )
+
+        trained_params, iter_results, epoch_results = train_autoregressive(
+            params,
+            transformer_structure,
+            train_loader,
+            optimizer,
+            train_config,
+            train_key,
+            verbose=False,
+            pmap_single_device=True,
+        )
+
+        first_batch_energy = iter_results[0][0]
+        last_batch_energy = iter_results[-1][-1]
+        assert np.isfinite(first_batch_energy)
+        assert np.isfinite(last_batch_energy)
+
+    def test_autoregressive_epoch_callback_single_params(self, transformer_structure, rng_key):
+        """Test that epoch_callback receives un-replicated params under pmap."""
+        model_key, train_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-3)
+        train_config = {"num_epochs": 1, "use_causal_mask": True}
+        train_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=2, rng_key=data_key
+        )
+
+        callback_received_shapes = []
+
+        def epoch_cb(epoch_idx, cb_params, cb_struct, cb_cfg, cb_rng, **kwargs):
+            shapes = [x.shape for x in jax.tree_util.tree_leaves(cb_params)]
+            callback_received_shapes.append(shapes)
+            return True
+
+        train_autoregressive(
+            params,
+            transformer_structure,
+            train_loader,
+            optimizer,
+            train_config,
+            train_key,
+            verbose=False,
+            epoch_callback=epoch_cb,
+            pmap_single_device=True,
+        )
+
+        orig_shapes = [x.shape for x in jax.tree_util.tree_leaves(params)]
+        assert len(callback_received_shapes) == 1
+        assert callback_received_shapes[0] == orig_shapes
+
+    def test_autoregressive_evaluation_multi_gpu(self, transformer_structure, rng_key):
+        """Test that multi-device evaluation matches single-device evaluation."""
+        model_key, eval_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        eval_config = {"use_causal_mask": True}
+        test_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=3, rng_key=data_key
+        )
+
+        metrics_jit = evaluate_autoregressive(
+            params,
+            transformer_structure,
+            test_loader,
+            eval_config,
+            eval_key,
+            pmap_single_device=False,
+        )
+
+        metrics_pmap = evaluate_autoregressive(
+            params,
+            transformer_structure,
+            test_loader,
+            eval_config,
+            eval_key,
+            pmap_single_device=True,
+        )
+
+        assert np.isclose(metrics_jit["loss"], metrics_pmap["loss"], rtol=1e-4, atol=1e-4)
+        assert np.isclose(metrics_jit["perplexity"], metrics_pmap["perplexity"], rtol=1e-4, atol=1e-4)
+        assert np.isclose(metrics_jit["accuracy"], metrics_pmap["accuracy"], rtol=1e-4, atol=1e-4)
+
