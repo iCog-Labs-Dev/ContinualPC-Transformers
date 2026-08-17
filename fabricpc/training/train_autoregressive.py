@@ -903,15 +903,30 @@ def evaluate_autoregressive(
                 replicated_params, batch_sharded, batch_key_for_step
             )
 
-            total_loss += float(jnp.mean(loss_sharded))
-
             padded_batch_size = batch_size + pad_size
             predictions = preds_sharded.reshape(
                 padded_batch_size, *preds_sharded.shape[2:]
             )
             predictions = predictions[:batch_size]
-
             targets = batch["y"][:batch_size]
+
+            if pad_size > 0:
+                log_preds = jnp.log(predictions + 1e-10)
+                if targets.ndim == 3:
+                    batch_loss = -float(jnp.mean(jnp.sum(targets * log_preds, axis=-1)))
+                else:
+                    batch_loss = -float(
+                        jnp.mean(
+                            jnp.take_along_axis(
+                                log_preds, targets[..., None], axis=-1
+                            )
+                        )
+                    )
+            else:
+                batch_loss = float(jnp.mean(loss_sharded))
+
+            total_loss += batch_loss
+
             pred_tokens = jnp.argmax(predictions, axis=-1)
             if targets.ndim == 3:
                 target_tokens = jnp.argmax(targets, axis=-1)
