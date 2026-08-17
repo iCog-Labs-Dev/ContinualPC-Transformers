@@ -1,5 +1,5 @@
 """
-Hyperparameter Tuning — Transformer on Tiny Shakespeare (Two-Phase)
+Hyperparameter Tuning — Transformer on Text Corpora (Two-Phase)
 
 Phase 1 — Architecture search: explore embed_dim, mlp_dim, num_heads, depth,
            infer_steps, eta_infer, lr, weight_init_std. Minimize perplexity;
@@ -36,7 +36,9 @@ def trial_model(config, rng_key):
     batch_size = config.get("batch_size", 32)
     vocab_size = config.get("vocab_size", 65)
     weight_init_std = config.get("weight_init_std", 0.02)
+    dropout_rate = config.get("dropout_rate", 0.0)
     use_bpe = config.get("use_bpe", False)
+    max_samples = config.get("max_samples", 50000)
 
     if embed_dim % num_heads != 0:
         raise optuna.TrialPruned(
@@ -57,7 +59,7 @@ def trial_model(config, rng_key):
             batch_size=batch_size,
             shuffle=True,
             seed=42,
-            max_samples=50000,
+            max_samples=max_samples,
         )
         val_loader = BpeDataLoader(
             "validation", seq_len=seq_len, batch_size=batch_size, shuffle=False
@@ -69,7 +71,7 @@ def trial_model(config, rng_key):
             batch_size=batch_size,
             shuffle=True,
             seed=42,
-            max_samples=50000,
+            max_samples=max_samples,
         )
         val_loader = CharDataLoader(
             "validation", seq_len=seq_len, batch_size=batch_size, shuffle=False
@@ -84,6 +86,7 @@ def trial_model(config, rng_key):
         vocab_size=vocab_size,
         inference=inference,
         weight_init={"type": "normal", "std": weight_init_std},
+        dropout_rate=dropout_rate,
     )
 
     params = initialize_params(structure, rng_key)
@@ -113,6 +116,9 @@ def phase1_search_space(trial):
     eta_infer = trial.suggest_float("eta_infer", 0.01, 0.15)
     lr = trial.suggest_float("lr", 1e-5, 3e-4, log=True)
     weight_init_std = trial.suggest_float("weight_init_std", 0.01, 0.05, log=True)
+    # Fixed initial residual dropout rate during Phase 1 architecture exploration
+    # to avoid adding another search dimension.
+    dropout_rate = 0.1
 
     return {
         "embed_dim": embed_dim,
@@ -125,6 +131,10 @@ def phase1_search_space(trial):
         "eta_infer": eta_infer,
         "lr": lr,
         "weight_init_std": weight_init_std,
+        "dropout_rate": dropout_rate,
+        # Char default: keep 50k
+        # For BPE WikiText-103, change to 150000
+        "max_samples": 50000,
     }
 
 
@@ -154,6 +164,12 @@ def phase2_search_space(trial, best_params):
         "infer_steps": trial.suggest_int(
             "infer_steps", max(min_infer_steps, infer_steps - 3), infer_steps + 5
         ),
+        "dropout_rate": trial.suggest_float(
+            "dropout_rate", 0.0, 0.3, step=0.025
+        ),
+        # Char default: keep 50k
+        # For BPE WikiText-103, change to 450000
+        "max_samples": 50000,
     }
 
 
@@ -164,10 +180,16 @@ def phase2_search_space(trial, best_params):
 if __name__ == "__main__":
     seq_len = 128
     batch_size = 32
+    
+    # Tuning data budget:
+    # Char Tiny Shakespeare: 50,000 samples (default)
+    # BPE WikiText-103: change Phase 1/Phase 2 max_samples below to:
+    #   Phase 1: 150,000 samples
+    #   Phase 2: 450,000 samples
     max_tuning_samples = 50000
     use_bpe = False  # set to True for BPE tokenizer
 
-    # Used only to get vocab_size training loaders are created per trial in trial_model
+    # Used only to get vocab_size; training loaders are created per trial in trial_model
     if use_bpe:
         train_loader = BpeDataLoader(
             "train",

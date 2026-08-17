@@ -114,3 +114,30 @@ def test_bpe_dataloader_from_cache(tmp_path):
     assert x.dtype == np.int32 and x.shape == (2, 4)
     assert y.dtype == np.int32 and y.shape == (2, 4)
     assert isinstance(loader.decode(x[0]), str)
+
+def test_prepare_fits_tokenizer_on_train_split_only(tmp_path, monkeypatch):
+    """_prepare fits vocab/merges on train only; a symbol appearing solely in
+    validation/test must never enter the vocabulary, and all splits still cache."""
+    pytest.importorskip("tokenizers")
+
+    split_text = {
+        "train": "alpha beta alpha beta alpha beta ",
+        "validation": "alpha zeta zeta zeta ",
+        "test": "beta zeta zeta zeta ",
+    }
+    monkeypatch.setattr(
+        BpeDataLoader,
+        "_load_split_text",
+        staticmethod(lambda dataset, split: split_text[split]),
+    )
+
+    bpe_dir = tmp_path / "bpe"
+    BpeDataLoader._prepare(bpe_dir, dataset="dummy", vocab_size=50, verbose=False)
+
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(str(bpe_dir / "tokenizer.json"))
+    # 'z' occurs only in held-out splits -> absent from a train-only fit
+    assert not any("z" in token for token in tok.get_vocab())
+    for split in ("train", "validation", "test"):
+        assert (bpe_dir / f"{split}.npy").exists()

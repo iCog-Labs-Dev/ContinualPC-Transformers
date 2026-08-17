@@ -18,6 +18,7 @@ from fabricpc.core.initializers import (
     InitializerBase,
     initialize,
     NormalInitializer,
+    OnesInitializer,
     XavierInitializer,
     KaimingInitializer,
 )
@@ -37,6 +38,22 @@ from fabricpc.core.activations import (
 from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.inference import InferenceBase
 from fabricpc.core.mupc import MuPCConfig
+
+def _apply_dropout_mask(
+    x: jnp.ndarray,
+    inputs: Dict[str, jnp.ndarray],
+    slot_suffix: str = ":dropout_mask",
+) -> jnp.ndarray:
+    """Apply an externally clamped inverted-dropout mask if present.
+
+    Dropout masks are represented as source nodes so the same mask is held
+    fixed throughout a PC inference solve. Training helpers clamp Bernoulli /
+    keep_prob masks, while evaluation/generation clamps ones.
+    """
+    mask_key = next((k for k in inputs if k.endswith(slot_suffix)), None)
+    if mask_key is None:
+        return x
+    return x * inputs[mask_key]
 
 # ==============================================================================
 # EMBEDDING NODE
@@ -148,6 +165,7 @@ class MhaResidualNode(NodeBase):
         use_rope=True,
         rope_theta=10000.0,
         is_causal=True,
+        dropout_rate=0.0,
         weight_init=None,
         latent_init=None,
         energy=None,
@@ -161,6 +179,7 @@ class MhaResidualNode(NodeBase):
             use_rope=use_rope,
             rope_theta=rope_theta,
             is_causal=is_causal,
+            dropout_rate=dropout_rate,
             weight_init=weight_init or XavierInitializer(),
             latent_init=latent_init or NormalInitializer(),
             energy=energy or GaussianEnergy(),
@@ -174,6 +193,7 @@ class MhaResidualNode(NodeBase):
             "skip": SlotSpec(
                 "skip", False, is_variance_scalable=False, is_skip_connection=True
             ),
+            "dropout_mask": SlotSpec("dropout_mask", False, is_variance_scalable=False),
         }
 
     @staticmethod
@@ -240,6 +260,7 @@ class MhaResidualNode(NodeBase):
         attn = jax.nn.softmax(scores, axis=-1)
         mha = jnp.matmul(attn, V).transpose(0, 2, 1, 3).reshape(B, L, D)
         mha = proj(mha, "W_o", "b_o")
+        mha = _apply_dropout_mask(mha, inputs)
 
         z_mu = skip + mha
         error = state.z_latent - z_mu
@@ -328,6 +349,7 @@ class Mlp2ResidualNode(NodeBase):
         name,
         embed_dim,
         ff_dim,
+        dropout_rate=0.0,
         weight_init=None,
         latent_init=None,
         energy=None,
@@ -338,6 +360,7 @@ class Mlp2ResidualNode(NodeBase):
             name=name,
             embed_dim=embed_dim,
             ff_dim=ff_dim,
+            dropout_rate=dropout_rate,
             weight_init=weight_init or XavierInitializer(),
             latent_init=latent_init or NormalInitializer(),
             energy=energy or GaussianEnergy(),
@@ -351,6 +374,7 @@ class Mlp2ResidualNode(NodeBase):
             "residual": SlotSpec(
                 "residual", False, is_variance_scalable=False, is_skip_connection=True
             ),
+            "dropout_mask": SlotSpec("dropout_mask", False, is_variance_scalable=False),
         }
 
     @staticmethod
@@ -365,6 +389,7 @@ class Mlp2ResidualNode(NodeBase):
         res_in = next(val for key, val in inputs.items() if key.endswith(":residual"))
 
         mlp2 = jnp.dot(mlp1_in, params.weights["W_ff2"]) + params.biases["b_ff2"]
+        mlp2 = _apply_dropout_mask(mlp2, inputs)
         z_mu = res_in + mlp2
 
         error = state.z_latent - z_mu
@@ -444,6 +469,7 @@ def create_deep_transformer(
     vocab_size: int,
     inference: InferenceBase,
     weight_init: Optional[Dict[str, Any]] = None,
+    dropout_rate: float = 0.0,
 ):
     """
     Creates a deep transformer graph using the new class-based builder API.
@@ -457,6 +483,9 @@ def create_deep_transformer(
     output = include_output=False). Changing these without accounting for the
     muPC interaction can cause embedding variance collapse or softmax saturation.
     """
+    if not 0.0 <= dropout_rate < 1.0:
+        raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}")
+
     if weight_init is None:
         # Transformer block weights default to std=0.02 (GPT-style); embedding
         # and output projection set their own init below (see those nodes)
@@ -472,6 +501,7 @@ def create_deep_transformer(
 
     nodes = []
     edges = []
+    dropout_tasks = {}
 
     input_node = Linear(
         shape=(seq_len,), activation=IdentityActivation(), name="input_ids"
@@ -496,20 +526,33 @@ def create_deep_transformer(
 
     previous_residual = embed_node
 
+    def add_dropout_mask(name: str, target_node) -> None:
+        if dropout_rate <= 0.0:
+            return
+        mask_node = Linear(
+            shape=(seq_len, embed_dim),
+            activation=IdentityActivation(),
+            name=name,
+            use_bias=False,
+            latent_init=OnesInitializer(),
+        )
+        nodes.append(mask_node)
+        edges.append(Edge(source=mask_node, target=target_node.slot("dropout_mask")))
+        dropout_tasks[name] = mask_node
+
     for i in range(depth):
         mha = MhaResidualNode(
             name=f"L{i}_mha",
             shape=(seq_len, embed_dim),
             embed_dim=embed_dim,
             num_heads=num_heads,
+            dropout_rate=dropout_rate,
             weight_init=w_init_obj,
         )
         nodes.append(mha)
-        # previous_residual feeds two edges: "in" is the attention-branch input
-        # and is muPC-scaled; "skip" is the residual bypass, unscaled and
-        # counted toward residual depth L.
         edges.append(Edge(source=previous_residual, target=mha.slot("in")))
         edges.append(Edge(source=previous_residual, target=mha.slot("skip")))
+        add_dropout_mask(f"dropout_L{i}_mha", mha)
 
         mlp1 = LnMlp1Node(
             name=f"L{i}_mlp1",
@@ -527,11 +570,13 @@ def create_deep_transformer(
             shape=(seq_len, embed_dim),
             embed_dim=embed_dim,
             ff_dim=mlp_dim,
+            dropout_rate=dropout_rate,
             weight_init=w_init_obj,
         )
         nodes.append(mlp2)
         edges.append(Edge(source=mlp1, target=mlp2.slot("in")))
         edges.append(Edge(source=mha, target=mlp2.slot("residual")))
+        add_dropout_mask(f"dropout_L{i}_mlp2", mlp2)
 
         previous_residual = mlp2
 
@@ -552,11 +597,14 @@ def create_deep_transformer(
     nodes.append(logits)
     edges.append(Edge(source=previous_residual, target=logits.slot("in")))
 
-    return graph(
+    structure = graph(
         nodes=nodes,
         edges=edges,
-        task_map=TaskMap(x=input_node, y=logits),
+        task_map=TaskMap(x=input_node, y=logits, **dropout_tasks),
         inference=inference,
         scaling=MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),
     )
+    return structure._replace(
+        config={**structure.config, "dropout_rate": float(dropout_rate)}
+    )   

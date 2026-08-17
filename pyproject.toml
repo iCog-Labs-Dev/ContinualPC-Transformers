@@ -35,6 +35,7 @@ dependencies = [
     "numpy>=1.24.0",
     "tqdm>=4.65.0",
     "optuna",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +49,7 @@ dev = [
 tfds = [
     "tensorflow-datasets>=4.9.0",
     "tensorflow>=2.15.0",
+    "datasets>=2.14.0",
     # tfds imports the third-party importlib_resources backport unconditionally
     # in its download path (dataset_builder.py), but declares it only for
     # python_version < "3.9". Without this, the first download of any dataset

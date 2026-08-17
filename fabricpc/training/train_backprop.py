@@ -26,8 +26,11 @@ from fabricpc.graph_initialization.state_initializer import (
     initialize_graph_state,
     FeedforwardStateInit,
 )
-from fabricpc.training.train_autoregressive import create_causal_mask, compute_loss
-
+from fabricpc.training.train_autoregressive import (
+    create_causal_mask,
+    create_dropout_clamps,
+    compute_loss,
+)
 
 def validate_feedforward_init(structure: GraphStructure):
     """
@@ -260,6 +263,7 @@ def compute_loss_autoregressive(
     batch: Dict[str, jnp.ndarray],
     rng_key: jax.Array,
     use_causal_mask: bool = True,
+    training: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Compute loss for autoregressive (next-token) prediction with backprop.
@@ -273,6 +277,7 @@ def compute_loss_autoregressive(
         batch: Batch with "x" (input) and "y" (target) sequences
         rng_key: JAX random key
         use_causal_mask: Whether to apply causal masking
+        training: If True, sample dropout masks; otherwise clamp ones.
 
     Returns:
         Tuple of (loss, predictions) where:
@@ -293,12 +298,17 @@ def compute_loss_autoregressive(
         causal_mask = causal_mask[None, None, :, :]  # (1, 1, seq, seq)
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, seq_len))
         clamps[structure.task_map["causal_mask"]] = causal_mask
+    
+    rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
+    clamps.update(
+        create_dropout_clamps(structure, batch_size, dropout_key, training=training)
+    )
 
     # Single forward pass
     state = initialize_graph_state(
         structure,
         batch_size,
-        rng_key,
+        state_key,
         clamps=clamps,
         params=params,
     )
@@ -461,7 +471,7 @@ def train_backprop_autoregressive(
         # Epoch callback
         if epoch_callback is not None:
             epoch_results.append(
-                epoch_callback(epoch_idx, params, structure, config, rng_key)
+                epoch_callback(epoch_idx, params, structure, config, rng_key, ce_loss=avg_loss)
             )
         else:
             epoch_results.append(None)
@@ -632,7 +642,9 @@ def evaluate_backprop_autoregressive(
 
     # JIT compile: returns (loss, predictions) tuple
     jit_forward = jax.jit(
-        lambda p, b, k: compute_loss_autoregressive(p, structure, b, k, use_causal_mask)
+        lambda p, b, k: compute_loss_autoregressive(
+            p, structure, b, k, use_causal_mask, training=False
+        )
     )
 
     total_loss = 0.0

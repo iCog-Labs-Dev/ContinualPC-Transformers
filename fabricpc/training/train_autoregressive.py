@@ -36,6 +36,48 @@ def create_causal_mask(seq_len: int) -> jnp.ndarray:
     """
     return jnp.tril(jnp.ones((seq_len, seq_len)))
 
+def create_dropout_clamps(
+    structure: GraphStructure,
+    batch_size: int,
+    rng_key: jax.Array,
+    training: bool,
+) -> Dict[str, jnp.ndarray]:
+    """Create clamps for transformer-v2 dropout mask source nodes.
+
+    Dropout masks are graph inputs whose task names start with ``dropout_``.
+    During training, each mask is Bernoulli(keep_prob) / keep_prob
+    (inverted dropout). During evaluation/generation, masks are all ones, so
+    no activation rescaling is applied at test time. Keeping dropout as clamped
+    source data makes the mask fixed over the entire PC inference solve.
+    """
+    dropout_tasks = tuple(
+        sorted(k for k in structure.task_map if k.startswith("dropout_"))
+    )
+    if not dropout_tasks:
+        return {}
+
+    dropout_rate = float(structure.config.get("dropout_rate", 0.0))
+    if not 0.0 <= dropout_rate < 1.0:
+        raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}")
+
+    keep_prob = 1.0 - dropout_rate
+    keys = jax.random.split(rng_key, len(dropout_tasks))
+    clamps = {}
+
+    for task_name, key in zip(dropout_tasks, keys):
+        node_name = structure.task_map[task_name]
+        node_shape = structure.nodes[node_name].node_info.shape
+        mask_shape = (batch_size, *node_shape)
+
+        if training and dropout_rate > 0.0:
+            mask = jax.random.bernoulli(key, keep_prob, mask_shape)
+            mask = mask.astype(jnp.float32) / keep_prob
+        else:
+            mask = jnp.ones(mask_shape, dtype=jnp.float32)
+
+        clamps[node_name] = mask
+
+    return clamps
 
 def compute_loss(
     final_state: GraphState,
@@ -153,11 +195,16 @@ def train_step_autoregressive(
         mask_node = structure.task_map["causal_mask"]
         clamps[mask_node] = causal_mask
 
+    rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
+    clamps.update(
+        create_dropout_clamps(structure, batch_size, dropout_key, training=True)
+    )
+
     # Initialize state
     init_state = initialize_graph_state(
         structure,
         batch_size,
-        rng_key,
+        state_key,
         clamps=clamps,
         params=params,
     )
@@ -376,6 +423,9 @@ def _generation_step(
 
     # Create clamps (only input, not output)
     clamps = {input_node: input_data}
+    clamps.update(
+        create_dropout_clamps(structure, batch_size, init_key, training=False)
+    )
 
     # Initialize and run inference
     state = initialize_graph_state(
@@ -572,11 +622,15 @@ def _eval_step_autoregressive(
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, seq_len))
         clamps[structure.task_map["causal_mask"]] = causal_mask
 
+    rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
+    clamps.update(
+        create_dropout_clamps(structure, batch_size, dropout_key, training=False)
+    )
     # Initialize and run inference
     state = initialize_graph_state(
         structure,
         batch_size,
-        rng_key,
+        state_key,
         clamps=clamps,
         params=params,
     )
