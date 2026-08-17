@@ -489,6 +489,11 @@ def train_autoregressive(
                 batch_energies.append(energy)
 
         iter_results.append(batch_energies)
+        if batches_processed == 0:
+            raise RuntimeError(
+                f"No batches were processed in epoch {epoch_idx + 1}. "
+                f"Ensure batch sizes are divisible by {n_devices} device(s)."
+            )
         avg_energy = epoch_energy / batches_processed
         avg_ce_loss = epoch_ce_loss / batches_processed
 
