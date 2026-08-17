@@ -16,6 +16,7 @@ The training loop supports both:
 
 from typing import Dict, Tuple, Any, List, Optional, Callable, cast
 import math
+import warnings
 import jax
 import jax.numpy as jnp
 import optax
@@ -24,6 +25,13 @@ from fabricpc.core.types import GraphParams, GraphState, GraphStructure
 from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.training.train import (
+    _convert_batch,
+    replicate_params,
+    replicate_opt_state,
+    shard_batch,
+    unshard_energies,
+)
 
 
 def create_causal_mask(seq_len: int) -> jnp.ndarray:
@@ -120,41 +128,27 @@ def compute_loss(
     return loss
 
 
-def train_step_autoregressive(
+def get_graph_param_gradient_autoregressive(
     params: GraphParams,
-    opt_state: optax.OptState,
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
-    optimizer: optax.GradientTransformation,
     rng_key: jax.Array,
     use_causal_mask: bool = True,
-) -> Tuple[GraphParams, optax.OptState, float, float, GraphState]:
+) -> Tuple[GraphParams, float, float, GraphState]:
     """
-    Single autoregressive training step.
+    Compute parameter gradients and metrics for an autoregressive batch.
 
-    This implements the predictive coding training loop for sequence prediction:
-    1. Clamp input sequence and target sequence using task_map
-    2. Optionally clamp an external causal mask if task_map defines a
-       "causal_mask" node (v1 only); the v2 node masks internally
-    3. Run inference to convergence
-    4. Compute local gradients
-    5. Update weights
+    Shared by both single-device (JIT) and multi-device (pmap) training.
 
     Args:
         params: Current model parameters
-        opt_state: Optimizer state
-        batch: Batch with keys matching task_map (e.g., 'x' for input, 'y' for target)
-            x: (batch, seq_len, vocab_size) or (batch, seq_len)
-            y: (batch, seq_len) integer token ids; one-hot encoded in this step
-        structure: Graph structure with task_map defining input/output nodes.
-            An external "causal_mask" -> node_name entry is optional and only
-            used by v1 graphs; v2 masks internally via the node's is_causal flag.
-        optimizer: Optax optimizer
+        batch: Batch dictionary with task-specific keys
+        structure: Graph structure
         rng_key: JAX random key
         use_causal_mask: Whether to apply causal masking
 
     Returns:
-        Tuple of (updated_params, updated_opt_state, avg_energy, output_cross_entropy, final_state)
+        Tuple of (grads, avg_energy, output_cross_entropy, final_state)
     """
     batch_size = batch["x"].shape[0]
     seq_len = batch["x"].shape[1]
@@ -223,14 +217,47 @@ def train_step_autoregressive(
     # Compute local gradients
     grads = compute_local_weight_gradients(params, final_state, structure)
 
-    # Update parameters
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = cast(GraphParams, optax.apply_updates(params, updates))
-
     # Compute output cross-entropy loss for perplexity metric - not used for gradients
     output_cross_entropy = compute_loss(
         final_state, y, structure.task_map["y"], loss_type="cross_entropy"
     )
+
+    return grads, avg_energy, output_cross_entropy, final_state
+
+
+def train_step_autoregressive(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+    use_causal_mask: bool = True,
+) -> Tuple[GraphParams, optax.OptState, float, float, GraphState]:
+    """
+    Single autoregressive training step with local updates (JIT path).
+
+    Args:
+        params: Current model parameters
+        opt_state: Optimizer state
+        batch: Batch of data with task-specific keys
+        structure: Graph structure
+        optimizer: Optax optimizer
+        rng_key: JAX random key
+        use_causal_mask: Whether to apply causal masking
+
+    Returns:
+        Tuple of (updated_params, updated_opt_state, avg_energy, ce_loss, final_state)
+    """
+    grads, avg_energy, output_cross_entropy, final_state = (
+        get_graph_param_gradient_autoregressive(
+            params, batch, structure, rng_key, use_causal_mask
+        )
+    )
+
+    # Update parameters using optimizer
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
 
     return (
         params,
@@ -239,6 +266,83 @@ def train_step_autoregressive(
         output_cross_entropy.astype(float),
         final_state,
     )
+
+
+def train_step_autoregressive_pmap(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+    use_causal_mask: bool = True,
+) -> Tuple[GraphParams, optax.OptState, jnp.ndarray, jnp.ndarray, GraphState]:
+    """
+    Training step for pmap: compute grads, average across devices, update.
+
+    Args:
+        params: Replicated parameters (has device axis)
+        opt_state: Replicated optimizer state (has device axis)
+        batch: Sharded batch (has device axis)
+        structure: Graph structure
+        optimizer: Optax optimizer
+        rng_key: JAX random key for this device
+        use_causal_mask: Whether to apply causal masking
+
+    Returns:
+        Tuple of (updated_params, updated_opt_state, energy_per_device, ce_loss_per_device, final_state)
+    """
+    grads, avg_energy, output_cross_entropy, final_state = (
+        get_graph_param_gradient_autoregressive(
+            params, batch, structure, rng_key, use_causal_mask
+        )
+    )
+
+    # Average gradients across all devices (data parallelism)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+
+    # Update parameters (each device now has same gradients)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+
+    return (
+        params,
+        opt_state,
+        avg_energy.astype(float),
+        output_cross_entropy.astype(float),
+        final_state,
+    )
+
+
+def create_pmap_train_step_autoregressive(
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    use_causal_mask: bool = True,
+):
+    """
+    Create a pmap'd autoregressive training step with static args in closure.
+
+    Args:
+        structure: Graph structure (static)
+        optimizer: Optimizer (static)
+        use_causal_mask: Whether to use causal masking (static)
+
+    Returns:
+        Pmap'd training step function
+    """
+
+    def step_fn(params, opt_state, batch, rng_key):
+        return train_step_autoregressive_pmap(
+            params,
+            opt_state,
+            batch,
+            structure,
+            optimizer,
+            rng_key,
+            use_causal_mask,
+        )
+
+    return jax.pmap(step_fn, axis_name="devices")
 
 
 def train_autoregressive(
@@ -251,9 +355,13 @@ def train_autoregressive(
     verbose: bool = True,
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
+    pmap_single_device: bool = False,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main training loop for autoregressive predictive coding.
+
+    Automatically detects available devices: uses JIT compilation on a single
+    device, pmap data parallelism across multiple devices.
 
     Args:
         params: Initial parameters
@@ -271,12 +379,11 @@ def train_autoregressive(
             Receives the epoch's mean training energy and CE loss; should
             accept **kwargs.
         iter_callback: Optional callback (epoch, batch_idx, loss) -> any
+        pmap_single_device: Force pmap code path for testing
 
     Returns:
         Tuple of (trained_params, energy_history, epoch_results)
     """
-    opt_state = optimizer.init(params)
-
     # Training hyperparameters
     num_epochs = config.get("num_epochs", 10)  # supports float (e.g. 1.5)
     use_causal_mask = config.get("use_causal_mask", True)
@@ -286,13 +393,30 @@ def train_autoregressive(
     total_epochs = math.ceil(num_epochs)
     frac = num_epochs - math.floor(num_epochs)
 
-    # JIT compile training step
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step_autoregressive(
-            p, o, b, structure, optimizer, k, use_causal_mask
-        )
-    )
+    # Device detection
+    n_devices = jax.device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
+    if verbose:
+        print(f"Training on {n_devices} device(s): {jax.devices()}")
+
+    opt_state = optimizer.init(params)
+
+    # Set up step function based on device path
+    if use_pmap:
+        params = replicate_params(params, n_devices)
+        opt_state = replicate_opt_state(opt_state, n_devices)
+        step_fn = create_pmap_train_step_autoregressive(
+            structure, optimizer, use_causal_mask
+        )
+    else:
+        step_fn = jax.jit(
+            lambda p, o, b, k: train_step_autoregressive(
+                p, o, b, structure, optimizer, k, use_causal_mask
+            )
+        )
+
+    _shard_warned = False
     iter_results = []
     epoch_results = []
 
@@ -309,9 +433,19 @@ def train_autoregressive(
         else:
             max_batches = num_batches
 
-        # Split keys for actual batch count
+        # Split keys for this epoch
         epoch_rng_key, rng_key = jax.random.split(rng_key)
-        batch_keys = jax.random.split(epoch_rng_key, max_batches)
+        if use_pmap:
+            dev_keys = (
+                jax.random.split(epoch_rng_key, n_devices)
+                if n_devices > 1
+                else epoch_rng_key[None, :]
+            )
+            batch_keys = jax.vmap(
+                lambda k: jax.random.split(k, max_batches)
+            )(dev_keys)
+        else:
+            batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
         batch_energies = []
         epoch_energy = 0.0
@@ -322,21 +456,28 @@ def train_autoregressive(
             if batch_idx >= max_batches:
                 break
 
-            # Convert batch to JAX format
-            if isinstance(batch_data, dict):
-                batch = {k: jnp.array(v) for k, v in batch_data.items()}
-            elif isinstance(batch_data, (list, tuple)):
-                batch = {
-                    "x": jnp.array(batch_data[0]),
-                    "y": jnp.array(batch_data[1]),
-                }
-            else:
-                raise ValueError(f"Unsupported batch format: {type(batch_data)}")
+            batch = _convert_batch(batch_data)
 
-            # Training step
-            params, opt_state, energy, ce_loss, _ = jit_train_step(
-                params, opt_state, batch, batch_keys[batch_idx]
-            )
+            if use_pmap:
+                try:
+                    batch = shard_batch(batch, n_devices)
+                except ValueError as e:
+                    if not _shard_warned:
+                        warnings.warn(
+                            f"Skipping batch (size not divisible by {n_devices}): {e}"
+                        )
+                        _shard_warned = True
+                    continue
+
+                params, opt_state, energy, ce_loss, _ = step_fn(
+                    params, opt_state, batch, batch_keys[:, batch_idx]
+                )
+                energy, ce_loss = unshard_energies(energy), float(jnp.mean(ce_loss))
+            else:
+                params, opt_state, energy, ce_loss, _ = step_fn(
+                    params, opt_state, batch, batch_keys[batch_idx]
+                )
+                energy, ce_loss = float(energy), float(ce_loss)
 
             epoch_energy += energy
             epoch_ce_loss += ce_loss
@@ -355,10 +496,15 @@ def train_autoregressive(
         # callers (e.g. the tuner) can report per-epoch progress to a pruner
         # without recomputing them. Callbacks should accept **kwargs.
         if epoch_callback is not None:
+            cb_params = (
+                jax.tree_util.tree_map(lambda x: x[0], params)
+                if use_pmap
+                else params
+            )
             epoch_results.append(
                 epoch_callback(
                     epoch_idx,
-                    params,
+                    cb_params,
                     structure,
                     config,
                     rng_key,
@@ -374,6 +520,10 @@ def train_autoregressive(
             print(
                 f"Train Epoch {epoch_idx + 1}/{total_epochs}, Energy: {avg_energy:.4f}, Loss: {avg_ce_loss:.4f}, Perplexity: {perplexity:.2f}"
             )
+
+    # Extract single-device params on return
+    if use_pmap:
+        params = jax.tree_util.tree_map(lambda x: x[0], params)
 
     return params, iter_results, epoch_results
 
@@ -646,6 +796,20 @@ def _eval_step_autoregressive(
     return output_cross_entropy, predictions
 
 
+def create_pmap_eval_step_autoregressive(
+    structure: GraphStructure,
+    use_causal_mask: bool,
+):
+    """Create a pmap'd evaluation step with static args in closure."""
+
+    def step_fn(params, batch, rng_key):
+        return _eval_step_autoregressive(
+            params, structure, batch, rng_key, use_causal_mask
+        )
+
+    return jax.pmap(step_fn, axis_name="devices")
+
+
 def evaluate_autoregressive(
     params: GraphParams,
     structure: GraphStructure,
@@ -653,9 +817,13 @@ def evaluate_autoregressive(
     config: dict,
     rng_key: jax.Array,
     debug: bool = False,
+    pmap_single_device: bool = False,
 ) -> Dict[str, float]:
     """
     Evaluate autoregressive model on test data.
+
+    Automatically detects available devices and uses pmap for multi-device
+    evaluation, or JIT for single-device.
 
     Computes:
     - Average loss (cross-entropy)
@@ -669,6 +837,7 @@ def evaluate_autoregressive(
         config: Evaluation config (use_causal_mask)
         rng_key: Random key
         debug: If True, print detailed diagnostics for first batch
+        pmap_single_device: If True, forces pmap path on single device
 
     Returns:
         Dictionary of metrics
@@ -684,81 +853,153 @@ def evaluate_autoregressive(
     except TypeError:
         raise TypeError("test_loader must support len()")
 
-    batch_keys = jax.random.split(rng_key, num_batches_total)
+    n_devices = jax.device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
-    # JIT compile the evaluation step
-    jit_eval_step = jax.jit(
-        lambda p, b, k: _eval_step_autoregressive(p, structure, b, k, use_causal_mask)
-    )
-
-    total_loss = 0.0
-    total_correct = 0
-    total_tokens = 0
-    num_batches = 0
-
-    for batch_idx, batch_data in enumerate(test_loader):
-        # Convert batch
-        if isinstance(batch_data, dict):
-            batch = {k: jnp.array(v) for k, v in batch_data.items()}
-        elif isinstance(batch_data, (list, tuple)):
-            batch = {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
+    if use_pmap:
+        epoch_key, rng_key = jax.random.split(rng_key)
+        if n_devices > 1:
+            device_keys = jax.random.split(epoch_key, n_devices)
         else:
-            raise ValueError(f"Unsupported batch format: {type(batch_data)}")
+            device_keys = jnp.expand_dims(epoch_key, axis=0)
 
-        batch_size = batch["x"].shape[0]
+        replicated_params = replicate_params(params, n_devices)
+        batch_keys_per_device = jax.vmap(
+            lambda k: jax.random.split(k, num_batches_total)
+        )(device_keys)
 
-        # Run JIT-compiled evaluation step
-        loss, predictions = jit_eval_step(params, batch, batch_keys[batch_idx])
-        total_loss += float(loss)
+        pmap_eval_step = create_pmap_eval_step_autoregressive(
+            structure, use_causal_mask
+        )
 
-        # Debug diagnostics for first batch
-        if debug and batch_idx == 0:
-            tgt = batch["y"]  # (batch, seq_len, vocab_size) one-hot
+        total_loss = 0.0
+        total_correct = 0
+        total_tokens = 0
+        num_batches = 0
 
-            # Check individual loss components
-            log_preds = jnp.log(predictions + 1e-10)
-            per_token_loss = -jnp.sum(tgt * log_preds, axis=-1)  # (batch, seq_len)
-            print(
-                f"  [DEBUG] per-token CE loss: min={float(jnp.min(per_token_loss)):.4f}, max={float(jnp.max(per_token_loss)):.4f}, mean={float(jnp.mean(per_token_loss)):.4f}"
+        for batch_idx, batch_data in enumerate(test_loader):
+            batch_key_for_step = batch_keys_per_device[:, batch_idx]
+            batch = _convert_batch(batch_data)
+            batch_size = next(iter(batch.values())).shape[0]
+
+            if batch_size % n_devices != 0:
+                pad_size = n_devices - (batch_size % n_devices)
+                batch = {
+                    k: jnp.concatenate(
+                        [v, jnp.zeros((pad_size,) + v.shape[1:], dtype=v.dtype)]
+                    )
+                    for k, v in batch.items()
+                }
+            else:
+                pad_size = 0
+
+            batch_sharded = shard_batch(batch, n_devices)
+            loss_sharded, preds_sharded = pmap_eval_step(
+                replicated_params, batch_sharded, batch_key_for_step
             )
 
-            token_intrinsic_perplexity = jnp.exp(
-                -jnp.sum(predictions * log_preds, axis=-1)
-            )  # (batch, seq_len)
-            print(
-                f"  [DEBUG] per-token intrinsic perplexity: min={float(jnp.min(token_intrinsic_perplexity)):.4f}, max={float(jnp.max(token_intrinsic_perplexity)):.4f}, mean={float(jnp.mean(token_intrinsic_perplexity)):.4f}"
+            total_loss += float(jnp.mean(loss_sharded))
+
+            padded_batch_size = batch_size + pad_size
+            predictions = preds_sharded.reshape(
+                padded_batch_size, *preds_sharded.shape[2:]
             )
+            predictions = predictions[:batch_size]
 
-            # Check if there are extreme values
-            correct_probs = jnp.sum(
-                tgt * predictions, axis=-1
-            )  # prob assigned to correct class
-            print(
-                f"  [DEBUG] prob of correct token: min={float(jnp.min(correct_probs)):.6f}, max={float(jnp.max(correct_probs)):.6f}, mean={float(jnp.mean(correct_probs)):.6f}"
+            targets = batch["y"][:batch_size]
+            pred_tokens = jnp.argmax(predictions, axis=-1)
+            if targets.ndim == 3:
+                target_tokens = jnp.argmax(targets, axis=-1)
+            else:
+                target_tokens = targets
+
+            correct = jnp.sum(pred_tokens == target_tokens)
+            total_correct += int(correct)
+            total_tokens += int(batch_size * predictions.shape[1])
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        perplexity = float(jnp.exp(avg_loss))
+        accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+
+        return {
+            "loss": avg_loss,
+            "perplexity": perplexity,
+            "accuracy": accuracy,
+            "num_batches": num_batches,
+        }
+
+    else:
+        batch_keys = jax.random.split(rng_key, num_batches_total)
+
+        # JIT compile the evaluation step
+        jit_eval_step = jax.jit(
+            lambda p, b, k: _eval_step_autoregressive(
+                p, structure, b, k, use_causal_mask
             )
+        )
 
-            print(f"  [DEBUG] batch loss: {float(loss):.4f}")
+        total_loss = 0.0
+        total_correct = 0
+        total_tokens = 0
+        num_batches = 0
 
-        # Compute accuracy
-        targets = batch["y"]
-        pred_tokens = jnp.argmax(predictions, axis=-1)
-        if targets.ndim == 3:
-            target_tokens = jnp.argmax(targets, axis=-1)
-        else:
-            target_tokens = targets
+        for batch_idx, batch_data in enumerate(test_loader):
+            batch = _convert_batch(batch_data)
+            batch_size = batch["x"].shape[0]
 
-        correct = jnp.sum(pred_tokens == target_tokens)
-        total_correct += int(correct)
-        total_tokens += int(batch_size * predictions.shape[1])
-        num_batches += 1
+            # Run JIT-compiled evaluation step
+            loss, predictions = jit_eval_step(params, batch, batch_keys[batch_idx])
+            total_loss += float(loss)
 
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    perplexity = float(jnp.exp(avg_loss))
-    accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+            # Debug diagnostics for first batch
+            if debug and batch_idx == 0:
+                tgt = batch["y"]  # (batch, seq_len, vocab_size) one-hot
 
-    return {
-        "loss": avg_loss,
-        "perplexity": perplexity,
-        "accuracy": accuracy,
-        "num_batches": num_batches,
-    }
+                # Check individual loss components
+                log_preds = jnp.log(predictions + 1e-10)
+                per_token_loss = -jnp.sum(tgt * log_preds, axis=-1)  # (batch, seq_len)
+                print(
+                    f"  [DEBUG] per-token CE loss: min={float(jnp.min(per_token_loss)):.4f}, max={float(jnp.max(per_token_loss)):.4f}, mean={float(jnp.mean(per_token_loss)):.4f}"
+                )
+
+                token_intrinsic_perplexity = jnp.exp(
+                    -jnp.sum(predictions * log_preds, axis=-1)
+                )  # (batch, seq_len)
+                print(
+                    f"  [DEBUG] per-token intrinsic perplexity: min={float(jnp.min(token_intrinsic_perplexity)):.4f}, max={float(jnp.max(token_intrinsic_perplexity)):.4f}, mean={float(jnp.mean(token_intrinsic_perplexity)):.4f}"
+                )
+
+                # Check if there are extreme values
+                correct_probs = jnp.sum(
+                    tgt * predictions, axis=-1
+                )  # prob assigned to correct class
+                print(
+                    f"  [DEBUG] prob of correct token: min={float(jnp.min(correct_probs)):.6f}, max={float(jnp.max(correct_probs)):.6f}, mean={float(jnp.mean(correct_probs)):.6f}"
+                )
+
+                print(f"  [DEBUG] batch loss: {float(loss):.4f}")
+
+            # Compute accuracy
+            targets = batch["y"]
+            pred_tokens = jnp.argmax(predictions, axis=-1)
+            if targets.ndim == 3:
+                target_tokens = jnp.argmax(targets, axis=-1)
+            else:
+                target_tokens = targets
+
+            correct = jnp.sum(pred_tokens == target_tokens)
+            total_correct += int(correct)
+            total_tokens += int(batch_size * predictions.shape[1])
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        perplexity = float(jnp.exp(avg_loss))
+        accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+
+        return {
+            "loss": avg_loss,
+            "perplexity": perplexity,
+            "accuracy": accuracy,
+            "num_batches": num_batches,
+        }
