@@ -9,7 +9,7 @@ classification head.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -20,7 +20,13 @@ from fabricpc.core.inference import InferenceBase
 from fabricpc.core.initializers import InitializerBase, NormalInitializer, initialize
 from fabricpc.core.mupc import MuPCConfig
 from fabricpc.core.topology import Edge
-from fabricpc.core.types import NodeInfo, NodeParams, NodeState
+from fabricpc.core.types import (
+    GraphParams,
+    GraphStructure,
+    NodeInfo,
+    NodeParams,
+    NodeState,
+)
 from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import FeedforwardStateInit
 from fabricpc.nodes import (
@@ -32,6 +38,7 @@ from fabricpc.nodes import (
     Mlp2ResidualNode,
     NodeBase,
     SlotSpec,
+    VocabProjectionNode,
 )
 from fabricpc.utils.helpers import layernorm
 
@@ -207,7 +214,7 @@ class FinalLayerNormNode(NodeBase):
         return node_info.node_class.energy_functional(state, node_info)
 
 
-def create_encoder_sentiment_classifier(
+def _build_encoder_backbone(
     *,
     depth: int,
     embed_dim: int,
@@ -215,14 +222,8 @@ def create_encoder_sentiment_classifier(
     mlp_dim: int,
     seq_len: int,
     vocab_size: int,
-    num_classes: int,
-    inference: InferenceBase,
-    weight_init: Optional[InitializerBase] = None,
-):
-    """Create a bidirectional encoder transformer for sequence classification."""
-    if weight_init is None:
-        weight_init = NormalInitializer(std=0.02)
-
+    weight_init: InitializerBase,
+) -> tuple[IdentityNode, NodeBase, list[NodeBase], list[Edge]]:
     input_node = IdentityNode(shape=(seq_len,), name="input_ids")
     embed = EmbeddingNode(
         name="token_embeddings",
@@ -239,13 +240,13 @@ def create_encoder_sentiment_classifier(
         weight_init=weight_init,
     )
 
-    nodes = [input_node, embed, positions]
+    nodes: list[NodeBase] = [input_node, embed, positions]
     edges = [
         Edge(source=input_node, target=embed.slot("in")),
         Edge(source=embed, target=positions.slot("in")),
     ]
 
-    previous_residual = positions
+    previous_residual: NodeBase = positions
     for i in range(depth):
         mha = MhaResidualNode(
             name=f"L{i}_mha",
@@ -287,6 +288,36 @@ def create_encoder_sentiment_classifier(
         name="final_layernorm",
         embed_dim=embed_dim,
     )
+    nodes.append(final_ln)
+    edges.append(Edge(source=previous_residual, target=final_ln.slot("in")))
+    return input_node, final_ln, nodes, edges
+
+
+def create_encoder_sentiment_classifier(
+    *,
+    depth: int,
+    embed_dim: int,
+    num_heads: int,
+    mlp_dim: int,
+    seq_len: int,
+    vocab_size: int,
+    num_classes: int,
+    inference: InferenceBase,
+    weight_init: Optional[InitializerBase] = None,
+) -> GraphStructure:
+    """Create a bidirectional encoder transformer for sequence classification."""
+    if weight_init is None:
+        weight_init = NormalInitializer(std=0.02)
+
+    input_node, final_ln, nodes, edges = _build_encoder_backbone(
+        depth=depth,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+        weight_init=weight_init,
+    )
     pool = FirstTokenPoolNode(shape=(embed_dim,), name="pooler")
     classifier = Linear(
         shape=(num_classes,),
@@ -295,10 +326,9 @@ def create_encoder_sentiment_classifier(
         energy=CrossEntropyEnergy(),
         weight_init=NormalInitializer(std=0.02),
     )
-    nodes.extend([final_ln, pool, classifier])
+    nodes.extend([pool, classifier])
     edges.extend(
         [
-            Edge(source=previous_residual, target=final_ln.slot("in")),
             Edge(source=final_ln, target=pool.slot("in")),
             Edge(source=pool, target=classifier.slot("in")),
         ]
@@ -312,3 +342,102 @@ def create_encoder_sentiment_classifier(
         scaling=MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),
     )
+
+
+def create_encoder_mlm_model(
+    *,
+    depth: int,
+    embed_dim: int,
+    num_heads: int,
+    mlp_dim: int,
+    seq_len: int,
+    vocab_size: int,
+    inference: InferenceBase,
+    weight_init: Optional[InitializerBase] = None,
+) -> GraphStructure:
+    """Create a bidirectional encoder transformer for masked LM pretraining."""
+    if weight_init is None:
+        weight_init = NormalInitializer(std=0.02)
+
+    input_node, final_ln, nodes, edges = _build_encoder_backbone(
+        depth=depth,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+        weight_init=weight_init,
+    )
+    mlm_head = VocabProjectionNode(
+        shape=(seq_len, vocab_size),
+        name="mlm_head",
+        vocab_size=vocab_size,
+        embed_dim=embed_dim,
+        weight_init=NormalInitializer(std=float(jnp.sqrt(1.0 / embed_dim))),
+    )
+    nodes.append(mlm_head)
+    edges.append(Edge(source=final_ln, target=mlm_head.slot("in")))
+
+    return graph(
+        nodes=nodes,
+        edges=edges,
+        task_map=TaskMap(x=input_node, y=mlm_head),
+        inference=inference,
+        scaling=MuPCConfig(include_output=False),
+        graph_state_initializer=FeedforwardStateInit(),
+    )
+
+
+def _default_encoder_node_names(source_params: GraphParams) -> list[str]:
+    names = ["token_embeddings", "position_embeddings"]
+    layer = 0
+    while f"L{layer}_mha" in source_params.nodes:
+        names.extend([f"L{layer}_mha", f"L{layer}_mlp1", f"L{layer}_mlp2"])
+        layer += 1
+    names.append("final_layernorm")
+    return names
+
+
+def copy_encoder_params(
+    source_params: GraphParams,
+    target_params: GraphParams,
+    node_names: Optional[Sequence[str]] = None,
+) -> GraphParams:
+    """Copy matching encoder node params into another BERT-style graph."""
+    if node_names is None:
+        node_names = _default_encoder_node_names(source_params)
+
+    copied_nodes = {
+        name: NodeParams(weights=dict(params.weights), biases=dict(params.biases))
+        for name, params in target_params.nodes.items()
+    }
+
+    for node_name in node_names:
+        if node_name not in source_params.nodes:
+            raise ValueError(f"source params missing encoder node {node_name!r}")
+        if node_name not in copied_nodes:
+            raise ValueError(f"target params missing encoder node {node_name!r}")
+
+        source_node = source_params.nodes[node_name]
+        target_node = copied_nodes[node_name]
+        for collection_name in ("weights", "biases"):
+            source_collection = getattr(source_node, collection_name)
+            target_collection = getattr(target_node, collection_name)
+            if source_collection.keys() != target_collection.keys():
+                raise ValueError(
+                    f"{node_name}.{collection_name} keys differ: "
+                    f"source={sorted(source_collection)} target={sorted(target_collection)}"
+                )
+            for key, source_value in source_collection.items():
+                target_value = target_collection[key]
+                if source_value.shape != target_value.shape:
+                    raise ValueError(
+                        f"shape mismatch for {node_name}.{collection_name}[{key!r}]: "
+                        f"source={source_value.shape} target={target_value.shape}"
+                    )
+
+        copied_nodes[node_name] = NodeParams(
+            weights=dict(source_node.weights), biases=dict(source_node.biases)
+        )
+
+    return GraphParams(nodes=copied_nodes)
