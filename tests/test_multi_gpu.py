@@ -448,8 +448,8 @@ class TestAutoRegressiveMultiGPU:
             f"Autoregressive pmap (single shard) must match JIT! Max rel diff: {max_relative_diff}"
         )
 
-    def test_autoregressive_pmap_reduces_energy(self, transformer_structure, rng_key):
-        """Test that autoregressive pmap reduces energy over training."""
+    def test_autoregressive_pmap_energy_is_finite(self, transformer_structure, rng_key):
+        """Test that autoregressive pmap produces finite energies during training."""
         model_key, train_key, data_key = jax.random.split(rng_key, 3)
 
         params = initialize_params(transformer_structure, model_key)
