@@ -91,6 +91,7 @@ def compute_loss(
     targets: jnp.ndarray,
     output_node: str,
     loss_type: str = "cross_entropy",
+    loss_mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """
     Compute differentiable loss
@@ -100,6 +101,9 @@ def compute_loss(
         targets: Target values (labels) for output node, expects one-hot for cross-entropy
         output_node: Name of the output node
         loss_type: Loss function type: "cross_entropy" or "mse"
+        loss_mask: Optional mask over prediction positions to include in the
+            average. Used by masked-language-model training where only selected
+            token positions contribute to the objective.
 
     Returns:
         Scalar loss value (mean over batch)
@@ -116,10 +120,32 @@ def compute_loss(
         if targets.ndim == predictions.ndim - 1:
             targets = jax.nn.one_hot(targets, predictions.shape[-1])
         log_preds = jnp.log(predictions + 1e-10)
-        loss = -jnp.mean(jnp.sum(targets * log_preds, axis=-1))
+        per_item_loss = -jnp.sum(targets * log_preds, axis=-1)
+        if loss_mask is not None:
+            if loss_mask.shape != per_item_loss.shape:
+                raise ValueError(
+                    "cross_entropy loss_mask shape must match per-item loss shape "
+                    f"exactly; got {loss_mask.shape}, expected {per_item_loss.shape}"
+                )
+            loss_mask = loss_mask.astype(per_item_loss.dtype)
+            loss = jnp.sum(per_item_loss * loss_mask) / jnp.maximum(
+                jnp.sum(loss_mask), 1.0
+            )
+        else:
+            loss = jnp.mean(per_item_loss)
 
     elif loss_type == "mse":
-        loss = jnp.mean((predictions - targets) ** 2)
+        per_item_loss = (predictions - targets) ** 2
+        if loss_mask is not None:
+            loss_mask = loss_mask.astype(per_item_loss.dtype)
+            while loss_mask.ndim < per_item_loss.ndim:
+                loss_mask = loss_mask[..., None]
+            loss_mask = jnp.broadcast_to(loss_mask, per_item_loss.shape)
+            loss = jnp.sum(per_item_loss * loss_mask) / jnp.maximum(
+                jnp.sum(loss_mask), 1.0
+            )
+        else:
+            loss = jnp.mean(per_item_loss)
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")

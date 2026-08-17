@@ -103,7 +103,7 @@ def train_step_backprop(
     optimizer: optax.GradientTransformation,
     rng_key: jax.Array,
     loss_type: str = "cross_entropy",
-) -> Tuple[GraphParams, optax.OptState, float]:
+) -> Tuple[GraphParams, optax.OptState, jax.Array]:
     """
     Single backprop training step.
 
@@ -129,6 +129,88 @@ def train_step_backprop(
     params = cast(GraphParams, optax.apply_updates(params, updates))
 
     return params, opt_state, loss
+
+
+def train_step_backprop_mlm(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+) -> Tuple[GraphParams, optax.OptState, jax.Array]:
+    """Single backprop step for masked-language-model pretraining."""
+    if "loss_mask" not in batch:
+        raise ValueError("MLM training requires batch['loss_mask']")
+    if int(jnp.sum(batch["loss_mask"].astype(bool))) == 0:
+        raise ValueError("MLM loss_mask must include at least one masked token")
+
+    def loss_fn(p):
+        state = compute_forward_pass(p, structure, batch, rng_key)
+        return compute_loss(
+            state,
+            batch["y"],
+            structure.task_map["y"],
+            loss_type="cross_entropy",
+            loss_mask=batch["loss_mask"],
+        )
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+
+    return params, opt_state, loss
+
+
+def evaluate_mlm(
+    params: GraphParams,
+    structure: GraphStructure,
+    loader: Any,
+    rng_key: jax.Array,
+) -> Dict[str, float]:
+    """Evaluate masked-token loss and accuracy over an MLM loader."""
+    total_loss = 0.0
+    total_correct = 0
+    total_masked = 0
+
+    for batch_data in loader:
+        if not isinstance(batch_data, dict):
+            raise ValueError("MLM loaders must yield dict batches")
+        if "loss_mask" not in batch_data:
+            raise ValueError("MLM evaluation requires batch['loss_mask']")
+        batch = {k: jnp.array(v) for k, v in batch_data.items()}
+        rng_key, step_key = jax.random.split(rng_key)
+        state = compute_forward_pass(params, structure, batch, step_key)
+        predictions = state.nodes[structure.task_map["y"]].z_mu
+        pred_ids = jnp.argmax(predictions, axis=-1)
+        if batch["loss_mask"].shape != pred_ids.shape:
+            raise ValueError(
+                "MLM loss_mask shape must match token prediction shape exactly; "
+                f"got {batch['loss_mask'].shape}, expected {pred_ids.shape}"
+            )
+        loss = compute_loss(
+            state,
+            batch["y"],
+            structure.task_map["y"],
+            loss_type="cross_entropy",
+            loss_mask=batch["loss_mask"],
+        )
+
+        mask = batch["loss_mask"].astype(bool)
+        masked_count = int(jnp.sum(mask))
+        correct = int(jnp.sum((pred_ids == batch["y"]) & mask))
+
+        total_loss += float(loss) * masked_count
+        total_correct += correct
+        total_masked += masked_count
+
+    if total_masked == 0:
+        return {"masked_loss": 0.0, "masked_accuracy": 0.0, "num_masked_tokens": 0}
+    return {
+        "masked_loss": total_loss / total_masked,
+        "masked_accuracy": total_correct / total_masked,
+        "num_masked_tokens": total_masked,
+    }
 
 
 def train_backprop(
