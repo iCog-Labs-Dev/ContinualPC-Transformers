@@ -541,3 +541,23 @@ class TestAutoRegressiveMultiGPU:
         assert np.isclose(metrics_jit["perplexity"], metrics_pmap["perplexity"], rtol=1e-4, atol=1e-4)
         assert np.isclose(metrics_jit["accuracy"], metrics_pmap["accuracy"], rtol=1e-4, atol=1e-4)
 
+    def test_autoregressive_zero_batches_processed_raises(self, transformer_structure, rng_key):
+        """Test that train_autoregressive raises RuntimeError if all batches are skipped."""
+        model_key, train_key, _ = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-3)
+        train_config = {"num_epochs": 1, "use_causal_mask": True}
+        empty_loader = []
+
+        with pytest.raises(RuntimeError, match="No batches were processed"):
+            train_autoregressive(
+                params,
+                transformer_structure,
+                empty_loader,
+                optimizer,
+                train_config,
+                train_key,
+                verbose=False,
+            )
+
