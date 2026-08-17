@@ -1,0 +1,378 @@
+"""Tests for the minimal BERT-style masked-language-model path."""
+
+import os
+import importlib.util
+from pathlib import Path
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.core.types import GraphParams, GraphState, NodeState
+from fabricpc.graph_initialization import initialize_params
+from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.models import (
+    copy_encoder_params,
+    create_encoder_mlm_model,
+    create_encoder_sentiment_classifier,
+)
+from fabricpc.nodes import VocabProjectionNode
+import fabricpc.training as training
+from fabricpc.training.train_backprop import (
+    compute_loss,
+    evaluate_mlm,
+    train_step_backprop_mlm,
+)
+
+
+def build_small_mlm():
+    return create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+
+
+def load_example_module(name: str):
+    demo_path = Path(__file__).resolve().parents[1] / "examples" / name
+    spec = importlib.util.spec_from_file_location(name.replace(".py", ""), demo_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def tree_any_changed(before, after):
+    before_leaves = jax.tree_util.tree_leaves(before)
+    after_leaves = jax.tree_util.tree_leaves(after)
+    assert len(before_leaves) == len(after_leaves)
+    return any(not jnp.allclose(a, b) for a, b in zip(before_leaves, after_leaves))
+
+
+def tree_allclose(left, right):
+    left_leaves = jax.tree_util.tree_leaves(left)
+    right_leaves = jax.tree_util.tree_leaves(right)
+    assert len(left_leaves) == len(right_leaves)
+    return all(jnp.allclose(a, b) for a, b in zip(left_leaves, right_leaves))
+
+
+def test_mlm_model_forward_shape_smoke(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    x = jnp.array([[1, 2, 3, 4, 0, 0], [1, 5, 6, 7, 8, 0]], dtype=jnp.int32)
+
+    state = initialize_graph_state(
+        structure,
+        batch_size=2,
+        rng_key=rng_key,
+        clamps={"input_ids": x},
+        params=params,
+    )
+
+    probs = state.nodes["mlm_head"].z_mu
+    assert probs.shape == (2, 6, 20)
+    assert jnp.all(jnp.isfinite(probs))
+    assert jnp.allclose(jnp.sum(probs, axis=-1), 1.0, atol=1e-5)
+
+
+def test_mlm_head_uses_vocab_projection_node():
+    structure = build_small_mlm()
+
+    assert structure.nodes["mlm_head"].node_info.node_class is VocabProjectionNode
+
+
+def test_mlm_training_helpers_are_exported_from_training_package():
+    assert training.train_step_backprop_mlm is train_step_backprop_mlm
+    assert training.evaluate_mlm is evaluate_mlm
+
+
+def test_compute_loss_with_mask_ignores_unmasked_positions():
+    predictions = jnp.array(
+        [
+            [
+                [0.9, 0.1],
+                [0.2, 0.8],
+                [0.7, 0.3],
+            ]
+        ]
+    )
+    dummy = jnp.zeros_like(predictions)
+    final_state = GraphState(
+        nodes={
+            "mlm": NodeState(
+                z_latent=dummy,
+                z_mu=predictions,
+                error=dummy,
+                energy=jnp.zeros((1,)),
+                latent_grad=dummy,
+            )
+        },
+        batch_size=1,
+    )
+    loss_mask = jnp.array([[True, False, False]])
+
+    original_targets = jnp.array([[0, 1, 0]])
+    changed_unmasked_targets = jnp.array([[0, 0, 1]])
+
+    original_loss = compute_loss(
+        final_state,
+        original_targets,
+        "mlm",
+        loss_type="cross_entropy",
+        loss_mask=loss_mask,
+    )
+    changed_loss = compute_loss(
+        final_state,
+        changed_unmasked_targets,
+        "mlm",
+        loss_type="cross_entropy",
+        loss_mask=loss_mask,
+    )
+
+    assert jnp.allclose(original_loss, changed_loss)
+
+
+def test_compute_loss_masked_mse_averages_over_masked_features():
+    predictions = jnp.array([[[1.0, 3.0], [10.0, 10.0]]])
+    targets = jnp.array([[[0.0, 1.0], [0.0, 0.0]]])
+    dummy = jnp.zeros_like(predictions)
+    final_state = GraphState(
+        nodes={
+            "out": NodeState(
+                z_latent=dummy,
+                z_mu=predictions,
+                error=dummy,
+                energy=jnp.zeros((1,)),
+                latent_grad=dummy,
+            )
+        },
+        batch_size=1,
+    )
+
+    loss = compute_loss(
+        final_state,
+        targets,
+        "out",
+        loss_type="mse",
+        loss_mask=jnp.array([[True, False]]),
+    )
+
+    assert jnp.allclose(loss, 2.5)
+
+
+def test_compute_loss_cross_entropy_rejects_broadcastable_mask():
+    predictions = jnp.array([[[0.9, 0.1], [0.2, 0.8], [0.7, 0.3]]])
+    dummy = jnp.zeros_like(predictions)
+    final_state = GraphState(
+        nodes={
+            "mlm": NodeState(
+                z_latent=dummy,
+                z_mu=predictions,
+                error=dummy,
+                energy=jnp.zeros((1,)),
+                latent_grad=dummy,
+            )
+        },
+        batch_size=1,
+    )
+
+    try:
+        compute_loss(
+            final_state,
+            jnp.array([[0, 1, 0]]),
+            "mlm",
+            loss_type="cross_entropy",
+            loss_mask=jnp.array([[True], [False], [True]]),
+        )
+    except ValueError as exc:
+        assert "loss_mask shape" in str(exc)
+        assert "must match" in str(exc)
+    else:
+        raise AssertionError("Expected cross-entropy loss_mask shape validation")
+
+
+def test_demo_checkpoint_roundtrip_json_npz_and_encoder_copy(tmp_path, rng_key):
+    pretrain_demo = load_example_module("bert_mlm_pretrain_demo.py")
+    downstream_demo = load_example_module("bert_downstream_finetune_demo.py")
+
+    source_structure = build_small_mlm()
+    source_params = initialize_params(source_structure, rng_key)
+    checkpoint_path = tmp_path / "mlm_checkpoint.json"
+    vocab = {"[PAD]": 0, "[MASK]": 1, "great": 2}
+    config = {"depth": 1, "embed_dim": 16, "num_heads": 4, "mlp_dim": 32, "seq_len": 6}
+
+    pretrain_demo.save_checkpoint(str(checkpoint_path), source_params, vocab, config)
+    loaded = downstream_demo.load_checkpoint(str(checkpoint_path))
+
+    assert checkpoint_path.exists()
+    assert checkpoint_path.suffix == ".json"
+    assert checkpoint_path.with_suffix(".json.npz").exists()
+    assert isinstance(loaded["params"], GraphParams)
+    assert loaded["vocab"] == vocab
+    assert loaded["config"] == config
+    assert tree_allclose(
+        source_params.nodes["token_embeddings"],
+        loaded["params"].nodes["token_embeddings"],
+    )
+    assert tree_allclose(
+        source_params.nodes["L0_mha"], loaded["params"].nodes["L0_mha"]
+    )
+
+    target_structure = create_encoder_sentiment_classifier(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        num_classes=2,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+    _, target_key = jax.random.split(rng_key)
+    target_params = initialize_params(target_structure, target_key)
+    original_classifier = target_params.nodes["classifier"]
+    copied_params = copy_encoder_params(loaded["params"], target_params)
+
+    assert tree_allclose(
+        loaded["params"].nodes["token_embeddings"],
+        copied_params.nodes["token_embeddings"],
+    )
+    assert tree_allclose(
+        loaded["params"].nodes["L0_mha"], copied_params.nodes["L0_mha"]
+    )
+    assert tree_allclose(original_classifier, copied_params.nodes["classifier"])
+    with np.load(
+        checkpoint_path.with_suffix(".json.npz"), allow_pickle=False
+    ) as tensors:
+        assert any(key.startswith("token_embeddings/weights/") for key in tensors)
+
+
+def test_train_step_backprop_mlm_updates_params(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adam(1e-2)
+    opt_state = optimizer.init(params)
+    batch = {
+        "x": jnp.array([[1, 2, 3, 4, 0, 0], [1, 5, 6, 7, 8, 0]], dtype=jnp.int32),
+        "y": jnp.array([[1, 9, 3, 4, 0, 0], [1, 5, 10, 7, 8, 0]], dtype=jnp.int32),
+        "loss_mask": jnp.array(
+            [
+                [False, True, False, False, False, False],
+                [False, False, True, False, False, False],
+            ]
+        ),
+    }
+
+    new_params, _, loss = train_step_backprop_mlm(
+        params, opt_state, batch, structure, optimizer, rng_key
+    )
+
+    assert jnp.isfinite(loss)
+    assert tree_any_changed(params, new_params)
+
+
+def test_train_step_backprop_mlm_requires_nonempty_loss_mask(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2, weight_decay=1e-1)
+    opt_state = optimizer.init(params)
+    batch = {
+        "x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "y": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "loss_mask": jnp.array([[False, False, False, False, False, False]]),
+    }
+
+    try:
+        train_step_backprop_mlm(params, opt_state, batch, structure, optimizer, rng_key)
+    except ValueError as exc:
+        assert "loss_mask" in str(exc)
+        assert "at least one" in str(exc)
+    else:
+        raise AssertionError("Expected empty MLM loss_mask to be rejected")
+
+
+def test_train_step_backprop_mlm_requires_loss_mask(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adam(1e-2)
+    opt_state = optimizer.init(params)
+    batch = {
+        "x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "y": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+    }
+
+    try:
+        train_step_backprop_mlm(params, opt_state, batch, structure, optimizer, rng_key)
+    except ValueError as exc:
+        assert "loss_mask" in str(exc)
+        assert "requires" in str(exc)
+    else:
+        raise AssertionError("Expected missing MLM loss_mask to be rejected")
+
+
+def test_evaluate_mlm_counts_only_masked_tokens(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    batch = {
+        "x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "y": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "loss_mask": jnp.array([[False, True, False, True, False, False]]),
+    }
+
+    metrics = evaluate_mlm(params, structure, [batch], rng_key)
+
+    assert metrics["num_masked_tokens"] == 2
+    assert 0.0 <= metrics["masked_accuracy"] <= 1.0
+    assert jnp.isfinite(metrics["masked_loss"])
+
+
+def test_evaluate_mlm_rejects_malformed_loss_mask(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    batch = {
+        "x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "y": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
+        "loss_mask": jnp.array([[True], [False], [True]]),
+    }
+
+    try:
+        evaluate_mlm(params, structure, [batch], rng_key)
+    except ValueError as exc:
+        assert "loss_mask shape" in str(exc)
+        assert "must match" in str(exc)
+    else:
+        raise AssertionError("Expected malformed eval loss_mask to be rejected")
+
+
+def test_copy_encoder_params_copies_encoder_and_leaves_head(rng_key):
+    source_structure = build_small_mlm()
+    target_structure = create_encoder_sentiment_classifier(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        num_classes=2,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+    source_params = initialize_params(source_structure, rng_key)
+    _, target_key = jax.random.split(rng_key)
+    target_params = initialize_params(target_structure, target_key)
+    original_classifier = target_params.nodes["classifier"]
+
+    copied_params = copy_encoder_params(source_params, target_params)
+
+    assert tree_allclose(
+        source_params.nodes["token_embeddings"], copied_params.nodes["token_embeddings"]
+    )
+    assert tree_allclose(source_params.nodes["L0_mha"], copied_params.nodes["L0_mha"])
+    assert tree_allclose(original_classifier, copied_params.nodes["classifier"])
