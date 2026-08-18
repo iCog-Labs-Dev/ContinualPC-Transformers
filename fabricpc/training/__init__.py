@@ -30,6 +30,8 @@ from fabricpc.training.train_backprop import (
     evaluate_backprop_autoregressive,
     train_step_backprop_mlm,
     evaluate_mlm,
+    train_backprop_mlm,
+    create_pmap_train_step_backprop_mlm,
 )
 
 # Backward-compatibility aliases (deprecated, will be removed)
@@ -70,4 +72,6 @@ __all__ = [
     # Backprop Masked LM
     "train_step_backprop_mlm",
     "evaluate_mlm",
+    "train_backprop_mlm",
+    "create_pmap_train_step_backprop_mlm",
 ]

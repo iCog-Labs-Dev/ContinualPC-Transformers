@@ -15,13 +15,16 @@ Use cases:
 - Standard deep learning workflows
 """
 
+from pathlib import Path
 from typing import Dict, Tuple, Any, List, Optional, Callable, cast
+import json
 import math
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
-from fabricpc.core.types import GraphParams, GraphStructure, GraphState
+from fabricpc.core.types import GraphParams, GraphStructure, GraphState, NodeParams
 from fabricpc.graph_initialization.state_initializer import (
     initialize_graph_state,
     FeedforwardStateInit,
@@ -79,10 +82,11 @@ def compute_forward_pass(
 
     batch_size = batch["x"].shape[0]
 
-    # Clamp ONLY input node (not output!) - key difference from PC
+    # Clamp inputs and auxiliary non-target nodes (not output!) - key difference from PC
     clamps = {}
-    if "x" in structure.task_map:
-        clamps[structure.task_map["x"]] = batch["x"]
+    for task_name, task_value in batch.items():
+        if task_name in structure.task_map and task_name not in {"y", "loss_mask"}:
+            clamps[structure.task_map[task_name]] = task_value
 
     # Single forward pass via initialize_state with feedforward init
     state = initialize_graph_state(
@@ -162,6 +166,218 @@ def train_step_backprop_mlm(
     return params, opt_state, loss
 
 
+def _train_step_backprop_mlm_no_validate(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+) -> Tuple[GraphParams, optax.OptState, jax.Array]:
+    def loss_fn(p):
+        state = compute_forward_pass(p, structure, batch, rng_key)
+        return compute_loss(
+            state,
+            batch["y"],
+            structure.task_map["y"],
+            loss_type="cross_entropy",
+            loss_mask=batch["loss_mask"],
+        )
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+    return params, opt_state, loss
+
+
+def train_step_backprop_mlm_pmap(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+) -> Tuple[GraphParams, optax.OptState, jax.Array]:
+    """Data-parallel MLM backprop step for use under ``jax.pmap``."""
+    mask = batch["loss_mask"].astype(jnp.float32)
+
+    def loss_numerator(p):
+        state = compute_forward_pass(p, structure, batch, rng_key)
+        predictions = state.nodes[structure.task_map["y"]].z_mu
+        targets = jax.nn.one_hot(batch["y"], predictions.shape[-1])
+        per_token_loss = -jnp.sum(targets * jnp.log(predictions + 1e-10), axis=-1)
+        return jnp.sum(per_token_loss * mask)
+
+    numerator, grads = jax.value_and_grad(loss_numerator)(params)
+    local_count = jnp.sum(mask)
+    global_count = jax.lax.psum(local_count, axis_name="devices")
+    global_numerator = jax.lax.psum(numerator, axis_name="devices")
+    grads = jax.lax.psum(grads, axis_name="devices")
+    grads = jax.tree_util.tree_map(lambda g: g / jnp.maximum(global_count, 1.0), grads)
+    loss = global_numerator / jnp.maximum(global_count, 1.0)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+    return params, opt_state, loss
+
+
+def create_pmap_train_step_backprop_mlm(
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+):
+    """Create a pmap'd MLM backprop step with static graph/optimizer closure."""
+
+    def step_fn(params, opt_state, batch, rng_key):
+        return train_step_backprop_mlm_pmap(
+            params, opt_state, batch, structure, optimizer, rng_key
+        )
+
+    return jax.pmap(step_fn, axis_name="devices")
+
+
+def _convert_batch_data(batch_data: Any) -> Dict[str, jnp.ndarray]:
+    if isinstance(batch_data, dict):
+        return {k: jnp.array(v) for k, v in batch_data.items()}
+    if isinstance(batch_data, (list, tuple)):
+        return {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
+    raise ValueError(f"Unsupported batch format: {type(batch_data)}")
+
+
+def _validate_mlm_batch(batch: Dict[str, jnp.ndarray]) -> None:
+    if "loss_mask" not in batch:
+        raise ValueError("MLM training requires batch['loss_mask']")
+    if int(jnp.sum(batch["loss_mask"].astype(bool))) == 0:
+        raise ValueError("MLM loss_mask must include at least one masked token")
+
+
+def _validate_mlm_batch_data(batch_data: Any) -> None:
+    if not isinstance(batch_data, dict):
+        return
+    if "loss_mask" not in batch_data:
+        raise ValueError("MLM training requires batch['loss_mask']")
+    if int(np.sum(np.asarray(batch_data["loss_mask"]).astype(bool))) == 0:
+        raise ValueError("MLM loss_mask must include at least one masked token")
+
+
+def _flatten_graph_params(
+    params: GraphParams,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    tensors: dict[str, np.ndarray] = {}
+    schema: dict[str, Any] = {}
+    for node_name, node_params in params.nodes.items():
+        node_schema = {"weights": {}, "biases": {}}
+        for collection_name in ("weights", "biases"):
+            for param_name, value in getattr(node_params, collection_name).items():
+                tensor_key = f"params/{node_name}/{collection_name}/{param_name}"
+                tensors[tensor_key] = np.asarray(value)
+                node_schema[collection_name][param_name] = tensor_key
+        schema[node_name] = node_schema
+    return tensors, schema
+
+
+def _load_graph_params(metadata: dict[str, Any], tensors: Any) -> GraphParams:
+    nodes = {}
+    for node_name, node_schema in metadata["params"].items():
+        collections = {}
+        for collection_name in ("weights", "biases"):
+            values = {}
+            for param_name, tensor_key in node_schema[collection_name].items():
+                if tensor_key not in tensors:
+                    raise ValueError(f"Missing tensor {tensor_key!r}")
+                values[param_name] = jnp.array(tensors[tensor_key])
+            collections[collection_name] = values
+        nodes[node_name] = NodeParams(
+            weights=collections["weights"], biases=collections["biases"]
+        )
+    return GraphParams(nodes=nodes)
+
+
+def save_mlm_training_checkpoint(
+    path: str,
+    *,
+    params: GraphParams,
+    opt_state: optax.OptState,
+    step: int,
+    config: dict[str, Any],
+    rng_key: Optional[jax.Array] = None,
+    loader_state: Optional[dict[str, Any]] = None,
+) -> None:
+    """Save params, optimizer leaves, step, and config as JSON + NPZ."""
+    checkpoint_path = Path(path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tensor_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".npz")
+    tensors, param_schema = _flatten_graph_params(params)
+
+    opt_leaves = jax.tree_util.tree_leaves(opt_state)
+    opt_schema = []
+    for idx, leaf in enumerate(opt_leaves):
+        key = f"opt_state/{idx}"
+        tensors[key] = np.asarray(leaf)
+        opt_schema.append(key)
+
+    np.savez(tensor_path, **tensors)
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "format": "fabricpc-mlm-training-checkpoint",
+                "version": 1,
+                "tensor_file": tensor_path.name,
+                "step": step,
+                "config": config,
+                "rng_key": None if rng_key is None else np.asarray(rng_key).tolist(),
+                "loader_state": loader_state or {},
+                "params": param_schema,
+                "opt_state": opt_schema,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def load_mlm_training_checkpoint(
+    path: str,
+    *,
+    opt_state_template: optax.OptState,
+) -> tuple[
+    GraphParams,
+    optax.OptState,
+    int,
+    dict[str, Any],
+    Optional[jax.Array],
+    dict[str, Any],
+]:
+    """Load a checkpoint saved by :func:`save_mlm_training_checkpoint`."""
+    checkpoint_path = Path(path)
+    metadata = json.loads(checkpoint_path.read_text())
+    if metadata.get("format") != "fabricpc-mlm-training-checkpoint":
+        raise ValueError("Unsupported MLM checkpoint format")
+    tensor_file = metadata.get("tensor_file")
+    if not isinstance(tensor_file, str):
+        raise ValueError("Checkpoint tensor_file must be a string")
+
+    with np.load(checkpoint_path.with_name(tensor_file), allow_pickle=False) as tensors:
+        params = _load_graph_params(metadata, tensors)
+        template_leaves, treedef = jax.tree_util.tree_flatten(opt_state_template)
+        opt_keys = metadata.get("opt_state", [])
+        if len(opt_keys) != len(template_leaves):
+            raise ValueError(
+                "Checkpoint optimizer state does not match optimizer template"
+            )
+        opt_leaves = [jnp.array(tensors[key]) for key in opt_keys]
+        opt_state = jax.tree_util.tree_unflatten(treedef, opt_leaves)
+
+    saved_rng = metadata.get("rng_key")
+    rng_key = None if saved_rng is None else jnp.array(saved_rng, dtype=jnp.uint32)
+    return (
+        params,
+        opt_state,
+        int(metadata["step"]),
+        metadata.get("config", {}),
+        rng_key,
+        metadata.get("loader_state", {}),
+    )
+
+
 def evaluate_mlm(
     params: GraphParams,
     structure: GraphStructure,
@@ -211,6 +427,182 @@ def evaluate_mlm(
         "masked_accuracy": total_correct / total_masked,
         "num_masked_tokens": total_masked,
     }
+
+
+def train_backprop_mlm(
+    params: GraphParams,
+    structure: GraphStructure,
+    train_loader: Any,
+    optimizer: optax.GradientTransformation,
+    config: dict,
+    rng_key: jax.Array,
+    val_loader: Any = None,
+    verbose: bool = True,
+) -> tuple[GraphParams, dict[str, Any]]:
+    """Train a masked-language-model encoder with optional checkpoint/resume.
+
+    Config keys:
+        max_steps: total optimizer steps to run to.
+        checkpoint_path: optional JSON path for periodic/final checkpoint.
+        checkpoint_interval: save every N steps when checkpoint_path is set.
+        resume_from: optional checkpoint path to resume from.
+        validation_interval: evaluate val_loader every N steps when provided.
+        use_pmap: use pmap when multiple devices are visible.
+        pmap_single_device: force pmap shape path on one device for testing.
+    """
+    validate_feedforward_init(structure)
+
+    try:
+        num_train_batches = len(train_loader)
+    except TypeError as exc:
+        if "max_steps" not in config:
+            raise TypeError(
+                "train_loader must support len() when max_steps is omitted"
+            ) from exc
+        num_train_batches = None
+    if num_train_batches == 0:
+        raise ValueError("train_loader must yield at least one full MLM batch")
+
+    max_steps = int(config.get("max_steps", num_train_batches))
+    checkpoint_path = config.get("checkpoint_path")
+    checkpoint_interval = int(config.get("checkpoint_interval", max_steps))
+    validation_interval = int(config.get("validation_interval", 0))
+    use_pmap = bool(config.get("use_pmap", False))
+    pmap_single_device = bool(config.get("pmap_single_device", False))
+    n_devices = jax.device_count()
+    run_pmap = use_pmap and ((n_devices > 1) or pmap_single_device)
+
+    opt_state = optimizer.init(params)
+    start_step = 0
+    start_batch_in_epoch = 0
+    if config.get("resume_from"):
+        loaded = load_mlm_training_checkpoint(
+            config["resume_from"], opt_state_template=opt_state
+        )
+        params, opt_state, start_step, _, saved_rng_key, loader_state = loaded
+        if saved_rng_key is not None:
+            rng_key = saved_rng_key
+        if hasattr(train_loader, "load_state_dict"):
+            train_loader.load_state_dict(loader_state)
+        start_batch_in_epoch = int(loader_state.get("batch_in_epoch", 0))
+
+    if run_pmap:
+        from fabricpc.training.train import (
+            replicate_params,
+            replicate_opt_state,
+            shard_batch,
+        )
+
+        params = replicate_params(params, n_devices)
+        opt_state = replicate_opt_state(opt_state, n_devices)
+        step_fn = create_pmap_train_step_backprop_mlm(structure, optimizer)
+    else:
+        step_fn = jax.jit(
+            lambda p, o, b, k: _train_step_backprop_mlm_no_validate(
+                p, o, b, structure, optimizer, k
+            )
+        )
+
+    losses: list[float] = []
+    validation: list[dict[str, float]] = []
+    step = start_step
+    last_loader_state = (
+        loader_state if config.get("resume_from") else {"epoch": 0, "batch_in_epoch": 0}
+    )
+    while step < max_steps:
+        progressed = False
+        for batch_idx, batch_data in enumerate(train_loader):
+            if start_batch_in_epoch and batch_idx < start_batch_in_epoch:
+                continue
+            start_batch_in_epoch = 0
+            if step >= max_steps:
+                break
+            _validate_mlm_batch_data(batch_data)
+            batch = _convert_batch_data(batch_data)
+            _validate_mlm_batch(batch)
+            rng_key, step_key = jax.random.split(rng_key)
+            progressed = True
+
+            if run_pmap:
+                batch = shard_batch(batch, n_devices)
+                device_keys = jax.random.split(step_key, n_devices)
+                params, opt_state, loss = step_fn(params, opt_state, batch, device_keys)
+                loss_value = float(jnp.mean(loss))
+            else:
+                params, opt_state, loss = step_fn(params, opt_state, batch, step_key)
+                loss_value = float(loss)
+
+            step += 1
+            losses.append(loss_value)
+            next_batch = (batch_idx + 1) % (num_train_batches or 1)
+            last_loader_state = {
+                "epoch": (
+                    getattr(train_loader, "_epoch", 0)
+                    if next_batch == 0
+                    else max(0, getattr(train_loader, "_epoch", 1) - 1)
+                ),
+                "batch_in_epoch": next_batch,
+            }
+
+            if verbose:
+                print(f"step={step} masked_loss={loss_value:.4f}")
+
+            checkpoint_due = checkpoint_path and step % checkpoint_interval == 0
+            if checkpoint_due:
+                checkpoint_params = (
+                    jax.tree_util.tree_map(lambda x: x[0], params)
+                    if run_pmap
+                    else params
+                )
+                checkpoint_opt_state = (
+                    jax.tree_util.tree_map(lambda x: x[0], opt_state)
+                    if run_pmap
+                    else opt_state
+                )
+                save_mlm_training_checkpoint(
+                    checkpoint_path,
+                    params=checkpoint_params,
+                    opt_state=checkpoint_opt_state,
+                    step=step,
+                    config=config,
+                    rng_key=rng_key,
+                    loader_state=last_loader_state,
+                )
+
+            if (
+                val_loader is not None
+                and validation_interval > 0
+                and step % validation_interval == 0
+            ):
+                eval_params = (
+                    jax.tree_util.tree_map(lambda x: x[0], params)
+                    if run_pmap
+                    else params
+                )
+                validation.append(
+                    evaluate_mlm(eval_params, structure, val_loader, rng_key)
+                )
+        if not progressed:
+            raise ValueError("train_loader produced no MLM batches during an epoch")
+
+    final_params = (
+        jax.tree_util.tree_map(lambda x: x[0], params) if run_pmap else params
+    )
+    if checkpoint_path:
+        final_opt_state = (
+            jax.tree_util.tree_map(lambda x: x[0], opt_state) if run_pmap else opt_state
+        )
+        save_mlm_training_checkpoint(
+            checkpoint_path,
+            params=final_params,
+            opt_state=final_opt_state,
+            step=step,
+            config=config,
+            rng_key=rng_key,
+            loader_state=last_loader_state,
+        )
+
+    return final_params, {"step": step, "losses": losses, "validation": validation}
 
 
 def train_backprop(
