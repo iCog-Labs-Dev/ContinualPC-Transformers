@@ -223,8 +223,14 @@ def _build_encoder_backbone(
     seq_len: int,
     vocab_size: int,
     weight_init: InitializerBase,
-) -> tuple[IdentityNode, NodeBase, list[NodeBase], list[Edge]]:
+    use_attention_mask: bool = False,
+) -> tuple[IdentityNode, Optional[IdentityNode], NodeBase, list[NodeBase], list[Edge]]:
     input_node = IdentityNode(shape=(seq_len,), name="input_ids")
+    attention_mask_node = (
+        IdentityNode(shape=(seq_len,), name="attention_mask")
+        if use_attention_mask
+        else None
+    )
     embed = EmbeddingNode(
         name="token_embeddings",
         shape=(seq_len, embed_dim),
@@ -241,6 +247,8 @@ def _build_encoder_backbone(
     )
 
     nodes: list[NodeBase] = [input_node, embed, positions]
+    if attention_mask_node is not None:
+        nodes.append(attention_mask_node)
     edges = [
         Edge(source=input_node, target=embed.slot("in")),
         Edge(source=embed, target=positions.slot("in")),
@@ -281,6 +289,10 @@ def _build_encoder_backbone(
                 Edge(source=mha, target=mlp2.slot("residual")),
             ]
         )
+        if attention_mask_node is not None:
+            edges.append(
+                Edge(source=attention_mask_node, target=mha.slot("attention_mask"))
+            )
         previous_residual = mlp2
 
     final_ln = FinalLayerNormNode(
@@ -290,7 +302,7 @@ def _build_encoder_backbone(
     )
     nodes.append(final_ln)
     edges.append(Edge(source=previous_residual, target=final_ln.slot("in")))
-    return input_node, final_ln, nodes, edges
+    return input_node, attention_mask_node, final_ln, nodes, edges
 
 
 def create_encoder_sentiment_classifier(
@@ -304,12 +316,13 @@ def create_encoder_sentiment_classifier(
     num_classes: int,
     inference: InferenceBase,
     weight_init: Optional[InitializerBase] = None,
+    use_attention_mask: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for sequence classification."""
     if weight_init is None:
         weight_init = NormalInitializer(std=0.02)
 
-    input_node, final_ln, nodes, edges = _build_encoder_backbone(
+    input_node, attention_mask_node, final_ln, nodes, edges = _build_encoder_backbone(
         depth=depth,
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -317,6 +330,7 @@ def create_encoder_sentiment_classifier(
         seq_len=seq_len,
         vocab_size=vocab_size,
         weight_init=weight_init,
+        use_attention_mask=use_attention_mask,
     )
     pool = FirstTokenPoolNode(shape=(embed_dim,), name="pooler")
     classifier = Linear(
@@ -337,7 +351,11 @@ def create_encoder_sentiment_classifier(
     return graph(
         nodes=nodes,
         edges=edges,
-        task_map=TaskMap(x=input_node, y=classifier),
+        task_map=TaskMap(
+            x=input_node,
+            y=classifier,
+            **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
+        ),
         inference=inference,
         scaling=MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),
@@ -354,12 +372,13 @@ def create_encoder_mlm_model(
     vocab_size: int,
     inference: InferenceBase,
     weight_init: Optional[InitializerBase] = None,
+    use_attention_mask: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked LM pretraining."""
     if weight_init is None:
         weight_init = NormalInitializer(std=0.02)
 
-    input_node, final_ln, nodes, edges = _build_encoder_backbone(
+    input_node, attention_mask_node, final_ln, nodes, edges = _build_encoder_backbone(
         depth=depth,
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -367,6 +386,7 @@ def create_encoder_mlm_model(
         seq_len=seq_len,
         vocab_size=vocab_size,
         weight_init=weight_init,
+        use_attention_mask=use_attention_mask,
     )
     mlm_head = VocabProjectionNode(
         shape=(seq_len, vocab_size),
@@ -381,7 +401,11 @@ def create_encoder_mlm_model(
     return graph(
         nodes=nodes,
         edges=edges,
-        task_map=TaskMap(x=input_node, y=mlm_head),
+        task_map=TaskMap(
+            x=input_node,
+            y=mlm_head,
+            **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
+        ),
         inference=inference,
         scaling=MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),

@@ -194,6 +194,9 @@ class MhaResidualNode(NodeBase):
                 "skip", False, is_variance_scalable=False, is_skip_connection=True
             ),
             "dropout_mask": SlotSpec("dropout_mask", False, is_variance_scalable=False),
+            "attention_mask": SlotSpec(
+                "attention_mask", False, is_variance_scalable=False
+            ),
         }
 
     @staticmethod
@@ -257,7 +260,16 @@ class MhaResidualNode(NodeBase):
             causal_mask = jnp.tril(jnp.ones((L, L)))
             scores = jnp.where(causal_mask == 0, -1e9, scores)
 
+        mask_key = next((k for k in inputs if k.endswith(":attention_mask")), None)
+        if mask_key is not None:
+            attention_mask = inputs[mask_key].astype(bool)
+            key_mask = attention_mask[:, None, None, :]
+            query_mask = attention_mask[:, None, :, None]
+            scores = jnp.where(key_mask, scores, -1e9)
+
         attn = jax.nn.softmax(scores, axis=-1)
+        if mask_key is not None:
+            attn = jnp.where(query_mask, attn, 0.0)
         mha = jnp.matmul(attn, V).transpose(0, 2, 1, 3).reshape(B, L, D)
         mha = proj(mha, "W_o", "b_o")
         mha = _apply_dropout_mask(mha, inputs)
