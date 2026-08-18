@@ -10,6 +10,11 @@ from fabricpc.utils.data.dataloader import (
     FewShotLoader,
     NoisyTestLoader,
 )
+from fabricpc.utils.data.mlm_loader import (
+    BabyLmMlmLoader,
+    MlmTextBatcher,
+    apply_mlm_mask,
+)
 
 __all__ = [
     "split_np_seed",
@@ -22,4 +27,7 @@ __all__ = [
     "FashionMnistLoader",
     "FewShotLoader",
     "NoisyTestLoader",
+    "BabyLmMlmLoader",
+    "MlmTextBatcher",
+    "apply_mlm_mask",
 ]
