@@ -20,12 +20,20 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.core.activations import IdentityActivation, ReLUActivation
 from fabricpc.core.initializers import XavierInitializer
 from fabricpc.core.inference import InferenceSGD, InferenceSGDNormClip
-from fabricpc.training import train_pcn, evaluate_pcn, train_autoregressive, evaluate_autoregressive
+from fabricpc.training import (
+    train_pcn,
+    evaluate_pcn,
+    train_autoregressive,
+    evaluate_autoregressive,
+    train_backprop_autoregressive,
+    evaluate_backprop_autoregressive,
+)
 from fabricpc.training.train import shard_batch, replicate_params, unshard_energies
 from fabricpc.training.train_autoregressive import (
     _validate_pmap_batch,
     get_graph_param_gradient_autoregressive,
 )
+from fabricpc.training.train_backprop import compute_loss_autoregressive
 from fabricpc.nodes.transformer_v2 import create_deep_transformer
 
 
@@ -454,6 +462,106 @@ class TestAutoRegressiveMultiGPU:
             f"Autoregressive pmap (single shard) must match JIT! Max rel diff: {max_relative_diff}"
         )
 
+    def test_backprop_pmap_single_shard_matches_jit(
+        self, transformer_structure, rng_key
+    ):
+        """Compare backprop pmap and JIT wiring on one device, not real multi-GPU behavior."""
+        model_key, train_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-3)
+        train_config = {"num_epochs": 1, "use_causal_mask": True}
+        train_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=2, rng_key=data_key
+        )
+
+        params_single = copy.deepcopy(params)
+        params_multi = copy.deepcopy(params)
+
+        trained_single, _, _ = train_backprop_autoregressive(
+            params_single,
+            transformer_structure,
+            train_loader,
+            optimizer,
+            train_config,
+            train_key,
+            verbose=False,
+            pmap_single_device=False,
+        )
+
+        trained_multi, _, _ = train_backprop_autoregressive(
+            params_multi,
+            transformer_structure,
+            train_loader,
+            optimizer,
+            train_config,
+            train_key,
+            verbose=False,
+            pmap_single_device=True,
+        )
+
+        max_relative_diff = 0.0
+        for node_name in transformer_structure.nodes:
+            if transformer_structure.nodes[node_name].node_info.in_degree > 0:
+                single_node = trained_single.nodes[node_name]
+                multi_node = trained_multi.nodes[node_name]
+
+                for edge_key in single_node.weights:
+                    w_single = single_node.weights[edge_key]
+                    w_multi = multi_node.weights[edge_key]
+                    diff = jnp.abs(w_single - w_multi)
+                    scale = jnp.maximum(jnp.abs(w_single), jnp.abs(w_multi)) + 1e-8
+                    rel_diff = diff / scale
+                    max_rel = float(jnp.max(rel_diff))
+                    max_relative_diff = max(max_relative_diff, max_rel)
+
+        assert max_relative_diff < 1e-5, (
+            f"Backprop pmap (single shard) must match JIT! Max rel diff: {max_relative_diff}"
+        )
+
+    def test_backprop_gradient_mean_matches_full_batch(
+        self, transformer_structure, rng_key
+    ):
+        """Verify that mean gradients from two halves match the full batch."""
+        model_key, gradient_key, data_key = jax.random.split(rng_key, 3)
+        params = initialize_params(transformer_structure, model_key)
+        batch = _make_token_batches(
+            vocab_size=10,
+            seq_len=4,
+            batch_size=4,
+            num_batches=1,
+            rng_key=data_key,
+        )[0]
+        first_half = {key: value[:2] for key, value in batch.items()}
+        second_half = {key: value[2:] for key, value in batch.items()}
+
+        def loss_for_batch(current_params, current_batch):
+            loss, _ = compute_loss_autoregressive(
+                current_params,
+                transformer_structure,
+                current_batch,
+                gradient_key,
+                use_causal_mask=True,
+                training=False,
+            )
+            return loss
+
+        full_grads = jax.grad(loss_for_batch)(params, batch)
+        first_grads = jax.grad(loss_for_batch)(params, first_half)
+        second_grads = jax.grad(loss_for_batch)(params, second_half)
+        combined_grads = jax.tree_util.tree_map(
+            lambda first, second: (first + second) / 2.0,
+            first_grads,
+            second_grads,
+        )
+
+        for expected, actual in zip(
+            jax.tree_util.tree_leaves(full_grads),
+            jax.tree_util.tree_leaves(combined_grads),
+            strict=True,
+        ):
+            np.testing.assert_allclose(expected, actual, rtol=1e-5, atol=1e-6)
+
     def test_pmap_gradient_combining_matches_full_batch(
         self, transformer_structure, rng_key
     ):
@@ -553,6 +661,38 @@ class TestAutoRegressiveMultiGPU:
         assert len(callback_received_shapes) == 1
         assert callback_received_shapes[0] == orig_shapes
 
+    def test_backprop_evaluation_multi_gpu(self, transformer_structure, rng_key):
+        """Test that multi-device backprop evaluation matches single-device evaluation."""
+        model_key, eval_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        eval_config = {"use_causal_mask": True}
+        test_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=3, rng_key=data_key
+        )
+
+        metrics_jit = evaluate_backprop_autoregressive(
+            params,
+            transformer_structure,
+            test_loader,
+            eval_config,
+            eval_key,
+            pmap_single_device=False,
+        )
+
+        metrics_pmap = evaluate_backprop_autoregressive(
+            params,
+            transformer_structure,
+            test_loader,
+            eval_config,
+            eval_key,
+            pmap_single_device=True,
+        )
+
+        assert np.isclose(metrics_jit["loss"], metrics_pmap["loss"], rtol=1e-4, atol=1e-4)
+        assert np.isclose(metrics_jit["perplexity"], metrics_pmap["perplexity"], rtol=1e-4, atol=1e-4)
+        assert np.isclose(metrics_jit["accuracy"], metrics_pmap["accuracy"], rtol=1e-4, atol=1e-4)
+
     def test_autoregressive_evaluation_multi_gpu(self, transformer_structure, rng_key):
         """Test that multi-device evaluation matches single-device evaluation."""
         model_key, eval_key, data_key = jax.random.split(rng_key, 3)
@@ -650,6 +790,51 @@ class TestAutoRegressiveMultiGPU:
             )
         )
 
+    def test_backprop_force_single_device_overrides_pmap(
+        self, transformer_structure, rng_key, monkeypatch
+    ):
+        """Test that force_single_device disables pmap for backprop training and evaluation."""
+        monkeypatch.setattr(jax, "local_device_count", lambda: 2)
+        model_key, run_key, data_key = jax.random.split(rng_key, 3)
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-3)
+        config = {"num_epochs": 1, "use_causal_mask": True}
+        batches = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=3, num_batches=1, rng_key=data_key
+        )
+
+        trained_params, _, _ = train_backprop_autoregressive(
+            params,
+            transformer_structure,
+            batches,
+            optimizer,
+            config,
+            run_key,
+            verbose=False,
+            pmap_single_device=True,
+            force_single_device=True,
+        )
+        metrics = evaluate_backprop_autoregressive(
+            trained_params,
+            transformer_structure,
+            batches,
+            config,
+            run_key,
+            pmap_single_device=True,
+            force_single_device=True,
+        )
+
+        assert metrics["num_batches"] == 1
+        assert np.isfinite(metrics["loss"])
+        assert all(
+            leaf.shape == original.shape
+            for leaf, original in zip(
+                jax.tree_util.tree_leaves(trained_params),
+                jax.tree_util.tree_leaves(params),
+                strict=True,
+            )
+        )
+
     def test_autoregressive_pmap_rejects_non_divisible_batch(self):
         """Test that pmap training validation rejects uneven batches."""
         batch = {
@@ -671,6 +856,46 @@ class TestAutoRegressiveMultiGPU:
         )
 
         metrics = evaluate_autoregressive(
+            params,
+            transformer_structure,
+            test_loader,
+            eval_config,
+            eval_key,
+            debug=True,
+        )
+        assert np.isfinite(metrics["loss"])
+
+    def test_backprop_zero_batches_processed_raises(self, transformer_structure, rng_key):
+        """Test that train_backprop_autoregressive raises RuntimeError if all batches are skipped."""
+        model_key, train_key, _ = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        optimizer = optax.adam(1e-3)
+        train_config = {"num_epochs": 1, "use_causal_mask": True}
+        empty_loader = []
+
+        with pytest.raises(RuntimeError, match="No batches were processed"):
+            train_backprop_autoregressive(
+                params,
+                transformer_structure,
+                empty_loader,
+                optimizer,
+                train_config,
+                train_key,
+                verbose=False,
+            )
+
+    def test_backprop_evaluation_debug_mode(self, transformer_structure, rng_key):
+        """Test evaluate_backprop_autoregressive with debug=True and integer targets."""
+        model_key, eval_key, data_key = jax.random.split(rng_key, 3)
+
+        params = initialize_params(transformer_structure, model_key)
+        eval_config = {"use_causal_mask": True}
+        test_loader = _make_token_batches(
+            vocab_size=10, seq_len=4, batch_size=4, num_batches=2, rng_key=data_key
+        )
+
+        metrics = evaluate_backprop_autoregressive(
             params,
             transformer_structure,
             test_loader,
