@@ -298,8 +298,8 @@ def train_step_autoregressive_pmap(
         )
     )
 
-    # Average gradients across all devices (data parallelism)
-    grads = jax.lax.pmean(grads, axis_name="devices")
+    # Sum per-device batch gradients
+    grads = jax.lax.psum(grads, axis_name="devices")
 
     # Update parameters (each device now has same gradients)
     updates, opt_state = optimizer.update(grads, opt_state, params)
