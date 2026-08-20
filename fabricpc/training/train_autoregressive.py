@@ -16,7 +16,6 @@ The training loop supports both:
 
 from typing import Dict, Tuple, Any, List, Optional, Callable, cast
 import math
-import warnings
 import jax
 import jax.numpy as jnp
 import optax
@@ -345,6 +344,15 @@ def create_pmap_train_step_autoregressive(
     return jax.pmap(step_fn, axis_name="devices")
 
 
+def _validate_pmap_batch(batch: Dict[str, jnp.ndarray], n_devices: int) -> None:
+    batch_size = next(iter(batch.values())).shape[0]
+    if batch_size % n_devices != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by "
+            f"n_devices ({n_devices}) when using pmap."
+        )
+
+
 def train_autoregressive(
     params: GraphParams,
     structure: GraphStructure,
@@ -356,6 +364,7 @@ def train_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
+    force_single_device: bool = False,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main training loop for autoregressive predictive coding.
@@ -380,6 +389,7 @@ def train_autoregressive(
             accept **kwargs.
         iter_callback: Optional callback (epoch, batch_idx, loss) -> any
         pmap_single_device: Force pmap code path for testing
+        force_single_device: Force single-device JIT execution
 
     Returns:
         Tuple of (trained_params, energy_history, epoch_results)
@@ -394,8 +404,9 @@ def train_autoregressive(
     frac = num_epochs - math.floor(num_epochs)
 
     # Device detection
-    n_devices = jax.device_count()
-    use_pmap = (n_devices > 1) or pmap_single_device
+    force_single = force_single_device or config.get("force_single_device", False)
+    n_devices = 1 if force_single else jax.local_device_count()
+    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
 
     if verbose:
         print(f"Training on {n_devices} device(s): {jax.devices()}")
@@ -416,7 +427,6 @@ def train_autoregressive(
             )
         )
 
-    _shard_warned = False
     iter_results = []
     epoch_results = []
 
@@ -459,15 +469,8 @@ def train_autoregressive(
             batch = _convert_batch(batch_data)
 
             if use_pmap:
-                try:
-                    batch = shard_batch(batch, n_devices)
-                except ValueError as e:
-                    if not _shard_warned:
-                        warnings.warn(
-                            f"Skipping batch (size not divisible by {n_devices}): {e}"
-                        )
-                        _shard_warned = True
-                    continue
+                _validate_pmap_batch(batch, n_devices)
+                batch = shard_batch(batch, n_devices)
 
                 params, opt_state, energy, ce_loss, _ = step_fn(
                     params, opt_state, batch, batch_keys[:, batch_idx]
@@ -823,6 +826,7 @@ def evaluate_autoregressive(
     rng_key: jax.Array,
     debug: bool = False,
     pmap_single_device: bool = False,
+    force_single_device: bool = False,
 ) -> Dict[str, float]:
     """
     Evaluate autoregressive model on test data.
@@ -843,6 +847,7 @@ def evaluate_autoregressive(
         rng_key: Random key
         debug: If True, print detailed diagnostics for first batch
         pmap_single_device: If True, forces pmap path on single device
+        force_single_device: If True, forces single-device JIT execution
 
     Returns:
         Dictionary of metrics
@@ -858,8 +863,9 @@ def evaluate_autoregressive(
     except TypeError:
         raise TypeError("test_loader must support len()")
 
-    n_devices = jax.device_count()
-    use_pmap = (n_devices > 1) or pmap_single_device
+    force_single = force_single_device or config.get("force_single_device", False)
+    n_devices = 1 if force_single else jax.local_device_count()
+    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
 
     if use_pmap:
         epoch_key, rng_key = jax.random.split(rng_key)
