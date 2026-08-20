@@ -893,6 +893,8 @@ def evaluate_autoregressive(
             batch = _convert_batch(batch_data)
             batch_size = next(iter(batch.values())).shape[0]
 
+            # Pad incomplete batches so no test data is dropped.
+            # Padding is sliced off before metrics so it has no effect.
             if batch_size % n_devices != 0:
                 pad_size = n_devices - (batch_size % n_devices)
                 batch = {
