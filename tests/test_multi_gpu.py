@@ -22,6 +22,7 @@ from fabricpc.core.initializers import XavierInitializer
 from fabricpc.core.inference import InferenceSGD, InferenceSGDNormClip
 from fabricpc.training import train_pcn, evaluate_pcn, train_autoregressive, evaluate_autoregressive
 from fabricpc.training.train import shard_batch, replicate_params, unshard_energies
+from fabricpc.training.train_autoregressive import get_graph_param_gradient_autoregressive
 from fabricpc.nodes.transformer_v2 import create_deep_transformer
 
 
@@ -390,11 +391,13 @@ class TestAutoRegressiveMultiGPU:
             mlp_dim=16,
             seq_len=4,
             vocab_size=10,
+            dropout_rate=0.0,
             inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=2, max_norm=5.0),
         )
 
-    def test_autoregressive_numerical_similarity(self, transformer_structure, rng_key):
-        """Test that autoregressive pmap updates match single-device JIT."""
+    def test_pmap_single_shard_matches_jit(self, transformer_structure, rng_key):
+        """Compare pmap and JIT wiring on one device, not real multi-GPU behavior."""
+        # This forces the pmap path with one shard; it does not test multi-GPU execution.
         model_key, train_key, data_key = jax.random.split(rng_key, 3)
 
         params = initialize_params(transformer_structure, model_key)
@@ -447,6 +450,44 @@ class TestAutoRegressiveMultiGPU:
         assert max_relative_diff < 1e-5, (
             f"Autoregressive pmap (single shard) must match JIT! Max rel diff: {max_relative_diff}"
         )
+
+    def test_pmap_gradient_combining_matches_full_batch(
+        self, transformer_structure, rng_key
+    ):
+        """Verify that per-device PC gradients sum to the full-batch gradient."""
+        model_key, gradient_key, data_key = jax.random.split(rng_key, 3)
+        params = initialize_params(transformer_structure, model_key)
+        batch = _make_token_batches(
+            vocab_size=10,
+            seq_len=4,
+            batch_size=4,
+            num_batches=1,
+            rng_key=data_key,
+        )[0]
+        first_half = {key: value[:2] for key, value in batch.items()}
+        second_half = {key: value[2:] for key, value in batch.items()}
+
+        full_grads, _, _, _ = get_graph_param_gradient_autoregressive(
+            params, batch, transformer_structure, gradient_key
+        )
+        first_grads, _, _, _ = get_graph_param_gradient_autoregressive(
+            params, first_half, transformer_structure, gradient_key
+        )
+        second_grads, _, _, _ = get_graph_param_gradient_autoregressive(
+            params, second_half, transformer_structure, gradient_key
+        )
+        combined_grads = jax.tree_util.tree_map(
+            lambda first, second: first + second,
+            first_grads,
+            second_grads,
+        )
+
+        for expected, actual in zip(
+            jax.tree_util.tree_leaves(full_grads),
+            jax.tree_util.tree_leaves(combined_grads),
+            strict=True,
+        ):
+            np.testing.assert_allclose(expected, actual, rtol=1e-5, atol=1e-6)
 
     def test_autoregressive_pmap_energy_is_finite(self, transformer_structure, rng_key):
         """Test that autoregressive pmap produces finite energies during training."""
