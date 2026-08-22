@@ -27,9 +27,15 @@ from fabricpc.graph_initialization.state_initializer import (
     FeedforwardStateInit,
 )
 from fabricpc.training.train_autoregressive import (
+    _validate_pmap_batch,
     create_causal_mask,
     create_dropout_clamps,
     compute_loss,
+)
+from fabricpc.training.train import (
+    replicate_opt_state,
+    replicate_params,
+    shard_batch,
 )
 
 def validate_feedforward_init(structure: GraphStructure):
@@ -206,7 +212,17 @@ def train_backprop(
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)
-        batch_keys = jax.random.split(epoch_rng_key, max_batches)
+        if use_pmap:
+            device_keys = (
+                jax.random.split(epoch_rng_key, n_devices)
+                if n_devices > 1
+                else epoch_rng_key[None, :]
+            )
+            batch_keys = jax.vmap(
+                lambda key: jax.random.split(key, max_batches)
+            )(device_keys)
+        else:
+            batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
         batch_losses = []
         epoch_loss = 0.0
@@ -254,7 +270,11 @@ def train_backprop(
         if verbose:
             print(f"Epoch {epoch_idx + 1}/{total_epochs}, Loss: {avg_loss:.4f}")
 
+    if use_pmap:
+        params = jax.tree_util.tree_map(lambda value: value[0], params)
+
     return params, iter_results, epoch_results
+
 
 
 def compute_loss_autoregressive(
@@ -298,7 +318,7 @@ def compute_loss_autoregressive(
         causal_mask = causal_mask[None, None, :, :]  # (1, 1, seq, seq)
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, seq_len))
         clamps[structure.task_map["causal_mask"]] = causal_mask
-    
+
     rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
     clamps.update(
         create_dropout_clamps(structure, batch_size, dropout_key, training=training)
@@ -361,6 +381,42 @@ def train_step_backprop_autoregressive(
     return params, opt_state, loss, predictions
 
 
+def train_step_backprop_autoregressive_pmap(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+    use_causal_mask: bool = True,
+) -> Tuple[GraphParams, optax.OptState, jnp.ndarray, jnp.ndarray]:
+    """Single backprop pmap training step with mean-gradient reduction."""
+    (loss, predictions), grads = jax.value_and_grad(
+        lambda p: compute_loss_autoregressive(
+            p, structure, batch, rng_key, use_causal_mask
+        ),
+        has_aux=True,
+    )(params)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+    return params, opt_state, loss, predictions
+
+
+def create_pmap_train_step_backprop_autoregressive(
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    use_causal_mask: bool = True,
+):
+    """Create a pmap'd backprop training step with static args in closure."""
+    def step_fn(params, opt_state, batch, rng_key):
+        return train_step_backprop_autoregressive_pmap(
+            params, opt_state, batch, structure, optimizer, rng_key, use_causal_mask
+        )
+
+    return jax.pmap(step_fn, axis_name="devices")
+
+
 def train_backprop_autoregressive(
     params: GraphParams,
     structure: GraphStructure,
@@ -371,6 +427,8 @@ def train_backprop_autoregressive(
     verbose: bool = True,
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
+    pmap_single_device: bool = False,
+    force_single_device: bool = False,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main autoregressive backprop training loop.
@@ -396,7 +454,23 @@ def train_backprop_autoregressive(
     """
     validate_feedforward_init(structure)
 
+    force_single = force_single_device or config.get("force_single_device", False)
+    n_devices = 1 if force_single else jax.local_device_count()
+    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+
     opt_state = optimizer.init(params)
+    if use_pmap:
+        params = replicate_params(params, n_devices)
+        opt_state = replicate_opt_state(opt_state, n_devices)
+        step_fn = create_pmap_train_step_backprop_autoregressive(
+            structure, optimizer, use_causal_mask=config.get("use_causal_mask", True)
+        )
+    else:
+        step_fn = jax.jit(
+            lambda p, o, b, k: train_step_backprop_autoregressive(
+                p, o, b, structure, optimizer, k, config.get("use_causal_mask", True)
+            )
+        )
 
     # Training hyperparameters
     num_epochs = config.get("num_epochs", 10)  # supports float (e.g. 1.5)
@@ -405,13 +479,6 @@ def train_backprop_autoregressive(
     # Support fractional epochs: e.g. 1.5 -> 2 loop iterations, last stops at 50%
     total_epochs = math.ceil(num_epochs)
     frac = num_epochs - math.floor(num_epochs)
-
-    # JIT compile training step
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step_backprop_autoregressive(
-            p, o, b, structure, optimizer, k, use_causal_mask
-        )
-    )
 
     iter_results = []
     epoch_results = []
@@ -431,7 +498,17 @@ def train_backprop_autoregressive(
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)
-        batch_keys = jax.random.split(epoch_rng_key, max_batches)
+        if use_pmap:
+            device_keys = (
+                jax.random.split(epoch_rng_key, n_devices)
+                if n_devices > 1
+                else epoch_rng_key[None, :]
+            )
+            batch_keys = jax.vmap(
+                lambda key: jax.random.split(key, max_batches)
+            )(device_keys)
+        else:
+            batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
         batch_losses = []
         epoch_loss = 0.0
@@ -452,10 +529,18 @@ def train_backprop_autoregressive(
             else:
                 raise ValueError(f"Unsupported batch format: {type(batch_data)}")
 
-            # Training step (predictions discarded during training)
-            params, opt_state, loss, _ = jit_train_step(
-                params, opt_state, batch, batch_keys[batch_idx]
-            )
+            if use_pmap:
+                _validate_pmap_batch(batch, n_devices)
+                batch = shard_batch(batch, n_devices)
+                params, opt_state, loss, _ = step_fn(
+                    params, opt_state, batch, batch_keys[:, batch_idx]
+                )
+                loss = float(jnp.mean(loss))
+            else:
+                params, opt_state, loss, _ = step_fn(
+                    params, opt_state, batch, batch_keys[batch_idx]
+                )
+                loss = float(loss)
 
             epoch_loss += float(loss)
             batches_processed += 1
@@ -466,12 +551,29 @@ def train_backprop_autoregressive(
                 batch_losses.append(float(loss))
 
         iter_results.append(batch_losses)
-        avg_loss = epoch_loss / batches_processed if batches_processed > 0 else 0.0
+        if batches_processed == 0:
+            raise RuntimeError(
+                f"No batches were processed in epoch {epoch_idx + 1}. "
+                "Check that the train_loader is not empty."
+            )
+        avg_loss = epoch_loss / batches_processed
 
         # Epoch callback
         if epoch_callback is not None:
+            callback_params = (
+                jax.tree_util.tree_map(lambda value: value[0], params)
+                if use_pmap
+                else params
+            )
             epoch_results.append(
-                epoch_callback(epoch_idx, params, structure, config, rng_key, ce_loss=avg_loss)
+                epoch_callback(
+                    epoch_idx,
+                    callback_params,
+                    structure,
+                    config,
+                    rng_key,
+                    ce_loss=avg_loss,
+                )
             )
         else:
             epoch_results.append(None)
@@ -481,6 +583,9 @@ def train_backprop_autoregressive(
             print(
                 f"Epoch {epoch_idx + 1}/{total_epochs}, Loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}"
             )
+
+    if use_pmap:
+        params = jax.tree_util.tree_map(lambda value: value[0], params)
 
     return params, iter_results, epoch_results
 
@@ -601,6 +706,19 @@ def evaluate_backprop(
     return result
 
 
+def create_pmap_eval_step_backprop_autoregressive(
+    structure: GraphStructure,
+    use_causal_mask: bool,
+):
+    """Create a pmap'd backprop evaluation step with static args in closure."""
+    def step_fn(params, batch, rng_key):
+        return compute_loss_autoregressive(
+            params, structure, batch, rng_key, use_causal_mask, training=False
+        )
+
+    return jax.pmap(step_fn, axis_name="devices")
+
+
 def evaluate_backprop_autoregressive(
     params: GraphParams,
     structure: GraphStructure,
@@ -608,7 +726,10 @@ def evaluate_backprop_autoregressive(
     config: dict,
     rng_key: jax.Array,
     debug: bool = False,
+    pmap_single_device: bool = False,
+    force_single_device: bool = False,
 ) -> Dict[str, float]:
+
     """
     Evaluate backprop-trained autoregressive model on test data.
 
@@ -631,6 +752,10 @@ def evaluate_backprop_autoregressive(
 
     validate_feedforward_init(structure)
 
+    force_single = force_single_device or config.get("force_single_device", False)
+    n_devices = 1 if force_single else jax.local_device_count()
+    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+
     use_causal_mask = config.get("use_causal_mask", True)
 
     try:
@@ -638,14 +763,30 @@ def evaluate_backprop_autoregressive(
     except TypeError:
         raise TypeError("test_loader must support len() for evaluation")
 
-    batch_keys = jax.random.split(rng_key, num_batches_total)
-
-    # JIT compile: returns (loss, predictions) tuple
-    jit_forward = jax.jit(
-        lambda p, b, k: compute_loss_autoregressive(
-            p, structure, b, k, use_causal_mask, training=False
+    if use_pmap:
+        epoch_key, rng_key = jax.random.split(rng_key)
+        device_keys = (
+            jax.random.split(epoch_key, n_devices)
+            if n_devices > 1
+            else epoch_key[None, :]
         )
-    )
+        batch_keys = jax.vmap(
+            lambda key: jax.random.split(key, num_batches_total)
+        )(device_keys)
+    else:
+        batch_keys = jax.random.split(rng_key, num_batches_total)
+
+    if use_pmap:
+        pmap_eval_step = create_pmap_eval_step_backprop_autoregressive(
+            structure, use_causal_mask
+        )
+        replicated_params = replicate_params(params, n_devices)
+    else:
+        jit_forward = jax.jit(
+            lambda p, b, k: compute_loss_autoregressive(
+                p, structure, b, k, use_causal_mask, training=False
+            )
+        )
 
     total_loss = 0.0
     total_correct = 0
@@ -663,13 +804,54 @@ def evaluate_backprop_autoregressive(
 
         batch_size = batch["x"].shape[0]
         seq_len = batch["x"].shape[1]
+        original_batch = batch
 
         # Single forward pass returns both loss and predictions
-        loss, predictions = jit_forward(params, batch, batch_keys[batch_idx])
+        if use_pmap:
+            # Pad incomplete batches so no test data is dropped.
+            # Padding is sliced off before metrics so it has no effect.
+            pad_size = (-batch_size) % n_devices
+            if pad_size:
+                batch = {
+                    key: jnp.concatenate(
+                        [value, jnp.zeros((pad_size,) + value.shape[1:], dtype=value.dtype)]
+                    )
+                    for key, value in batch.items()
+                }
+            batch = shard_batch(batch, n_devices)
+            loss_sharded, preds_sharded = pmap_eval_step(
+                replicated_params, batch, batch_keys[:, batch_idx]
+            )
+            padded_batch_size = batch_size + pad_size
+            loss = float(jnp.mean(loss_sharded))
+            predictions = preds_sharded.reshape(
+                padded_batch_size, *preds_sharded.shape[2:]
+            )[:batch_size]
+        else:
+            loss, predictions = jit_forward(params, batch, batch_keys[batch_idx])
+
+        batch = original_batch
+        if use_pmap and pad_size:
+            log_predictions = jnp.log(predictions + 1e-10)
+            if batch["y"].ndim == 3:
+                valid_targets = batch["y"]
+                loss = -float(
+                    jnp.mean(jnp.sum(valid_targets * log_predictions, axis=-1))
+                )
+            else:
+                loss = -float(
+                    jnp.mean(
+                        jnp.take_along_axis(
+                            log_predictions, batch["y"][..., None], axis=-1
+                        )
+                    )
+                )
 
         # Debug diagnostics for first batch
         if debug and batch_idx == 0:
-            tgt = batch["y"]  # (batch, seq_len, vocab_size) one-hot
+            tgt = batch["y"]
+            if tgt.ndim == predictions.ndim - 1:
+                tgt = jax.nn.one_hot(tgt, predictions.shape[-1])
 
             # Check individual loss components
             log_preds = jnp.log(predictions + 1e-10)
