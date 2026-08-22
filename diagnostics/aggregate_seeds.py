@@ -59,6 +59,25 @@ def fmt(mean, std, spec):
         return f"{mean:{spec}}"
     return f"{mean:{spec}} ± {std:{spec}}"
 
+# Seeds averaged together must come from the same experiment. These fields
+# define "same experiment"; if any differs within a group, refuse to average.
+_COMPAT_FIELDS = ("n_params", "vocab_size", "global_batch_size")
+
+def _assert_compatible(runs, mode, tokenizer):
+    ref = runs[0]
+    for r in runs[1:]:
+        for field in _COMPAT_FIELDS:
+            if r.get(field) != ref.get(field):
+                raise ValueError(
+                    f"{mode}/{tokenizer}: cannot average seeds with different "
+                    f"{field} (seed {ref['seed']}={ref.get(field)}, "
+                    f"seed {r['seed']}={r.get(field)}). These are different runs."
+                )
+        if r.get("config") != ref.get("config"):
+            raise ValueError(
+                f"{mode}/{tokenizer}: cannot average seeds with different configs "
+                f"(seed {ref['seed']} vs seed {r['seed']})."
+            )
 
 def load_metrics(metrics_dir, tokenizer):
     """Group final-metric files into arms keyed by (mode, tokenizer)."""
@@ -71,6 +90,9 @@ def load_metrics(metrics_dir, tokenizer):
         # Percent accuracy is what the table reports; derive it once here.
         m["test_accuracy_pct"] = m["test_accuracy"] * 100.0
         arms[(m["mode"], m["tokenizer"])].append(m)
+    
+    for (mode, tok), runs in arms.items():
+        _assert_compatible(runs, mode, tok)
     return arms
 
 

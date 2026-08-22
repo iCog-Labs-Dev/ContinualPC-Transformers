@@ -135,7 +135,7 @@ def parse_args():
         "--batch_size",
         type=int,
         default=None,
-        help="Batch size (per-device for PC, total for backprop; default: tuned per --tokenizer)",
+        help="Global batch size, sharded across devices (default: tuned per --tokenizer)",
     )
     parser.add_argument(
         "--num_epochs", type=int, default=5, help="Number of training epochs"
@@ -211,13 +211,19 @@ def main(args=None):
             setattr(args, key, val)
 
     # --- Batch size ---
-    if use_pc:
-        n_devices = jax.device_count()
-        batch_size = args.batch_size * n_devices
-        print(f"PC mode: {n_devices} device(s), total batch_size={batch_size}")
-    else:
-        batch_size = args.batch_size
-        print(f"Backprop mode: single device, batch_size={batch_size}")
+    n_devices = jax.device_count()
+    if args.batch_size % n_devices != 0:
+        raise ValueError(
+            f"--batch_size ({args.batch_size}) must be divisible by n_devices "
+            f"({n_devices}). Try {(args.batch_size // n_devices) * n_devices} "
+            f"or {(args.batch_size // n_devices + 1) * n_devices}."
+        )
+    global_batch_size = args.batch_size          # tuned global batch, e.g. 32
+    per_device_batch_size = args.batch_size // n_devices      
+    batch_size = args.batch_size                 # passed to trainer, which shards it
+
+    print(f"{args.mode} mode: {n_devices} device(s), "
+          f"global batch {global_batch_size} ({per_device_batch_size}/device)")
 
     # --- Data ---
     if use_bpe:
@@ -376,12 +382,25 @@ def main(args=None):
     os.makedirs(metrics_dir, exist_ok=True)
     tag = f"{args.mode}_{args.tokenizer}_seed{args.seed}"
 
+    # Config record shared by the checkpoint and the metrics file.
+    config_record = {
+        k: getattr(args, k)
+        for k in (
+            "embed_dim", "num_heads", "mlp_dim", "depth", "seq_len",
+            "num_epochs", "lr", "infer_steps",
+            "eta_infer", "weight_init_std", "dropout_rate",
+        )
+    }
+    config_record["per_device_batch_size"] = per_device_batch_size
+    config_record["global_batch_size"] = global_batch_size
+    config_record["n_devices"] = n_devices
+
     # --- Save checkpoint (per-seed, so runs don't overwrite each other) ---
     ckpt_dir = "runs/checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt = {
         "params": jax.device_get(trained_params),  
-        "config": vars(args),
+        "config": {**vars(args), **config_record},
     }
     ckpt_file = os.path.join(ckpt_dir, f"ckpt_{tag}.pkl")
     with open(ckpt_file, "wb") as f:
@@ -407,29 +426,14 @@ def main(args=None):
         "seed": args.seed,
         "n_params": int(n_params),
         "vocab_size": int(vocab_size),
+        "global_batch_size": global_batch_size,
         "train_seconds": train_seconds,
         "final_train_ppl": train_ppl_hist[-1] if train_ppl_hist else None,
         "final_train_energy": train_energy_hist[-1] if train_energy_hist else None,
         "test_ppl": float(metrics["perplexity"]),
         "test_loss": float(metrics["loss"]),
         "test_accuracy": float(metrics["accuracy"]),
-        "config": {
-            k: getattr(args, k)
-            for k in (
-                "embed_dim",
-                "num_heads",
-                "mlp_dim",
-                "depth",
-                "seq_len",
-                "batch_size",
-                "num_epochs",
-                "lr",
-                "infer_steps",
-                "eta_infer",
-                "weight_init_std",
-                "dropout_rate",
-            )
-        },
+        "config": config_record,
     }
     metrics_file = os.path.join(metrics_dir, f"metrics_{tag}.json")
     with open(metrics_file, "w") as fh:
