@@ -71,7 +71,7 @@ class AddPositionEmbeddingNode(NodeBase):
 
     @staticmethod
     def get_slots() -> Dict[str, SlotSpec]:
-        return {"in": SlotSpec("in", is_multi_input=False)}
+        return {"in": SlotSpec("in", is_multi_input=False, is_variance_scalable=False)}
 
     @staticmethod
     def initialize_params(
@@ -133,7 +133,7 @@ class FirstTokenPoolNode(NodeBase):
 
     @staticmethod
     def get_slots() -> Dict[str, SlotSpec]:
-        return {"in": SlotSpec("in", is_multi_input=False)}
+        return {"in": SlotSpec("in", is_multi_input=False, is_variance_scalable=False)}
 
     @staticmethod
     def initialize_params(
@@ -184,7 +184,7 @@ class FinalLayerNormNode(NodeBase):
 
     @staticmethod
     def get_slots() -> Dict[str, SlotSpec]:
-        return {"in": SlotSpec("in", is_multi_input=False)}
+        return {"in": SlotSpec("in", is_multi_input=False, is_variance_scalable=False)}
 
     @staticmethod
     def initialize_params(
@@ -305,6 +305,30 @@ def _build_encoder_backbone(
     return input_node, attention_mask_node, final_ln, nodes, edges
 
 
+def _validate_encoder_config(
+    *,
+    depth: int,
+    embed_dim: int,
+    num_heads: int,
+    mlp_dim: int,
+    seq_len: int,
+    vocab_size: int,
+) -> None:
+    values = {
+        "depth": depth,
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "mlp_dim": mlp_dim,
+        "seq_len": seq_len,
+        "vocab_size": vocab_size,
+    }
+    for name, value in values.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    if embed_dim % num_heads != 0:
+        raise ValueError("embed_dim must be divisible by num_heads")
+
+
 def create_encoder_sentiment_classifier(
     *,
     depth: int,
@@ -319,6 +343,16 @@ def create_encoder_sentiment_classifier(
     use_attention_mask: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for sequence classification."""
+    _validate_encoder_config(
+        depth=depth,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+    )
+    if num_classes <= 0:
+        raise ValueError("num_classes must be positive")
     if weight_init is None:
         weight_init = NormalInitializer(std=0.02)
 
@@ -375,6 +409,14 @@ def create_encoder_mlm_model(
     use_attention_mask: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked LM pretraining."""
+    _validate_encoder_config(
+        depth=depth,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+    )
     if weight_init is None:
         weight_init = NormalInitializer(std=0.02)
 

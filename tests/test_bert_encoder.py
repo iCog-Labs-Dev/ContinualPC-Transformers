@@ -9,6 +9,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import optax
+import pytest
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
@@ -17,6 +18,7 @@ from fabricpc.models.bert import (
     AddPositionEmbeddingNode,
     FinalLayerNormNode,
     FirstTokenPoolNode,
+    create_encoder_mlm_model,
     create_encoder_sentiment_classifier,
 )
 
@@ -61,6 +63,79 @@ def test_encoder_topology_is_bidirectional():
     assert structure.nodes["classifier"].node_info.weight_init.config["std"] == 0.02
     assert structure.task_map["x"] == "input_ids"
     assert structure.task_map["y"] == "classifier"
+
+
+def test_encoder_weightless_transform_slots_are_not_mupc_scaled():
+    inference = InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0)
+    mlm = create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        inference=inference,
+    )
+    classifier = create_encoder_sentiment_classifier(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        num_classes=2,
+        inference=inference,
+    )
+
+    for structure in (mlm, classifier):
+        for node_name in ("position_embeddings", "final_layernorm", "pooler"):
+            if node_name not in structure.nodes:
+                continue
+            scaling = structure.nodes[node_name].node_info.scaling_config
+            forward_scale = {} if scaling is None else scaling.forward_scale
+            assert not any(key.endswith(f"->{node_name}:in") for key in forward_scale)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"depth": 0},
+        {"embed_dim": 0},
+        {"num_heads": 0},
+        {"mlp_dim": 0},
+        {"seq_len": 0},
+        {"vocab_size": 0},
+        {"embed_dim": 10, "num_heads": 4},
+    ],
+)
+def test_encoder_mlm_builder_rejects_invalid_config(overrides):
+    kwargs = dict(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError):
+        create_encoder_mlm_model(**kwargs)
+
+
+def test_encoder_classifier_builder_rejects_invalid_num_classes():
+    with pytest.raises(ValueError, match="num_classes"):
+        create_encoder_sentiment_classifier(
+            depth=1,
+            embed_dim=16,
+            num_heads=4,
+            mlp_dim=32,
+            seq_len=6,
+            vocab_size=20,
+            num_classes=0,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+        )
 
 
 def test_encoder_forward_shape_smoke():
