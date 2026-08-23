@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.types import GraphParams, GraphState, NodeState
@@ -25,8 +26,11 @@ import fabricpc.training as training
 from fabricpc.training.train_backprop import (
     compute_loss,
     evaluate_mlm,
+    load_mlm_training_checkpoint,
+    train_backprop_mlm,
     train_step_backprop_mlm,
 )
+from fabricpc.utils.data import MlmTextBatcher
 
 
 def build_small_mlm():
@@ -279,10 +283,10 @@ def test_train_step_backprop_mlm_updates_params(rng_key):
     assert tree_any_changed(params, new_params)
 
 
-def test_train_step_backprop_mlm_requires_nonempty_loss_mask(rng_key):
+def test_train_step_backprop_mlm_allows_empty_loss_mask_as_noop(rng_key):
     structure = build_small_mlm()
     params = initialize_params(structure, rng_key)
-    optimizer = optax.adamw(1e-2, weight_decay=1e-1)
+    optimizer = optax.adam(1e-2)
     opt_state = optimizer.init(params)
     batch = {
         "x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
@@ -290,13 +294,12 @@ def test_train_step_backprop_mlm_requires_nonempty_loss_mask(rng_key):
         "loss_mask": jnp.array([[False, False, False, False, False, False]]),
     }
 
-    try:
-        train_step_backprop_mlm(params, opt_state, batch, structure, optimizer, rng_key)
-    except ValueError as exc:
-        assert "loss_mask" in str(exc)
-        assert "at least one" in str(exc)
-    else:
-        raise AssertionError("Expected empty MLM loss_mask to be rejected")
+    new_params, _, loss = train_step_backprop_mlm(
+        params, opt_state, batch, structure, optimizer, rng_key
+    )
+
+    assert float(loss) == 0.0
+    assert tree_allclose(params, new_params)
 
 
 def test_train_step_backprop_mlm_requires_loss_mask(rng_key):
@@ -350,6 +353,102 @@ def test_evaluate_mlm_rejects_malformed_loss_mask(rng_key):
         assert "must match" in str(exc)
     else:
         raise AssertionError("Expected malformed eval loss_mask to be rejected")
+
+
+def test_evaluate_mlm_restores_loader_state(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    loader = MlmTextBatcher(
+        token_ids=np.array([1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 2], dtype=np.int32),
+        seq_len=6,
+        batch_size=2,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=0.5,
+        stride=3,
+        shuffle=False,
+    )
+    before = loader.state_dict()
+
+    evaluate_mlm(params, structure, loader, rng_key)
+
+    assert loader.state_dict() == before
+
+
+def test_train_backprop_mlm_records_validation_steps(tmp_path, rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+
+    def make_loader(seed):
+        return MlmTextBatcher(
+            token_ids=np.array([1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 2], dtype=np.int32),
+            seq_len=6,
+            batch_size=2,
+            pad_token_id=0,
+            mask_token_id=3,
+            vocab_size=20,
+            special_token_ids={0, 1, 2, 3},
+            seed=seed,
+            mask_prob=0.5,
+            stride=3,
+            shuffle=False,
+        )
+
+    _, state = train_backprop_mlm(
+        params,
+        structure,
+        make_loader(2),
+        optimizer,
+        {
+            "max_steps": 2,
+            "validation_interval": 1,
+            "checkpoint_path": str(tmp_path / "mlm.json"),
+        },
+        rng_key,
+        val_loader=make_loader(3),
+        verbose=False,
+    )
+
+    assert [record["step"] for record in state["validation"]] == [1, 2]
+
+
+def test_load_mlm_training_checkpoint_rejects_unknown_version(tmp_path, rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    checkpoint_path = tmp_path / "mlm.json"
+    train_backprop_mlm(
+        params,
+        structure,
+        MlmTextBatcher(
+            token_ids=np.array([1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 2], dtype=np.int32),
+            seq_len=6,
+            batch_size=2,
+            pad_token_id=0,
+            mask_token_id=3,
+            vocab_size=20,
+            special_token_ids={0, 1, 2, 3},
+            seed=2,
+            mask_prob=0.5,
+            stride=3,
+            shuffle=False,
+        ),
+        optimizer,
+        {"max_steps": 1, "checkpoint_path": str(checkpoint_path)},
+        rng_key,
+        verbose=False,
+    )
+    metadata = checkpoint_path.read_text()
+    checkpoint_path.write_text(metadata.replace('"version": 1', '"version": 2'))
+
+    with pytest.raises(ValueError, match="checkpoint version"):
+        load_mlm_training_checkpoint(
+            str(checkpoint_path), opt_state_template=optimizer.init(params)
+        )
 
 
 def test_copy_encoder_params_copies_encoder_and_leaves_head(rng_key):

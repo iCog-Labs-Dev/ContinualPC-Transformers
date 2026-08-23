@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import optax
 
 from fabricpc.training.optimizers import (
+    build_warmup_cosine_adamw,
     scale_by_natural_gradient_diag,
     scale_by_natural_gradient_layerwise,
 )
@@ -111,3 +112,33 @@ def test_natural_gradient_hparams_validation():
 
     with pytest.raises(ValueError, match="damping"):
         scale_by_natural_gradient_layerwise(damping=0.0)
+
+
+def test_build_warmup_cosine_adamw_updates_params():
+    optimizer = build_warmup_cosine_adamw(
+        learning_rate=1e-2,
+        total_steps=10,
+        warmup_steps=2,
+        weight_decay=1e-3,
+        min_learning_rate=1e-4,
+    )
+    params = {"w": jnp.ones((2, 2))}
+    grads = {"w": jnp.full((2, 2), 0.1)}
+    opt_state = optimizer.init(params)
+
+    updates, _ = optimizer.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    assert jnp.all(jnp.isfinite(new_params["w"]))
+
+
+def test_build_warmup_cosine_adamw_validates_schedule_args():
+    with pytest.raises(ValueError, match="learning_rate"):
+        build_warmup_cosine_adamw(learning_rate=0.0, total_steps=10)
+
+    with pytest.raises(ValueError, match="warmup_steps"):
+        build_warmup_cosine_adamw(
+            learning_rate=1e-2,
+            total_steps=10,
+            warmup_steps=11,
+        )

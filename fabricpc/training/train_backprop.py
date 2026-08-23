@@ -17,6 +17,7 @@ Use cases:
 
 from pathlib import Path
 from typing import Dict, Tuple, Any, List, Optional, Callable, cast
+from collections import deque
 import json
 import math
 import jax
@@ -36,6 +37,7 @@ from fabricpc.training.train_autoregressive import (
     compute_loss,
 )
 from fabricpc.training.train import (
+    _convert_batch,
     replicate_opt_state,
     replicate_params,
     shard_batch,
@@ -146,8 +148,6 @@ def train_step_backprop_mlm(
     """Single backprop step for masked-language-model pretraining."""
     if "loss_mask" not in batch:
         raise ValueError("MLM training requires batch['loss_mask']")
-    if int(jnp.sum(batch["loss_mask"].astype(bool))) == 0:
-        raise ValueError("MLM loss_mask must include at least one masked token")
 
     def loss_fn(p):
         state = compute_forward_pass(p, structure, batch, rng_key)
@@ -234,19 +234,9 @@ def create_pmap_train_step_backprop_mlm(
     return jax.pmap(step_fn, axis_name="devices")
 
 
-def _convert_batch_data(batch_data: Any) -> Dict[str, jnp.ndarray]:
-    if isinstance(batch_data, dict):
-        return {k: jnp.array(v) for k, v in batch_data.items()}
-    if isinstance(batch_data, (list, tuple)):
-        return {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
-    raise ValueError(f"Unsupported batch format: {type(batch_data)}")
-
-
 def _validate_mlm_batch(batch: Dict[str, jnp.ndarray]) -> None:
     if "loss_mask" not in batch:
         raise ValueError("MLM training requires batch['loss_mask']")
-    if int(jnp.sum(batch["loss_mask"].astype(bool))) == 0:
-        raise ValueError("MLM loss_mask must include at least one masked token")
 
 
 def _validate_mlm_batch_data(batch_data: Any) -> None:
@@ -254,12 +244,11 @@ def _validate_mlm_batch_data(batch_data: Any) -> None:
         return
     if "loss_mask" not in batch_data:
         raise ValueError("MLM training requires batch['loss_mask']")
-    if int(np.sum(np.asarray(batch_data["loss_mask"]).astype(bool))) == 0:
-        raise ValueError("MLM loss_mask must include at least one masked token")
 
 
 def _flatten_graph_params(
     params: GraphParams,
+    key_prefix: str = "params",
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     tensors: dict[str, np.ndarray] = {}
     schema: dict[str, Any] = {}
@@ -267,14 +256,14 @@ def _flatten_graph_params(
         node_schema = {"weights": {}, "biases": {}}
         for collection_name in ("weights", "biases"):
             for param_name, value in getattr(node_params, collection_name).items():
-                tensor_key = f"params/{node_name}/{collection_name}/{param_name}"
+                tensor_key = f"{key_prefix}/{node_name}/{collection_name}/{param_name}"
                 tensors[tensor_key] = np.asarray(value)
                 node_schema[collection_name][param_name] = tensor_key
         schema[node_name] = node_schema
     return tensors, schema
 
 
-def _load_graph_params(metadata: dict[str, Any], tensors: Any) -> GraphParams:
+def _graph_params_from_tensors(metadata: dict[str, Any], tensors: Any) -> GraphParams:
     nodes = {}
     for node_name, node_schema in metadata["params"].items():
         collections = {}
@@ -351,12 +340,16 @@ def load_mlm_training_checkpoint(
     metadata = json.loads(checkpoint_path.read_text())
     if metadata.get("format") != "fabricpc-mlm-training-checkpoint":
         raise ValueError("Unsupported MLM checkpoint format")
+    if metadata.get("version") != 1:
+        raise ValueError(
+            f"Unsupported MLM checkpoint version: {metadata.get('version')!r}"
+        )
     tensor_file = metadata.get("tensor_file")
     if not isinstance(tensor_file, str):
         raise ValueError("Checkpoint tensor_file must be a string")
 
     with np.load(checkpoint_path.with_name(tensor_file), allow_pickle=False) as tensors:
-        params = _load_graph_params(metadata, tensors)
+        params = _graph_params_from_tensors(metadata, tensors)
         template_leaves, treedef = jax.tree_util.tree_flatten(opt_state_template)
         opt_keys = metadata.get("opt_state", [])
         if len(opt_keys) != len(template_leaves):
@@ -389,36 +382,46 @@ def evaluate_mlm(
     total_correct = 0
     total_masked = 0
 
-    for batch_data in loader:
-        if not isinstance(batch_data, dict):
-            raise ValueError("MLM loaders must yield dict batches")
-        if "loss_mask" not in batch_data:
-            raise ValueError("MLM evaluation requires batch['loss_mask']")
-        batch = {k: jnp.array(v) for k, v in batch_data.items()}
-        rng_key, step_key = jax.random.split(rng_key)
-        state = compute_forward_pass(params, structure, batch, step_key)
-        predictions = state.nodes[structure.task_map["y"]].z_mu
-        pred_ids = jnp.argmax(predictions, axis=-1)
-        if batch["loss_mask"].shape != pred_ids.shape:
-            raise ValueError(
-                "MLM loss_mask shape must match token prediction shape exactly; "
-                f"got {batch['loss_mask'].shape}, expected {pred_ids.shape}"
+    loader_state = None
+    if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
+        loader_state = loader.state_dict()
+
+    try:
+        for batch_data in loader:
+            if not isinstance(batch_data, dict):
+                raise ValueError("MLM loaders must yield dict batches")
+            if "loss_mask" not in batch_data:
+                raise ValueError("MLM evaluation requires batch['loss_mask']")
+            batch = {k: jnp.array(v) for k, v in batch_data.items()}
+            rng_key, step_key = jax.random.split(rng_key)
+            state = compute_forward_pass(params, structure, batch, step_key)
+            predictions = state.nodes[structure.task_map["y"]].z_mu
+            pred_ids = jnp.argmax(predictions, axis=-1)
+            if batch["loss_mask"].shape != pred_ids.shape:
+                raise ValueError(
+                    "MLM loss_mask shape must match token prediction shape exactly; "
+                    f"got {batch['loss_mask'].shape}, expected {pred_ids.shape}"
+                )
+
+            mask = batch["loss_mask"].astype(bool)
+            masked_count = int(jnp.sum(mask))
+            if masked_count == 0:
+                continue
+            loss = compute_loss(
+                state,
+                batch["y"],
+                structure.task_map["y"],
+                loss_type="cross_entropy",
+                loss_mask=batch["loss_mask"],
             )
-        loss = compute_loss(
-            state,
-            batch["y"],
-            structure.task_map["y"],
-            loss_type="cross_entropy",
-            loss_mask=batch["loss_mask"],
-        )
+            correct = int(jnp.sum((pred_ids == batch["y"]) & mask))
 
-        mask = batch["loss_mask"].astype(bool)
-        masked_count = int(jnp.sum(mask))
-        correct = int(jnp.sum((pred_ids == batch["y"]) & mask))
-
-        total_loss += float(loss) * masked_count
-        total_correct += correct
-        total_masked += masked_count
+            total_loss += float(loss) * masked_count
+            total_correct += correct
+            total_masked += masked_count
+    finally:
+        if loader_state is not None:
+            loader.load_state_dict(loader_state)
 
     if total_masked == 0:
         return {"masked_loss": 0.0, "masked_accuracy": 0.0, "num_masked_tokens": 0}
@@ -467,6 +470,12 @@ def train_backprop_mlm(
     checkpoint_path = config.get("checkpoint_path")
     checkpoint_interval = int(config.get("checkpoint_interval", max_steps))
     validation_interval = int(config.get("validation_interval", 0))
+    log_interval = int(config.get("log_interval", 1))
+    rolling_loss_window = int(config.get("rolling_loss_window", 100))
+    if log_interval < 0:
+        raise ValueError("log_interval must be non-negative")
+    if rolling_loss_window < 1:
+        raise ValueError("rolling_loss_window must be positive")
     use_pmap = bool(config.get("use_pmap", False))
     pmap_single_device = bool(config.get("pmap_single_device", False))
     n_devices = jax.device_count()
@@ -504,6 +513,8 @@ def train_backprop_mlm(
         )
 
     losses: list[float] = []
+    rolling_losses: deque[float] = deque(maxlen=rolling_loss_window)
+    rolling_loss_sum = 0.0
     validation: list[dict[str, float]] = []
     step = start_step
     last_loader_state = (
@@ -518,7 +529,7 @@ def train_backprop_mlm(
             if step >= max_steps:
                 break
             _validate_mlm_batch_data(batch_data)
-            batch = _convert_batch_data(batch_data)
+            batch = _convert_batch(batch_data)
             _validate_mlm_batch(batch)
             rng_key, step_key = jax.random.split(rng_key)
             progressed = True
@@ -534,6 +545,10 @@ def train_backprop_mlm(
 
             step += 1
             losses.append(loss_value)
+            if len(rolling_losses) == rolling_losses.maxlen:
+                rolling_loss_sum -= rolling_losses[0]
+            rolling_losses.append(loss_value)
+            rolling_loss_sum += loss_value
             next_batch = (batch_idx + 1) % (num_train_batches or 1)
             last_loader_state = {
                 "epoch": (
@@ -544,8 +559,12 @@ def train_backprop_mlm(
                 "batch_in_epoch": next_batch,
             }
 
-            if verbose:
-                print(f"step={step} masked_loss={loss_value:.4f}")
+            if verbose and log_interval > 0 and step % log_interval == 0:
+                rolling_average = rolling_loss_sum / len(rolling_losses)
+                print(
+                    f"step={step} masked_loss={loss_value:.4f} "
+                    f"masked_loss_avg{len(rolling_losses)}={rolling_average:.4f}"
+                )
 
             checkpoint_due = checkpoint_path and step % checkpoint_interval == 0
             if checkpoint_due:
@@ -579,9 +598,20 @@ def train_backprop_mlm(
                     if run_pmap
                     else params
                 )
-                validation.append(
-                    evaluate_mlm(eval_params, structure, val_loader, rng_key)
+                validation_metrics = evaluate_mlm(
+                    eval_params, structure, val_loader, rng_key
                 )
+                validation_record = {"step": step, **validation_metrics}
+                validation.append(validation_record)
+                if verbose:
+                    print(
+                        f"step={step} validation_masked_loss="
+                        f"{validation_metrics['masked_loss']:.4f} "
+                        f"validation_masked_accuracy="
+                        f"{validation_metrics['masked_accuracy']:.4f} "
+                        f"validation_masked_tokens="
+                        f"{validation_metrics['num_masked_tokens']:.0f}"
+                    )
         if not progressed:
             raise ValueError("train_loader produced no MLM batches during an epoch")
 
@@ -601,6 +631,10 @@ def train_backprop_mlm(
             rng_key=rng_key,
             loader_state=last_loader_state,
         )
+
+    if verbose:
+        final_loss = losses[-1] if losses else 0.0
+        print(f"done step={step} final_masked_loss={final_loss:.4f} losses={len(losses)}")
 
     return final_params, {"step": step, "losses": losses, "validation": validation}
 

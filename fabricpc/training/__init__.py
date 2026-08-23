@@ -33,6 +33,7 @@ from fabricpc.training.train_backprop import (
     train_backprop_mlm,
     create_pmap_train_step_backprop_mlm,
 )
+from fabricpc.training.optimizers import build_warmup_cosine_adamw
 
 # Backward-compatibility aliases (deprecated, will be removed)
 train_pcn_multi_gpu = train_pcn
@@ -74,4 +75,5 @@ __all__ = [
     "evaluate_mlm",
     "train_backprop_mlm",
     "create_pmap_train_step_backprop_mlm",
+    "build_warmup_cosine_adamw",
 ]
