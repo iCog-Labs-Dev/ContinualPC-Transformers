@@ -8,7 +8,13 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import numpy as np
 import pytest
 
-from fabricpc.utils.data.dataloader import _TokenSequenceLoader, BpeDataLoader
+from fabricpc.utils.data.dataloader import (
+    _TokenSequenceLoader,
+    BpeDataLoader,
+    MlmTextBatcher,
+    apply_mlm_mask,
+    prepare_bpe_tokenized_texts,
+)
 
 
 class _ArrayTokenLoader(_TokenSequenceLoader):
@@ -141,3 +147,84 @@ def test_prepare_fits_tokenizer_on_train_split_only(tmp_path, monkeypatch):
     assert not any("z" in token for token in tok.get_vocab())
     for split in ("train", "validation", "test"):
         assert (bpe_dir / f"{split}.npy").exists()
+
+
+def test_apply_mlm_mask_has_no_forced_mask_fallback():
+    tokens = np.array([[1, 5, 6, 2]], dtype=np.int32)
+
+    _, _, loss_mask = apply_mlm_mask(
+        tokens,
+        mask_token_id=3,
+        vocab_size=10,
+        special_token_ids={0, 1, 2, 3},
+        seed=0,
+        mask_prob=0.0,
+    )
+
+    assert not np.any(loss_mask)
+
+
+def test_apply_mlm_mask_random_replacements_exclude_special_tokens():
+    tokens = np.tile(np.array([[4, 5, 6, 7]], dtype=np.int32), (20, 1))
+
+    masked, targets, loss_mask = apply_mlm_mask(
+        tokens,
+        mask_token_id=3,
+        vocab_size=8,
+        special_token_ids={0, 1, 2, 3},
+        seed=1,
+        mask_prob=1.0,
+        random_replacement_excludes_special=True,
+    )
+
+    random_replacements = loss_mask & (masked != targets) & (masked != 3)
+    assert np.any(random_replacements)
+    assert not np.any(np.isin(masked[random_replacements], [0, 1, 2, 3]))
+
+
+def test_mlm_text_batcher_prefixes_cls_and_uses_stream_stride():
+    batcher = MlmTextBatcher(
+        token_ids=np.arange(10, 20, dtype=np.int32),
+        seq_len=5,
+        batch_size=2,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=32,
+        special_token_ids={0, 1, 2, 3},
+        cls_token_id=1,
+        seed=0,
+        mask_prob=1.0,
+        shuffle=False,
+    )
+
+    batch = next(iter(batcher))
+
+    assert np.array_equal(batch["y"][:, 0], np.array([1, 1], dtype=np.int32))
+    assert np.array_equal(batch["x"][:, 0], np.array([1, 1], dtype=np.int32))
+    assert not np.any(batch["loss_mask"][:, 0])
+    assert np.all(batch["attention_mask"][:, 0])
+    assert np.array_equal(batch["y"][0, 1:], np.array([10, 11, 12, 13]))
+    assert np.array_equal(batch["y"][1, 1:], np.array([14, 15, 16, 17]))
+
+
+def test_prepare_bpe_tokenized_texts_rejects_mismatched_cache_manifest(tmp_path):
+    pytest.importorskip("tokenizers")
+
+    prepare_bpe_tokenized_texts(
+        texts=["warm happy movie"],
+        cache_dir=tmp_path,
+        vocab_size=32,
+        special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"],
+        token_stem="tokens_train",
+        cache_metadata={"dataset_name": "demo", "split": "train"},
+    )
+
+    with pytest.raises(ValueError, match="overwrite_cache=True"):
+        prepare_bpe_tokenized_texts(
+            texts=["warm happy movie"],
+            cache_dir=tmp_path,
+            vocab_size=64,
+            special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"],
+            token_stem="tokens_train",
+            cache_metadata={"dataset_name": "demo", "split": "train"},
+        )

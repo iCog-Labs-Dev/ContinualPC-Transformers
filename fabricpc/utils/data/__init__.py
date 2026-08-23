@@ -8,12 +8,15 @@ from fabricpc.utils.data.dataloader import (
     Cifar100Loader,
     FashionMnistLoader,
     FewShotLoader,
+    MLM_SPECIAL_TOKENS,
+    MlmTextBatcher,
     NoisyTestLoader,
+    apply_mlm_mask,
+    load_tokenized_mlm_loader,
+    prepare_bpe_tokenized_texts,
 )
 from fabricpc.utils.data.mlm_loader import (
     BabyLmMlmLoader,
-    MlmTextBatcher,
-    apply_mlm_mask,
 )
 
 __all__ = [
@@ -27,7 +30,10 @@ __all__ = [
     "FashionMnistLoader",
     "FewShotLoader",
     "NoisyTestLoader",
+    "MLM_SPECIAL_TOKENS",
     "BabyLmMlmLoader",
     "MlmTextBatcher",
     "apply_mlm_mask",
+    "prepare_bpe_tokenized_texts",
+    "load_tokenized_mlm_loader",
 ]
