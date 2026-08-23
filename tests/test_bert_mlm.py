@@ -286,7 +286,7 @@ def test_train_step_backprop_mlm_updates_params(rng_key):
 def test_train_step_backprop_mlm_allows_empty_loss_mask_as_noop(rng_key):
     structure = build_small_mlm()
     params = initialize_params(structure, rng_key)
-    optimizer = optax.adam(1e-2)
+    optimizer = optax.adamw(1e-2, weight_decay=1e-1)
     opt_state = optimizer.init(params)
     batch = {
         "x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32),
@@ -294,12 +294,54 @@ def test_train_step_backprop_mlm_allows_empty_loss_mask_as_noop(rng_key):
         "loss_mask": jnp.array([[False, False, False, False, False, False]]),
     }
 
-    new_params, _, loss = train_step_backprop_mlm(
+    new_params, new_opt_state, loss = train_step_backprop_mlm(
         params, opt_state, batch, structure, optimizer, rng_key
     )
 
     assert float(loss) == 0.0
     assert tree_allclose(params, new_params)
+    assert tree_allclose(opt_state, new_opt_state)
+
+
+def test_train_backprop_mlm_rejects_invalid_intervals(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    loader = MlmTextBatcher(
+        token_ids=np.array([1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 2], dtype=np.int32),
+        seq_len=6,
+        batch_size=2,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=0.5,
+        stride=3,
+        shuffle=False,
+    )
+
+    with pytest.raises(ValueError, match="max_steps"):
+        train_backprop_mlm(
+            params,
+            structure,
+            loader,
+            optimizer,
+            {"max_steps": 0},
+            rng_key,
+            verbose=False,
+        )
+
+    with pytest.raises(ValueError, match="checkpoint_interval"):
+        train_backprop_mlm(
+            params,
+            structure,
+            loader,
+            optimizer,
+            {"max_steps": 1, "checkpoint_interval": 0},
+            rng_key,
+            verbose=False,
+        )
 
 
 def test_train_step_backprop_mlm_requires_loss_mask(rng_key):

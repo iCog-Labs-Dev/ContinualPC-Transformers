@@ -137,6 +137,36 @@ def train_step_backprop(
     return params, opt_state, loss
 
 
+def _apply_optimizer_update_when_masked(
+    *,
+    params: GraphParams,
+    opt_state: optax.OptState,
+    grads: GraphParams,
+    optimizer: optax.GradientTransformation,
+    masked_count: jax.Array,
+) -> tuple[GraphParams, optax.OptState]:
+    def update_fn(args):
+        current_params, current_opt_state, current_grads = args
+        updates, new_opt_state = optimizer.update(
+            current_grads,
+            current_opt_state,
+            current_params,
+        )
+        new_params = cast(GraphParams, optax.apply_updates(current_params, updates))
+        return new_params, new_opt_state
+
+    def noop_fn(args):
+        current_params, current_opt_state, _ = args
+        return current_params, current_opt_state
+
+    return jax.lax.cond(
+        masked_count > 0,
+        update_fn,
+        noop_fn,
+        (params, opt_state, grads),
+    )
+
+
 def train_step_backprop_mlm(
     params: GraphParams,
     opt_state: optax.OptState,
@@ -160,8 +190,13 @@ def train_step_backprop_mlm(
         )
 
     loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = cast(GraphParams, optax.apply_updates(params, updates))
+    params, opt_state = _apply_optimizer_update_when_masked(
+        params=params,
+        opt_state=opt_state,
+        grads=grads,
+        optimizer=optimizer,
+        masked_count=jnp.sum(batch["loss_mask"].astype(jnp.float32)),
+    )
 
     return params, opt_state, loss
 
@@ -185,8 +220,13 @@ def _train_step_backprop_mlm_no_validate(
         )
 
     loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = cast(GraphParams, optax.apply_updates(params, updates))
+    params, opt_state = _apply_optimizer_update_when_masked(
+        params=params,
+        opt_state=opt_state,
+        grads=grads,
+        optimizer=optimizer,
+        masked_count=jnp.sum(batch["loss_mask"].astype(jnp.float32)),
+    )
     return params, opt_state, loss
 
 
@@ -215,8 +255,13 @@ def train_step_backprop_mlm_pmap(
     grads = jax.lax.psum(grads, axis_name="devices")
     grads = jax.tree_util.tree_map(lambda g: g / jnp.maximum(global_count, 1.0), grads)
     loss = global_numerator / jnp.maximum(global_count, 1.0)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = cast(GraphParams, optax.apply_updates(params, updates))
+    params, opt_state = _apply_optimizer_update_when_masked(
+        params=params,
+        opt_state=opt_state,
+        grads=grads,
+        optimizer=optimizer,
+        masked_count=global_count,
+    )
     return params, opt_state, loss
 
 
@@ -472,6 +517,12 @@ def train_backprop_mlm(
     validation_interval = int(config.get("validation_interval", 0))
     log_interval = int(config.get("log_interval", 1))
     rolling_loss_window = int(config.get("rolling_loss_window", 100))
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be positive")
+    if validation_interval < 0:
+        raise ValueError("validation_interval must be non-negative")
     if log_interval < 0:
         raise ValueError("log_interval must be non-negative")
     if rolling_loss_window < 1:

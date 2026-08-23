@@ -164,6 +164,25 @@ def test_apply_mlm_mask_has_no_forced_mask_fallback():
     assert not np.any(loss_mask)
 
 
+def test_mlm_text_batcher_allows_zero_mask_probability():
+    batcher = MlmTextBatcher(
+        token_ids=np.array([1, 5, 6, 7, 2, 1, 8, 9, 10, 2], dtype=np.int32),
+        seq_len=5,
+        batch_size=2,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=16,
+        special_token_ids={0, 1, 2, 3},
+        seed=0,
+        mask_prob=0.0,
+        shuffle=False,
+    )
+
+    batch = next(iter(batcher))
+
+    assert not np.any(batch["loss_mask"])
+
+
 def test_apply_mlm_mask_random_replacements_exclude_special_tokens():
     tokens = np.tile(np.array([[4, 5, 6, 7]], dtype=np.int32), (20, 1))
 

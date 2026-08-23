@@ -137,8 +137,8 @@ class MlmTextBatcher:
             raise ValueError("batch_size must be positive")
         if vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
-        if not 0.0 < mask_prob <= 1.0:
-            raise ValueError("mask_prob must be in (0, 1]")
+        if not 0.0 <= mask_prob <= 1.0:
+            raise ValueError("mask_prob must be in [0, 1]")
         if cls_token_id is not None and seq_len < 2:
             raise ValueError("seq_len must be at least 2 when cls_token_id is set")
 
