@@ -247,3 +247,32 @@ def test_prepare_bpe_tokenized_texts_rejects_mismatched_cache_manifest(tmp_path)
             token_stem="tokens_train",
             cache_metadata={"dataset_name": "demo", "split": "train"},
         )
+
+
+def test_prepare_bpe_overwrites_split_tokens_without_retraining_tokenizer(tmp_path):
+    pytest.importorskip("tokenizers")
+    special_tokens = ["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"]
+    prepare_bpe_tokenized_texts(
+        texts=["warm happy movie"],
+        cache_dir=tmp_path,
+        vocab_size=32,
+        special_tokens=special_tokens,
+        token_stem="tokens_train",
+        cache_metadata={"dataset_name": "demo"},
+        overwrite=True,
+    )
+    tokenizer_before = (tmp_path / "tokenizer.json").read_text()
+
+    prepare_bpe_tokenized_texts(
+        texts=["zzzz yyyy xxxx"],
+        cache_dir=tmp_path,
+        vocab_size=32,
+        special_tokens=special_tokens,
+        token_stem="tokens_valid",
+        cache_metadata={"dataset_name": "demo"},
+        overwrite=True,
+        overwrite_tokenizer=False,
+    )
+
+    assert (tmp_path / "tokenizer.json").read_text() == tokenizer_before
+    assert (tmp_path / "tokens_valid.npy").exists()

@@ -1,8 +1,6 @@
 """Tests for the additive encoder-only sentiment transformer builder."""
 
 import os
-import importlib.util
-from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -10,6 +8,8 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
+
+from examples.bert_demo import build_optimizer
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
@@ -21,19 +21,6 @@ from fabricpc.models.bert import (
     create_encoder_mlm_model,
     create_encoder_sentiment_classifier,
 )
-
-
-def load_demo_build_optimizer():
-    demo_path = (
-        Path(__file__).resolve().parents[1] / "examples" / "bert_sentiment_demo.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "bert_sentiment_demo_for_test", demo_path
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module.build_optimizer
 
 
 def build_small_encoder():
@@ -191,7 +178,6 @@ def test_future_token_can_affect_first_position_attention():
 
 
 def test_sentiment_demo_optimizer_supports_warmup_and_clipping():
-    build_optimizer = load_demo_build_optimizer()
     optimizer = build_optimizer(
         learning_rate=1e-2,
         weight_decay=1e-4,

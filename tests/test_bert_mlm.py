@@ -1,8 +1,6 @@
 """Tests for the minimal BERT-style masked-language-model path."""
 
 import os
-import importlib.util
-from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -11,6 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+from examples.bert_demo import load_checkpoint, save_checkpoint
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.types import GraphParams, GraphState, NodeState
@@ -43,15 +43,6 @@ def build_small_mlm():
         vocab_size=20,
         inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
     )
-
-
-def load_example_module(name: str):
-    demo_path = Path(__file__).resolve().parents[1] / "examples" / name
-    spec = importlib.util.spec_from_file_location(name.replace(".py", ""), demo_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
 
 
 def tree_any_changed(before, after):
@@ -113,6 +104,7 @@ def test_compute_loss_with_mask_ignores_unmasked_positions():
         nodes={
             "mlm": NodeState(
                 z_latent=dummy,
+                pre_activation=predictions,
                 z_mu=predictions,
                 error=dummy,
                 energy=jnp.zeros((1,)),
@@ -152,6 +144,7 @@ def test_compute_loss_masked_mse_averages_over_masked_features():
         nodes={
             "out": NodeState(
                 z_latent=dummy,
+                pre_activation=predictions,
                 z_mu=predictions,
                 error=dummy,
                 energy=jnp.zeros((1,)),
@@ -179,6 +172,7 @@ def test_compute_loss_cross_entropy_rejects_broadcastable_mask():
         nodes={
             "mlm": NodeState(
                 z_latent=dummy,
+                pre_activation=predictions,
                 z_mu=predictions,
                 error=dummy,
                 energy=jnp.zeros((1,)),
@@ -204,17 +198,14 @@ def test_compute_loss_cross_entropy_rejects_broadcastable_mask():
 
 
 def test_demo_checkpoint_roundtrip_json_npz_and_encoder_copy(tmp_path, rng_key):
-    pretrain_demo = load_example_module("bert_mlm_pretrain_demo.py")
-    downstream_demo = load_example_module("bert_downstream_finetune_demo.py")
-
     source_structure = build_small_mlm()
     source_params = initialize_params(source_structure, rng_key)
     checkpoint_path = tmp_path / "mlm_checkpoint.json"
     vocab = {"[PAD]": 0, "[MASK]": 1, "great": 2}
     config = {"depth": 1, "embed_dim": 16, "num_heads": 4, "mlp_dim": 32, "seq_len": 6}
 
-    pretrain_demo.save_checkpoint(str(checkpoint_path), source_params, vocab, config)
-    loaded = downstream_demo.load_checkpoint(str(checkpoint_path))
+    save_checkpoint(str(checkpoint_path), source_params, vocab, config)
+    loaded = load_checkpoint(str(checkpoint_path))
 
     assert checkpoint_path.exists()
     assert checkpoint_path.suffix == ".json"

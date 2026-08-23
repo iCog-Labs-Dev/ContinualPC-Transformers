@@ -100,7 +100,9 @@ def apply_mlm_mask(
         else:
             random_tokens = rng.choice(replacement_ids, size=token_ids.shape)
     else:
-        random_tokens = rng.integers(0, vocab_size, size=token_ids.shape, dtype=np.int32)
+        random_tokens = rng.integers(
+            0, vocab_size, size=token_ids.shape, dtype=np.int32
+        )
 
     masked = np.where(loss_mask & (policy < 0.8), mask_token_id, masked)
     masked = np.where(
@@ -198,7 +200,9 @@ class MlmTextBatcher:
                 segment = self.token_ids[start : start + self.stream_window]
                 if self.cls_token_id is None:
                     original[row_idx, : len(segment)] = segment
-                    attention_mask[row_idx, : len(segment)] = segment != self.pad_token_id
+                    attention_mask[row_idx, : len(segment)] = (
+                        segment != self.pad_token_id
+                    )
                 else:
                     original[row_idx, 0] = self.cls_token_id
                     attention_mask[row_idx, 0] = True
@@ -234,6 +238,7 @@ def prepare_bpe_tokenized_texts(
     special_tokens: Sequence[str],
     token_stem: str = "tokens",
     overwrite: bool = False,
+    overwrite_tokenizer: bool = True,
     cache_metadata: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, Any]:
     """Train/load a BPE tokenizer and encode texts into one token stream."""
@@ -253,16 +258,18 @@ def prepare_bpe_tokenized_texts(
     )
 
     if overwrite:
-        for path in (
-            tokenizer_path,
-            tokenizer_manifest_path,
-            tokens_path,
-            tokens_manifest_path,
-        ):
+        paths = [tokens_path, tokens_manifest_path]
+        if overwrite_tokenizer:
+            paths.extend([tokenizer_path, tokenizer_manifest_path])
+        for path in paths:
             if path.exists():
                 path.unlink()
 
-    if tokenizer_path.exists() and tokens_path.exists() and not overwrite:
+    can_use_existing_tokenizer = tokenizer_path.exists() and (
+        not overwrite or not overwrite_tokenizer
+    )
+
+    if can_use_existing_tokenizer and tokens_path.exists() and not overwrite:
         _validate_manifest(
             tokenizer_manifest_path, manifest, artifact_name="BPE tokenizer"
         )
@@ -270,7 +277,7 @@ def prepare_bpe_tokenized_texts(
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
         return np.load(tokens_path, allow_pickle=False), tokenizer
 
-    if tokenizer_path.exists() and not overwrite:
+    if can_use_existing_tokenizer:
         _validate_manifest(
             tokenizer_manifest_path, manifest, artifact_name="BPE tokenizer"
         )
@@ -287,7 +294,9 @@ def prepare_bpe_tokenized_texts(
         tokenizer.train(files=[str(corpus_path)], trainer=trainer)
         corpus_path.unlink()
         tokenizer.save(str(tokenizer_path))
-        tokenizer_manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        tokenizer_manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True)
+        )
 
     ids: list[int] = []
     sep_id = tokenizer.token_to_id("[SEP]")

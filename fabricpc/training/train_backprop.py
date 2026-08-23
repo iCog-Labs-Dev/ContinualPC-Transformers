@@ -43,6 +43,7 @@ from fabricpc.training.train import (
     shard_batch,
 )
 
+
 def validate_feedforward_init(structure: GraphStructure):
     """
     Validate that the graph state initializer is feedforward type.
@@ -685,7 +686,9 @@ def train_backprop_mlm(
 
     if verbose:
         final_loss = losses[-1] if losses else 0.0
-        print(f"done step={step} final_masked_loss={final_loss:.4f} losses={len(losses)}")
+        print(
+            f"done step={step} final_masked_loss={final_loss:.4f} losses={len(losses)}"
+        )
 
     return final_params, {"step": step, "losses": losses, "validation": validation}
 
@@ -771,17 +774,7 @@ def train_backprop(
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)
-        if use_pmap:
-            device_keys = (
-                jax.random.split(epoch_rng_key, n_devices)
-                if n_devices > 1
-                else epoch_rng_key[None, :]
-            )
-            batch_keys = jax.vmap(
-                lambda key: jax.random.split(key, max_batches)
-            )(device_keys)
-        else:
-            batch_keys = jax.random.split(epoch_rng_key, max_batches)
+        batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
         batch_losses = []
         epoch_loss = 0.0
@@ -829,11 +822,7 @@ def train_backprop(
         if verbose:
             print(f"Epoch {epoch_idx + 1}/{total_epochs}, Loss: {avg_loss:.4f}")
 
-    if use_pmap:
-        params = jax.tree_util.tree_map(lambda value: value[0], params)
-
     return params, iter_results, epoch_results
-
 
 
 def compute_loss_autoregressive(
@@ -968,6 +957,7 @@ def create_pmap_train_step_backprop_autoregressive(
     use_causal_mask: bool = True,
 ):
     """Create a pmap'd backprop training step with static args in closure."""
+
     def step_fn(params, opt_state, batch, rng_key):
         return train_step_backprop_autoregressive_pmap(
             params, opt_state, batch, structure, optimizer, rng_key, use_causal_mask
@@ -1033,7 +1023,6 @@ def train_backprop_autoregressive(
 
     # Training hyperparameters
     num_epochs = config.get("num_epochs", 10)  # supports float (e.g. 1.5)
-    use_causal_mask = config.get("use_causal_mask", True)
 
     # Support fractional epochs: e.g. 1.5 -> 2 loop iterations, last stops at 50%
     total_epochs = math.ceil(num_epochs)
@@ -1063,9 +1052,9 @@ def train_backprop_autoregressive(
                 if n_devices > 1
                 else epoch_rng_key[None, :]
             )
-            batch_keys = jax.vmap(
-                lambda key: jax.random.split(key, max_batches)
-            )(device_keys)
+            batch_keys = jax.vmap(lambda key: jax.random.split(key, max_batches))(
+                device_keys
+            )
         else:
             batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
@@ -1270,6 +1259,7 @@ def create_pmap_eval_step_backprop_autoregressive(
     use_causal_mask: bool,
 ):
     """Create a pmap'd backprop evaluation step with static args in closure."""
+
     def step_fn(params, batch, rng_key):
         return compute_loss_autoregressive(
             params, structure, batch, rng_key, use_causal_mask, training=False
@@ -1288,7 +1278,6 @@ def evaluate_backprop_autoregressive(
     pmap_single_device: bool = False,
     force_single_device: bool = False,
 ) -> Dict[str, float]:
-
     """
     Evaluate backprop-trained autoregressive model on test data.
 
@@ -1329,9 +1318,9 @@ def evaluate_backprop_autoregressive(
             if n_devices > 1
             else epoch_key[None, :]
         )
-        batch_keys = jax.vmap(
-            lambda key: jax.random.split(key, num_batches_total)
-        )(device_keys)
+        batch_keys = jax.vmap(lambda key: jax.random.split(key, num_batches_total))(
+            device_keys
+        )
     else:
         batch_keys = jax.random.split(rng_key, num_batches_total)
 
@@ -1373,7 +1362,10 @@ def evaluate_backprop_autoregressive(
             if pad_size:
                 batch = {
                     key: jnp.concatenate(
-                        [value, jnp.zeros((pad_size,) + value.shape[1:], dtype=value.dtype)]
+                        [
+                            value,
+                            jnp.zeros((pad_size,) + value.shape[1:], dtype=value.dtype),
+                        ]
                     )
                     for key, value in batch.items()
                 }

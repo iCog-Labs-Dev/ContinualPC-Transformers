@@ -56,6 +56,7 @@ class AddPositionEmbeddingNode(NodeBase):
         seq_len: int,
         embed_dim: int,
         weight_init: InitializerBase = NormalInitializer(std=0.02),
+        latent_init: InitializerBase = NormalInitializer(),
         energy: GaussianEnergy = GaussianEnergy(),
         **kwargs,
     ):
@@ -65,6 +66,7 @@ class AddPositionEmbeddingNode(NodeBase):
             seq_len=seq_len,
             embed_dim=embed_dim,
             weight_init=weight_init,
+            latent_init=latent_init,
             energy=energy,
             **kwargs,
         )
@@ -100,13 +102,14 @@ class AddPositionEmbeddingNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jax.Array, NodeState]:
         x = inputs[next(iter(inputs))]
         seq_len = x.shape[1]
         z_mu = x + params.weights["position_embeddings"][:seq_len][None, :, :]
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        return node_info.node_class.energy_functional(state, node_info)
+        state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
+        state = node_info.node_class.energy_functional(state, node_info)
+        return jnp.sum(state.energy), state
 
 
 class FirstTokenPoolNode(NodeBase):
@@ -120,6 +123,7 @@ class FirstTokenPoolNode(NodeBase):
         shape: Tuple[int, ...],
         name: str,
         token_index: int = 0,
+        latent_init: InitializerBase = NormalInitializer(),
         energy: GaussianEnergy = GaussianEnergy(),
         **kwargs,
     ):
@@ -127,6 +131,7 @@ class FirstTokenPoolNode(NodeBase):
             shape=shape,
             name=name,
             token_index=token_index,
+            latent_init=latent_init,
             energy=energy,
             **kwargs,
         )
@@ -151,13 +156,14 @@ class FirstTokenPoolNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jax.Array, NodeState]:
         x = inputs[next(iter(inputs))]
         token_index = node_info.node_config.get("token_index", 0)
         z_mu = x[:, token_index, :]
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        return node_info.node_class.energy_functional(state, node_info)
+        state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
+        state = node_info.node_class.energy_functional(state, node_info)
+        return jnp.sum(state.energy), state
 
 
 class FinalLayerNormNode(NodeBase):
@@ -171,6 +177,7 @@ class FinalLayerNormNode(NodeBase):
         shape: Tuple[int, int],
         name: str,
         embed_dim: int,
+        latent_init: InitializerBase = NormalInitializer(),
         energy: GaussianEnergy = GaussianEnergy(),
         **kwargs,
     ):
@@ -178,6 +185,7 @@ class FinalLayerNormNode(NodeBase):
             shape=shape,
             name=name,
             embed_dim=embed_dim,
+            latent_init=latent_init,
             energy=energy,
             **kwargs,
         )
@@ -206,12 +214,13 @@ class FinalLayerNormNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jax.Array, NodeState]:
         x = inputs[next(iter(inputs))]
         z_mu = layernorm(x, params.weights["ln_gamma"], params.biases["ln_beta"])
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        return node_info.node_class.energy_functional(state, node_info)
+        state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
+        state = node_info.node_class.energy_functional(state, node_info)
+        return jnp.sum(state.energy), state
 
 
 def _build_encoder_backbone(

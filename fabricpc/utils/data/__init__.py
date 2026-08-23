@@ -15,9 +15,6 @@ from fabricpc.utils.data.dataloader import (
     load_tokenized_mlm_loader,
     prepare_bpe_tokenized_texts,
 )
-from fabricpc.utils.data.mlm_loader import (
-    BabyLmMlmLoader,
-)
 
 __all__ = [
     "split_np_seed",
@@ -31,7 +28,6 @@ __all__ = [
     "FewShotLoader",
     "NoisyTestLoader",
     "MLM_SPECIAL_TOKENS",
-    "BabyLmMlmLoader",
     "MlmTextBatcher",
     "apply_mlm_mask",
     "prepare_bpe_tokenized_texts",
