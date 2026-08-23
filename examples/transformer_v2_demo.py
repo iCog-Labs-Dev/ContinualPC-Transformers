@@ -55,6 +55,7 @@ import optax
 import time
 import os
 import json
+import pickle
 from diagnostics.plot_history import plot_single
 
 # Tuned on WikiText-103 (2M-token slice), BPE tokenizer (vocab_size=8000).
@@ -73,20 +74,20 @@ BPE_DEFAULTS = {
     "dropout_rate": 0.175,
 }
 
-# Tuned on Tiny Shakespeare, char tokenizer (two-phase search, val PPL 12.22).
+# Tuned on Tiny Shakespeare, char tokenizer (two-phase search).
 CHAR_DEFAULTS = {
-    "embed_dim": 64,
+    "embed_dim": 128,
     "num_heads": 8,
-    "mlp_dim": 256,
+    "mlp_dim": 512,
     "depth": 2,
-    "seq_len": 128,
-    "batch_size": 16,
+    "seq_len": 64,
+    "batch_size": 32,
     "num_epochs": 5,
-    "infer_steps": 12,
-    "lr": 0.00012108621644524519,
-    "eta_infer": 0.0174852165627398,
-    "weight_init_std": 0.015166293102182283,
-    "dropout_rate": 0.0,
+    "infer_steps": 4,
+    "lr": 0.0000402,
+    "eta_infer": 0.0483,
+    "weight_init_std": 0.0228,
+    "dropout_rate": 0.125,
 }
 
 
@@ -134,7 +135,7 @@ def parse_args():
         "--batch_size",
         type=int,
         default=None,
-        help="Batch size (per-device for PC, total for backprop; default: tuned per --tokenizer)",
+        help="Global batch size, sharded across devices (default: tuned per --tokenizer)",
     )
     parser.add_argument(
         "--num_epochs", type=int, default=5, help="Number of training epochs"
@@ -175,7 +176,13 @@ def parse_args():
         default=None,
         help="Cap training sequences (e.g. 2000000) to bound a large BPE corpus",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Training seed: controls weight init, data shuffling, and dropout "
+        "masks. Vary this across runs for a multi-seed study",
+    )
     parser.add_argument(
         "--tokenizer",
         choices=["char", "bpe"],
@@ -204,13 +211,19 @@ def main(args=None):
             setattr(args, key, val)
 
     # --- Batch size ---
-    if use_pc:
-        n_devices = jax.device_count()
-        batch_size = args.batch_size * n_devices
-        print(f"PC mode: {n_devices} device(s), total batch_size={batch_size}")
-    else:
-        batch_size = args.batch_size
-        print(f"Backprop mode: single device, batch_size={batch_size}")
+    n_devices = jax.device_count()
+    if args.batch_size % n_devices != 0:
+        raise ValueError(
+            f"--batch_size ({args.batch_size}) must be divisible by n_devices "
+            f"({n_devices}). Try {(args.batch_size // n_devices) * n_devices} "
+            f"or {(args.batch_size // n_devices + 1) * n_devices}."
+        )
+    global_batch_size = args.batch_size          # tuned global batch, e.g. 32
+    per_device_batch_size = args.batch_size // n_devices      
+    batch_size = args.batch_size                 # passed to trainer, which shards it
+
+    print(f"{args.mode} mode: {n_devices} device(s), "
+          f"global batch {global_batch_size} ({per_device_batch_size}/device)")
 
     # --- Data ---
     if use_bpe:
@@ -303,7 +316,19 @@ def main(args=None):
             train_energy_hist.append(float(energy))
         if ce_loss is not None:
             train_ppl_hist.append(float(jnp.exp(ce_loss)))
-        m = eval_fn(cb_params, cb_structure, test_loader, train_config, cb_rng)
+        
+        # force 0 inference steps at eval (no-op on this graph; avoids the
+        # adaptive solver running on an already settled state)
+        ic = cb_structure.config["inference"].config
+        eval_inf = type(cb_structure.config["inference"])(
+            eta_infer=ic["eta_infer"], infer_steps=0,
+            latent_decay=ic["latent_decay"], max_norm=ic["max_norm"], eps=ic["eps"],
+        )
+        eval_structure = cb_structure._replace(
+            config={**cb_structure.config, "inference": eval_inf}
+        )
+
+        m = eval_fn(cb_params, eval_structure, test_loader, train_config, cb_rng)
         test_metrics_hist.append(m)
         test_ppl_hist.append(float(m["perplexity"]))
         print(f"  [epoch {epoch_idx + 1}] test perplexity: {m['perplexity']:.2f}")
@@ -333,7 +358,8 @@ def main(args=None):
             epoch_callback=epoch_callback,
         )
 
-    print(f"Training completed in {time.time() - start:.1f}s")
+    train_seconds = time.time() - start
+    print(f"Training completed in {train_seconds:.1f}s")
 
     # --- Evaluate ---
     eval_start = time.time()
@@ -348,10 +374,39 @@ def main(args=None):
     print(f"Test CE Loss:    {metrics['loss']:.4f}")
     print(f"Test Perplexity: {metrics['perplexity']:.2f}")
 
-    # Save metrics history & plot curves
+    # Save metrics history & plot curves. The tag carries the seed so a
+    # multi-seed sweep writes one set of files per run instead of overwriting.
     plot_dir = "runs/plots"
+    metrics_dir = "runs/metrics"
     os.makedirs(plot_dir, exist_ok=True)
-    tag = f"{args.mode}_{args.tokenizer}"
+    os.makedirs(metrics_dir, exist_ok=True)
+    tag = f"{args.mode}_{args.tokenizer}_seed{args.seed}"
+
+    # Config record shared by the checkpoint and the metrics file.
+    config_record = {
+        k: getattr(args, k)
+        for k in (
+            "embed_dim", "num_heads", "mlp_dim", "depth", "seq_len",
+            "num_epochs", "lr", "infer_steps",
+            "eta_infer", "weight_init_std", "dropout_rate",
+        )
+    }
+    config_record["per_device_batch_size"] = per_device_batch_size
+    config_record["global_batch_size"] = global_batch_size
+    config_record["n_devices"] = n_devices
+
+    # --- Save checkpoint (per-seed, so runs don't overwrite each other) ---
+    ckpt_dir = "runs/checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt = {
+        "params": jax.device_get(trained_params),  
+        "config": {**vars(args), **config_record},
+    }
+    ckpt_file = os.path.join(ckpt_dir, f"ckpt_{tag}.pkl")
+    with open(ckpt_file, "wb") as f:
+        pickle.dump(ckpt, f)
+    print(f"Saved checkpoint to {ckpt_file}")
+
     epochs = list(range(1, len(test_ppl_hist) + 1))
     history_dict = {
         "epochs": epochs,
@@ -363,8 +418,30 @@ def main(args=None):
     with open(history_file, "w") as fh:
         json.dump(history_dict, fh, indent=2)
 
+    # Final metrics, one file per run. aggregate_seeds.py reads these to report
+    # mean +/- std across seeds.
+    final_metrics = {
+        "mode": args.mode,
+        "tokenizer": args.tokenizer,
+        "seed": args.seed,
+        "n_params": int(n_params),
+        "vocab_size": int(vocab_size),
+        "global_batch_size": global_batch_size,
+        "train_seconds": train_seconds,
+        "final_train_ppl": train_ppl_hist[-1] if train_ppl_hist else None,
+        "final_train_energy": train_energy_hist[-1] if train_energy_hist else None,
+        "test_ppl": float(metrics["perplexity"]),
+        "test_loss": float(metrics["loss"]),
+        "test_accuracy": float(metrics["accuracy"]),
+        "config": config_record,
+    }
+    metrics_file = os.path.join(metrics_dir, f"metrics_{tag}.json")
+    with open(metrics_file, "w") as fh:
+        json.dump(final_metrics, fh, indent=2)
+
     plot_single(tag, history_dict, plot_dir)
     print(f"Saved plots and history to {plot_dir}/ (tag: {tag})")
+    print(f"Saved final metrics to {metrics_file}")
 
     # --- Text Generation ---
     gen_key = jax.random.PRNGKey(99)
