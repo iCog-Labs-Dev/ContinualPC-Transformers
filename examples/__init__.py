@@ -1,8 +1,6 @@
-"""
-Examples for fabricpc.
+"""Examples for FabricPC.
 
-Run examples from the project root:
-    python -m fabricpc.examples.mnist_demo
+Run examples from the project root with ``PYTHONPATH=.``.
 """
 
-from fabricpc.examples.plotting import visualize_experiment
+__all__: list[str] = []
