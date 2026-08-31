@@ -32,6 +32,7 @@ from fabricpc.models import (
 from fabricpc.training.optimizers import build_warmup_cosine_adamw
 from fabricpc.training.train_backprop import (
     compute_forward_pass,
+    evaluate_mlm,
     train_backprop_mlm,
     train_step_backprop,
 )
@@ -88,6 +89,34 @@ def build_tiny_token_stream(texts: Sequence[str], vocab: dict[str, int], seq_len
     return np.asarray([token for row in encoded for token in row], dtype=np.int32)
 
 
+def _resolve_partition_split(args: argparse.Namespace, requested_split: str) -> str:
+    if args.data_source == "hf" and args.validation_split == args.split:
+        return "train" if requested_split == args.split else requested_split
+    return requested_split
+
+
+def _effective_batch_size(args: argparse.Namespace) -> int:
+    return args.micro_batch_size or args.batch_size
+
+
+def _split_source_texts(args: argparse.Namespace, texts: Sequence[str], split: str):
+    if split not in {"train", "dev", "test"}:
+        return list(texts)
+    split_seed = args.seed if args.split_seed is None else args.split_seed
+    train, dev, test = deterministic_fraction_split(
+        list(texts),
+        train_fraction=args.train_fraction,
+        dev_fraction=args.dev_fraction,
+        test_fraction=args.test_fraction,
+        seed=split_seed,
+    )
+    return {"train": train, "dev": dev, "test": test}[split]
+
+
+def _shuffle_for_split(args: argparse.Namespace, split: str) -> bool:
+    return args.shuffle_train_windows if split == "train" else args.shuffle_eval_windows
+
+
 @dataclass(frozen=True)
 class SentimentBatcher:
     examples: Sequence[tuple[str, int]]
@@ -124,6 +153,86 @@ def normalize_hf_dataset_args(
     return normalized_dataset_name, normalized_revision or None
 
 
+def validate_split_fractions(
+    train_fraction: float,
+    dev_fraction: float,
+    test_fraction: float,
+    *,
+    tolerance: float = 1e-6,
+) -> None:
+    fractions = (train_fraction, dev_fraction, test_fraction)
+    if any(fraction < 0.0 for fraction in fractions):
+        raise ValueError("split fractions must be non-negative")
+    if abs(sum(fractions) - 1.0) > tolerance:
+        raise ValueError("split fractions must sum to 1.0")
+
+
+def deterministic_fraction_split(
+    rows: Sequence[Any],
+    *,
+    train_fraction: float,
+    dev_fraction: float,
+    test_fraction: float,
+    seed: int,
+) -> tuple[list[Any], list[Any], list[Any]]:
+    validate_split_fractions(train_fraction, dev_fraction, test_fraction)
+    n_rows = len(rows)
+    fractions = (train_fraction, dev_fraction, test_fraction)
+    requested = sum(1 for fraction in fractions if fraction > 0.0)
+    if n_rows < requested:
+        raise ValueError("dataset has too few rows for requested non-zero splits")
+
+    counts = np.floor(np.array(fractions) * n_rows).astype(int)
+    remainders = np.array(fractions) * n_rows - counts
+    for idx in np.argsort(-remainders)[: n_rows - int(counts.sum())]:
+        counts[idx] += 1
+    for idx, fraction in enumerate(fractions):
+        if fraction > 0.0 and counts[idx] == 0:
+            donor = int(np.argmax(counts))
+            counts[donor] -= 1
+            counts[idx] = 1
+
+    permuted = np.random.default_rng(seed).permutation(n_rows)
+    train_end = counts[0]
+    dev_end = train_end + counts[1]
+    partitions = (permuted[:train_end], permuted[train_end:dev_end], permuted[dev_end:])
+    return tuple(
+        [rows[int(index)] for index in sorted(indices)] for indices in partitions
+    )
+
+
+def parse_validation_mask_seeds(value: str) -> list[int]:
+    seeds = [part.strip() for part in value.split(",") if part.strip()]
+    if not seeds:
+        raise ValueError("--validation_mask_seeds must include at least one integer")
+    return [int(seed) for seed in seeds]
+
+
+def average_mlm_metrics(metrics: Sequence[dict[str, float]]) -> dict[str, float]:
+    if not metrics:
+        return {"masked_loss": 0.0, "masked_accuracy": 0.0, "num_masked_tokens": 0}
+    return {
+        "masked_loss": float(np.mean([m["masked_loss"] for m in metrics])),
+        "masked_accuracy": float(np.mean([m["masked_accuracy"] for m in metrics])),
+        "num_masked_tokens": int(sum(m["num_masked_tokens"] for m in metrics)),
+    }
+
+
+def evaluate_mlm_with_mask_seeds(
+    params: GraphParams,
+    structure,
+    loader_factory: Callable[[int], MlmTextBatcher],
+    rng_key,
+    *,
+    seeds: Sequence[int],
+    strategy: str,
+) -> dict[str, float]:
+    selected_seeds = [seeds[0]] if strategy == "fixed" else list(seeds)
+    return average_mlm_metrics(
+        [evaluate_mlm(params, structure, loader_factory(seed), rng_key) for seed in selected_seeds]
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BERT-style encoder demo")
     parser.add_argument("--stage", choices=["pretrain", "finetune"], required=True)
@@ -146,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label_field", default="label")
     parser.add_argument("--revision", default=None)
     parser.add_argument("--token_path", default=None)
+    parser.add_argument("--validation_token_path", default=None)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--cache_dir", default="data/bert_demo_bpe")
     parser.add_argument("--checkpoint", default="data/bert_demo_mlm_params.json")
@@ -159,7 +269,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--train_epochs_equivalent", type=float, default=1.0)
     parser.add_argument("--max_sequences", type=int, default=None)
     parser.add_argument("--max_texts", type=int, default=None)
     parser.add_argument("--max_chars", type=int, default=100_000)
@@ -174,6 +285,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--rolling_loss_window", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--train_fraction", type=float, default=0.98)
+    parser.add_argument("--dev_fraction", type=float, default=0.01)
+    parser.add_argument("--test_fraction", type=float, default=0.01)
+    parser.add_argument("--split_seed", type=int, default=None)
+    parser.add_argument(
+        "--shuffle_train_windows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--shuffle_eval_windows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--validation_mask_seeds", default="0")
+    parser.add_argument(
+        "--validation_mask_strategy", choices=["fixed", "average"], default="fixed"
+    )
+    parser.add_argument("--dropout_rate", type=float, default=0.0)
+    parser.add_argument("--embedding_init_std", type=float, default=1.0)
+    parser.add_argument("--position_init_std", type=float, default=0.02)
+    parser.add_argument("--transformer_init_std", type=float, default=0.02)
+    parser.add_argument("--tokens_per_update", type=int, default=None)
+    parser.add_argument("--micro_batch_size", type=int, default=None)
+    parser.add_argument("--metrics_jsonl", default=None)
     parser.add_argument("--compare_scratch", action="store_true")
     parser.add_argument("--overwrite_cache", action="store_true")
     parser.add_argument("--use_pmap", action="store_true")
@@ -320,14 +456,16 @@ def load_checkpoint(path: str) -> dict[str, Any] | None:
 def build_tiny_mlm_loader(
     args: argparse.Namespace,
     *,
+    split: str = "train",
     seed: int,
 ) -> tuple[MlmTextBatcher, dict[str, int], str | None]:
     vocab = build_tiny_vocab(TINY_MLM_CORPUS)
-    token_ids = build_tiny_token_stream(TINY_MLM_CORPUS, vocab, args.seq_len)
+    texts = _split_source_texts(args, TINY_MLM_CORPUS, split)
+    token_ids = build_tiny_token_stream(texts, vocab, args.seq_len)
     loader = MlmTextBatcher(
         token_ids=token_ids,
         seq_len=args.seq_len,
-        batch_size=args.batch_size,
+        batch_size=_effective_batch_size(args),
         pad_token_id=vocab["[PAD]"],
         mask_token_id=vocab["[MASK]"],
         vocab_size=len(vocab),
@@ -335,7 +473,8 @@ def build_tiny_mlm_loader(
         seed=seed,
         mask_prob=args.mask_prob,
         max_sequences=args.max_sequences,
-        shuffle=False,
+        shuffle=_shuffle_for_split(args, split),
+        token_unit="word",
     )
     return loader, vocab, None
 
@@ -369,9 +508,12 @@ def build_text_mlm_loader(
     seed: int,
     overwrite_tokenizer: bool = True,
 ) -> tuple[MlmTextBatcher, dict[str, int], str | None]:
-    texts = (
-        TINY_MLM_CORPUS if args.data_source == "tiny" else _load_hf_texts(args, split)
-    )
+    if args.data_source == "tiny":
+        texts = TINY_MLM_CORPUS
+    else:
+        source_split = args.split if split in {"train", "dev", "test"} else split
+        texts = _load_hf_texts(args, source_split)
+    texts = _split_source_texts(args, texts, _resolve_partition_split(args, split))
     token_ids, tokenizer = prepare_bpe_tokenized_texts(
         texts=texts,
         cache_dir=args.cache_dir,
@@ -389,7 +531,7 @@ def build_text_mlm_loader(
     loader = MlmTextBatcher(
         token_ids=token_ids,
         seq_len=args.seq_len,
-        batch_size=args.batch_size,
+        batch_size=_effective_batch_size(args),
         pad_token_id=token_to_id("[PAD]"),
         mask_token_id=token_to_id("[MASK]"),
         vocab_size=tokenizer.get_vocab_size(),
@@ -398,7 +540,8 @@ def build_text_mlm_loader(
         seed=seed,
         mask_prob=args.mask_prob,
         max_sequences=args.max_sequences,
-        shuffle=False,
+        shuffle=_shuffle_for_split(args, split),
+        token_unit="subword",
     )
     return loader, tokenizer.get_vocab(), tokenizer.to_str()
 
@@ -414,15 +557,23 @@ def build_mlm_loader(
     if args.data_source == "tokenized":
         if not args.token_path or not args.tokenizer_path:
             raise ValueError("--token_path and --tokenizer_path are required")
+        token_path = args.token_path
+        if split != args.split:
+            if not args.validation_token_path:
+                raise ValueError(
+                    "tokenized validation requires --validation_token_path; "
+                    "validation_split on --token_path would leak train tokens"
+                )
+            token_path = args.validation_token_path
         loader = load_tokenized_mlm_loader(
-            token_path=args.token_path,
+            token_path=token_path,
             tokenizer_path=args.tokenizer_path,
             seq_len=args.seq_len,
-            batch_size=args.batch_size,
+            batch_size=_effective_batch_size(args),
             seed=seed,
             mask_prob=args.mask_prob,
             max_sequences=args.max_sequences,
-            shuffle=False,
+            shuffle=_shuffle_for_split(args, split),
         )
         tokenizers = __import__("tokenizers")
         tokenizer_json = Path(args.tokenizer_path).read_text()
@@ -435,7 +586,7 @@ def build_mlm_loader(
     if args.data_source == "tiny" and args.vocab_size <= len(
         build_tiny_vocab(TINY_MLM_CORPUS)
     ):
-        return build_tiny_mlm_loader(args, seed=seed)
+        return build_tiny_mlm_loader(args, split=split, seed=seed)
     return build_text_mlm_loader(args, split=split, seed=seed)
 
 
@@ -513,7 +664,7 @@ def _split_tiny_sentiment_data():
     return positives[:5] + negatives[:5], positives[5:] + negatives[5:]
 
 
-def _model_config(args: argparse.Namespace, vocab_size: int) -> dict[str, int]:
+def _model_config(args: argparse.Namespace, vocab_size: int) -> dict[str, int | float]:
     return {
         "depth": args.depth,
         "embed_dim": args.embed_dim,
@@ -521,38 +672,91 @@ def _model_config(args: argparse.Namespace, vocab_size: int) -> dict[str, int]:
         "mlp_dim": args.mlp_dim,
         "seq_len": args.seq_len,
         "vocab_size": vocab_size,
+        "dropout_rate": args.dropout_rate,
+        "embedding_init_std": args.embedding_init_std,
+        "position_init_std": args.position_init_std,
+        "transformer_init_std": args.transformer_init_std,
     }
+
+
+def compute_gradient_accumulation_steps(args: argparse.Namespace) -> int:
+    if args.tokens_per_update is None:
+        return 1
+    micro_batch_size = _effective_batch_size(args)
+    micro_tokens = micro_batch_size * args.seq_len
+    return max(1, int(np.ceil(args.tokens_per_update / micro_tokens)))
+
+
+def derive_max_steps(args: argparse.Namespace, loader: MlmTextBatcher) -> int:
+    if args.max_steps is not None:
+        return int(args.max_steps)
+    metadata = loader.metadata
+    tokens_per_update = args.tokens_per_update or metadata["max_tokens_per_batch"]
+    if tokens_per_update <= 0:
+        return max(1, len(loader))
+    target_tokens = metadata["source_token_count"] * args.train_epochs_equivalent
+    return max(1, int(np.ceil(target_tokens / tokens_per_update)))
+
+
+def summarize_init_diagnostics(params: GraphParams) -> dict[str, float]:
+    leaves = [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(params)]
+    flat = np.concatenate([leaf.reshape(-1) for leaf in leaves if leaf.size])
+    diagnostics = {
+        "param_mean": float(np.mean(flat)),
+        "param_std": float(np.std(flat)),
+        "param_abs_max": float(np.max(np.abs(flat))),
+    }
+    token_embeddings = params.nodes.get("token_embeddings")
+    if token_embeddings is not None and "embeddings" in token_embeddings.weights:
+        diagnostics["token_embedding_std"] = float(
+            np.std(np.asarray(token_embeddings.weights["embeddings"]))
+        )
+    position_embeddings = params.nodes.get("position_embeddings")
+    if (
+        position_embeddings is not None
+        and "position_embeddings" in position_embeddings.weights
+    ):
+        diagnostics["position_embedding_std"] = float(
+            np.std(np.asarray(position_embeddings.weights["position_embeddings"]))
+        )
+    return diagnostics
+
+
+def build_validation_mlm_loader(
+    args: argparse.Namespace,
+    *,
+    seed: int,
+) -> MlmTextBatcher:
+    if args.validation_split is None:
+        raise ValueError("--validation_split is required")
+    validation_split = args.validation_split
+    if args.data_source == "hf" and validation_split == args.split:
+        validation_split = "dev"
+    if args.data_source == "tiny" and args.vocab_size <= len(build_tiny_vocab(TINY_MLM_CORPUS)):
+        loader, _, _ = build_mlm_loader(args, split=validation_split, seed=seed)
+        return loader
+    if args.data_source in {"tiny", "hf"}:
+        loader, _, _ = build_text_mlm_loader(
+            args,
+            split=validation_split,
+            seed=seed,
+            overwrite_tokenizer=False,
+        )
+        return loader
+    loader, _, _ = build_mlm_loader(args, split=validation_split, seed=seed)
+    return loader
 
 
 def run_pretrain(args: argparse.Namespace) -> None:
     _reject_unsupported_pc(args)
+    validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)
     train_loader, vocab, tokenizer_json = build_mlm_loader(
         args, split=args.split, seed=args.seed
     )
     val_loader = None
     if args.validation_split:
-        if args.data_source == "tiny" and args.vocab_size <= len(
-            build_tiny_vocab(TINY_MLM_CORPUS)
-        ):
-            val_loader, _, _ = build_mlm_loader(
-                args,
-                split=args.validation_split,
-                seed=args.seed + 1,
-            )
-        elif args.data_source in {"tiny", "hf"}:
-            val_loader, _, _ = build_text_mlm_loader(
-                args,
-                split=args.validation_split,
-                seed=args.seed + 1,
-                overwrite_tokenizer=False,
-            )
-        else:
-            val_loader, _, _ = build_mlm_loader(
-                args,
-                split=args.validation_split,
-                seed=args.seed + 1,
-            )
+        val_loader = build_validation_mlm_loader(args, seed=validation_mask_seeds[0])
 
     structure = create_encoder_mlm_model(
         depth=args.depth,
@@ -563,14 +767,26 @@ def run_pretrain(args: argparse.Namespace) -> None:
         vocab_size=train_loader.vocab_size,
         inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
         use_attention_mask=True,
+        dropout_rate=args.dropout_rate,
+        embedding_init_std=args.embedding_init_std,
+        position_init_std=args.position_init_std,
+        transformer_init_std=args.transformer_init_std,
     )
     params = initialize_params(structure, rng_key)
+    init_diagnostics = {
+        **summarize_init_diagnostics(params),
+        "configured_embedding_init_std": args.embedding_init_std,
+        "configured_position_init_std": args.position_init_std,
+        "configured_transformer_init_std": args.transformer_init_std,
+    }
+    max_steps = derive_max_steps(args, train_loader)
+    gradient_accumulation_steps = compute_gradient_accumulation_steps(args)
     optimizer = build_optimizer(
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         warmup_steps=args.warmup_steps,
-        total_steps=args.max_steps,
+        total_steps=max_steps,
     )
     params, state = train_backprop_mlm(
         params,
@@ -578,7 +794,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         train_loader,
         optimizer,
         {
-            "max_steps": args.max_steps,
+            "max_steps": max_steps,
             "checkpoint_path": args.training_checkpoint,
             "checkpoint_interval": args.checkpoint_interval,
             "validation_interval": args.validation_interval,
@@ -587,7 +803,12 @@ def run_pretrain(args: argparse.Namespace) -> None:
             "pmap_single_device": args.pmap_single_device,
             "log_interval": args.log_interval,
             "rolling_loss_window": args.rolling_loss_window,
+            "tokens_per_update": args.tokens_per_update,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "metrics_jsonl": args.metrics_jsonl,
+            "init_diagnostics": init_diagnostics,
             "model": _model_config(args, train_loader.vocab_size),
+            "validation_fn": None,
         },
         rng_key,
         val_loader=val_loader,
@@ -597,10 +818,36 @@ def run_pretrain(args: argparse.Namespace) -> None:
             args.checkpoint,
             params,
             vocab,
-            _model_config(args, train_loader.vocab_size),
+            {
+                **_model_config(args, train_loader.vocab_size),
+                "init_diagnostics": init_diagnostics,
+                "max_steps": max_steps,
+                "tokens_per_update": args.tokens_per_update,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+            },
             tokenizer_json=tokenizer_json,
         )
         print(f"transfer_checkpoint={args.checkpoint}")
+    if args.validation_split:
+        validation_metrics = evaluate_mlm_with_mask_seeds(
+            params,
+            structure,
+            lambda seed: build_validation_mlm_loader(args, seed=seed),
+            rng_key,
+            seeds=validation_mask_seeds,
+            strategy=args.validation_mask_strategy,
+        )
+        print(
+            f"final_validation_masked_loss={validation_metrics['masked_loss']:.4f} "
+            f"final_validation_masked_accuracy={validation_metrics['masked_accuracy']:.4f} "
+            f"final_validation_masked_tokens={validation_metrics['num_masked_tokens']:.0f}"
+        )
+    print(
+        "init_diagnostics "
+        f"param_mean={init_diagnostics['param_mean']:.6f} "
+        f"param_std={init_diagnostics['param_std']:.6f} "
+        f"param_abs_max={init_diagnostics['param_abs_max']:.6f}"
+    )
     print(f"done stage=pretrain step={state['step']}")
 
 
@@ -638,6 +885,10 @@ def run_finetune(args: argparse.Namespace) -> None:
         vocab_size=len(vocab),
         num_classes=2,
         inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
+        dropout_rate=args.dropout_rate,
+        embedding_init_std=args.embedding_init_std,
+        position_init_std=args.position_init_std,
+        transformer_init_std=args.transformer_init_std,
     )
 
     rng_key, scratch_key, transfer_key = jax.random.split(rng_key, 3)

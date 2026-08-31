@@ -10,10 +10,15 @@ import pytest
 from examples.bert_demo import (
     PC_UNSUPPORTED_MESSAGE,
     build_mlm_loader,
+    compute_gradient_accumulation_steps,
+    derive_max_steps,
+    deterministic_fraction_split,
     normalize_hf_dataset_args,
     parse_args,
+    parse_validation_mask_seeds,
     run_finetune,
     run_pretrain,
+    summarize_init_diagnostics,
 )
 
 
@@ -59,6 +64,109 @@ def test_normalize_hf_dataset_args_treats_empty_revision_as_none():
 
     assert dataset_name == "babylm/example"
     assert revision is None
+
+
+def test_deterministic_fraction_split_preserves_order_and_validates_sum():
+    rows = list(range(10))
+
+    first = deterministic_fraction_split(
+        rows, train_fraction=0.6, dev_fraction=0.2, test_fraction=0.2, seed=3
+    )
+    second = deterministic_fraction_split(
+        rows, train_fraction=0.6, dev_fraction=0.2, test_fraction=0.2, seed=3
+    )
+    different = deterministic_fraction_split(
+        rows, train_fraction=0.6, dev_fraction=0.2, test_fraction=0.2, seed=4
+    )
+
+    assert first == second
+    assert first != different
+    assert all(part == sorted(part) for part in first)
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        deterministic_fraction_split(
+            rows, train_fraction=0.5, dev_fraction=0.2, test_fraction=0.2, seed=3
+        )
+
+
+def test_train_and_eval_window_shuffle_defaults_are_applied():
+    args = parse_args(["--stage", "pretrain", "--data_source", "tiny", "--seq_len", "6"])
+
+    train_loader, _, _ = build_mlm_loader(args, split="train", seed=0)
+    dev_loader, _, _ = build_mlm_loader(args, split="dev", seed=0)
+
+    assert train_loader.shuffle is True
+    assert dev_loader.shuffle is False
+
+
+def test_validation_mask_seed_parser_and_step_derivation(rng_key):
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--data_source",
+            "tiny",
+            "--seq_len",
+            "6",
+            "--batch_size",
+            "2",
+            "--tokens_per_update",
+            "24",
+        ]
+    )
+    loader, _, _ = build_mlm_loader(args, split="train", seed=0)
+
+    assert parse_validation_mask_seeds("1, 2") == [1, 2]
+    assert compute_gradient_accumulation_steps(args) == 2
+    assert derive_max_steps(args, loader) == 3
+
+    from fabricpc.core.inference import InferenceSGDNormClip
+    from fabricpc.graph_initialization import initialize_params
+    from fabricpc.models import create_encoder_mlm_model
+
+    structure = create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=loader.vocab_size,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+    diagnostics = summarize_init_diagnostics(initialize_params(structure, rng_key))
+    assert all(np.isfinite(value) for value in diagnostics.values())
+    assert "token_embedding_std" in diagnostics
+    assert "position_embedding_std" in diagnostics
+
+
+def test_tokenized_validation_requires_distinct_token_path(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.BPE(vocab={"[UNK]": 0, "warm": 1}, merges=[], unk_token="[UNK]")
+    )
+    tokenizer.add_special_tokens(["[PAD]", "[MASK]", "[CLS]", "[SEP]"])
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(tokenizer_path))
+    token_path = tmp_path / "tokens.npy"
+    np.save(token_path, np.array([1, 1, 1, 1], dtype=np.int32))
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--data_source",
+            "tokenized",
+            "--token_path",
+            str(token_path),
+            "--tokenizer_path",
+            str(tokenizer_path),
+            "--validation_split",
+            "validation",
+            "--seq_len",
+            "4",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="validation_token_path"):
+        build_mlm_loader(args, split="validation", seed=0)
 
 
 def test_pretrain_backprop_tiny_smoke(tmp_path):
