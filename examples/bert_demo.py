@@ -5,6 +5,8 @@ experiment stage and training mode with CLI flags, while reusable pieces live in
 ``fabricpc`` modules.
 """
 
+# ruff: noqa: E402
+
 from jax_setup import set_jax_flags_before_importing_jax
 
 set_jax_flags_before_importing_jax()
