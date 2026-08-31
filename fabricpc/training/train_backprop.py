@@ -64,6 +64,7 @@ def compute_forward_pass(
     structure: GraphStructure,
     batch: Dict[str, jnp.ndarray],
     rng_key: jax.Array,
+    training: bool = False,
 ) -> GraphState:
     """
     Compute forward pass for backpropagation training.
@@ -90,12 +91,16 @@ def compute_forward_pass(
     for task_name, task_value in batch.items():
         if task_name in structure.task_map and task_name not in {"y", "loss_mask"}:
             clamps[structure.task_map[task_name]] = task_value
+    dropout_key, state_key = jax.random.split(rng_key)
+    clamps.update(
+        create_dropout_clamps(structure, batch_size, dropout_key, training=training)
+    )
 
     # Single forward pass via initialize_state with feedforward init
     state = initialize_graph_state(
         structure,
         batch_size,
-        rng_key,
+        state_key,
         clamps=clamps,
         params=params,
     )
@@ -128,7 +133,7 @@ def train_step_backprop(
     """
 
     def loss_fn(p):
-        state = compute_forward_pass(p, structure, batch, rng_key)
+        state = compute_forward_pass(p, structure, batch, rng_key, training=True)
         return compute_loss(state, batch["y"], structure.task_map["y"], loss_type)
 
     loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -181,7 +186,7 @@ def train_step_backprop_mlm(
         raise ValueError("MLM training requires batch['loss_mask']")
 
     def loss_fn(p):
-        state = compute_forward_pass(p, structure, batch, rng_key)
+        state = compute_forward_pass(p, structure, batch, rng_key, training=True)
         return compute_loss(
             state,
             batch["y"],
@@ -211,7 +216,7 @@ def _train_step_backprop_mlm_no_validate(
     rng_key: jax.Array,
 ) -> Tuple[GraphParams, optax.OptState, jax.Array]:
     def loss_fn(p):
-        state = compute_forward_pass(p, structure, batch, rng_key)
+        state = compute_forward_pass(p, structure, batch, rng_key, training=True)
         return compute_loss(
             state,
             batch["y"],
@@ -231,6 +236,47 @@ def _train_step_backprop_mlm_no_validate(
     return params, opt_state, loss
 
 
+def _loss_and_grad_backprop_mlm_no_update(
+    params: GraphParams,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    rng_key: jax.Array,
+) -> tuple[jax.Array, GraphParams, jax.Array]:
+    def loss_fn(p):
+        state = compute_forward_pass(p, structure, batch, rng_key, training=True)
+        return compute_loss(
+            state,
+            batch["y"],
+            structure.task_map["y"],
+            loss_type="cross_entropy",
+            loss_mask=batch["loss_mask"],
+        )
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    masked_count = jnp.sum(batch["loss_mask"].astype(jnp.float32))
+    return loss, grads, masked_count
+
+
+def _apply_optimizer_update(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    grads: GraphParams,
+    optimizer: optax.GradientTransformation,
+) -> tuple[GraphParams, optax.OptState]:
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+    return params, opt_state
+
+
+def _validate_resume_config(saved_config: dict[str, Any], current_config: dict[str, Any]) -> None:
+    for key in ("gradient_accumulation_steps", "tokens_per_update"):
+        if saved_config.get(key) != current_config.get(key):
+            raise ValueError(
+                f"Checkpoint {key}={saved_config.get(key)!r} does not match "
+                f"current {key}={current_config.get(key)!r}; resume with matching accumulation config"
+            )
+
+
 def train_step_backprop_mlm_pmap(
     params: GraphParams,
     opt_state: optax.OptState,
@@ -243,7 +289,7 @@ def train_step_backprop_mlm_pmap(
     mask = batch["loss_mask"].astype(jnp.float32)
 
     def loss_numerator(p):
-        state = compute_forward_pass(p, structure, batch, rng_key)
+        state = compute_forward_pass(p, structure, batch, rng_key, training=True)
         predictions = state.nodes[structure.task_map["y"]].z_mu
         targets = jax.nn.one_hot(batch["y"], predictions.shape[-1])
         per_token_loss = -jnp.sum(targets * jnp.log(predictions + 1e-10), axis=-1)
@@ -478,6 +524,40 @@ def evaluate_mlm(
     }
 
 
+def _loader_metadata(loader: Any) -> dict[str, Any]:
+    metadata = getattr(loader, "metadata", {})
+    if callable(metadata):
+        metadata = metadata()
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _count_exposure_tokens(
+    batch_data: Any,
+    loader_metadata: dict[str, Any],
+) -> tuple[int, bool]:
+    if isinstance(batch_data, dict) and "attention_mask" in batch_data:
+        return int(np.asarray(batch_data["attention_mask"]).sum()), False
+    if isinstance(batch_data, dict) and "x" in batch_data and "pad_token_id" in loader_metadata:
+        pad_token_id = int(loader_metadata["pad_token_id"])
+        return int(np.sum(np.asarray(batch_data["x"]) != pad_token_id)), False
+    if isinstance(batch_data, dict) and "x" in batch_data:
+        return int(np.asarray(batch_data["x"]).size), True
+    return 0, True
+
+
+def _append_metrics_jsonl(path: str | Path | None, event: dict[str, Any]) -> None:
+    if not path:
+        return
+    metrics_path = Path(path)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _serializable_training_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in config.items() if not callable(value)}
+
+
 def train_backprop_mlm(
     params: GraphParams,
     structure: GraphStructure,
@@ -518,6 +598,9 @@ def train_backprop_mlm(
     validation_interval = int(config.get("validation_interval", 0))
     log_interval = int(config.get("log_interval", 1))
     rolling_loss_window = int(config.get("rolling_loss_window", 100))
+    gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1))
+    metrics_jsonl = config.get("metrics_jsonl")
+    validation_fn = config.get("validation_fn")
     if max_steps < 1:
         raise ValueError("max_steps must be positive")
     if checkpoint_interval < 1:
@@ -528,10 +611,14 @@ def train_backprop_mlm(
         raise ValueError("log_interval must be non-negative")
     if rolling_loss_window < 1:
         raise ValueError("rolling_loss_window must be positive")
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
     use_pmap = bool(config.get("use_pmap", False))
     pmap_single_device = bool(config.get("pmap_single_device", False))
     n_devices = jax.device_count()
     run_pmap = use_pmap and ((n_devices > 1) or pmap_single_device)
+    if run_pmap and gradient_accumulation_steps > 1:
+        raise ValueError("gradient accumulation is not supported with pmap MLM training")
 
     opt_state = optimizer.init(params)
     start_step = 0
@@ -540,7 +627,8 @@ def train_backprop_mlm(
         loaded = load_mlm_training_checkpoint(
             config["resume_from"], opt_state_template=opt_state
         )
-        params, opt_state, start_step, _, saved_rng_key, loader_state = loaded
+        params, opt_state, start_step, saved_config, saved_rng_key, loader_state = loaded
+        _validate_resume_config(saved_config, config)
         if saved_rng_key is not None:
             rng_key = saved_rng_key
         if hasattr(train_loader, "load_state_dict"):
@@ -558,29 +646,65 @@ def train_backprop_mlm(
         opt_state = replicate_opt_state(opt_state, n_devices)
         step_fn = create_pmap_train_step_backprop_mlm(structure, optimizer)
     else:
-        step_fn = jax.jit(
-            lambda p, o, b, k: _train_step_backprop_mlm_no_validate(
-                p, o, b, structure, optimizer, k
+        grad_fn = jax.jit(
+            lambda p, b, k: _loss_and_grad_backprop_mlm_no_update(
+                p, b, structure, k
             )
+        )
+        update_fn = jax.jit(
+            lambda p, o, g: _apply_optimizer_update(p, o, g, optimizer)
         )
 
     losses: list[float] = []
     rolling_losses: deque[float] = deque(maxlen=rolling_loss_window)
     rolling_loss_sum = 0.0
     validation: list[dict[str, float]] = []
-    step = start_step
+    update_step = start_step
+    train_metadata = _loader_metadata(train_loader)
+    source_token_count = int(train_metadata.get("source_token_count", 0) or 0)
+    max_tokens_per_micro_batch = int(
+        train_metadata.get("max_tokens_per_batch", 0) or 0
+    )
+    tokens_per_update = config.get("tokens_per_update")
+    if tokens_per_update is None and max_tokens_per_micro_batch:
+        tokens_per_update = max_tokens_per_micro_batch * gradient_accumulation_steps
     last_loader_state = (
         loader_state if config.get("resume_from") else {"epoch": 0, "batch_in_epoch": 0}
     )
-    while step < max_steps:
+    micro_steps = int(last_loader_state.get("micro_steps", 0))
+    real_tokens_seen = int(last_loader_state.get("real_tokens_seen", 0))
+    masked_positions_seen = int(last_loader_state.get("masked_positions_seen", 0))
+    max_token_slots_seen = int(last_loader_state.get("max_token_slots_seen", 0))
+    real_tokens_seen_estimated = bool(
+        last_loader_state.get("real_tokens_seen_estimated", False)
+    )
+    pending_real_tokens = 0
+    pending_masked_positions = 0
+    pending_max_token_slots = 0
+    pending_real_tokens_estimated = False
+    pending_grads = None
+    pending_losses: list[float] = []
+    pending_micro_batches = 0
+    while update_step < max_steps:
         progressed = False
         for batch_idx, batch_data in enumerate(train_loader):
             if start_batch_in_epoch and batch_idx < start_batch_in_epoch:
                 continue
             start_batch_in_epoch = 0
-            if step >= max_steps:
+            if update_step >= max_steps:
                 break
             _validate_mlm_batch_data(batch_data)
+            batch_real_tokens, estimated = _count_exposure_tokens(
+                batch_data, train_metadata
+            )
+            batch_masked_positions = (
+                int(np.asarray(batch_data["loss_mask"]).sum())
+                if isinstance(batch_data, dict)
+                else 0
+            )
+            batch_max_token_slots = (
+                int(np.asarray(batch_data["x"]).size) if isinstance(batch_data, dict) else 0
+            )
             batch = _convert_batch(batch_data)
             _validate_mlm_batch(batch)
             rng_key, step_key = jax.random.split(rng_key)
@@ -591,11 +715,51 @@ def train_backprop_mlm(
                 device_keys = jax.random.split(step_key, n_devices)
                 params, opt_state, loss = step_fn(params, opt_state, batch, device_keys)
                 loss_value = float(jnp.mean(loss))
+                masked_count = batch_masked_positions
             else:
-                params, opt_state, loss = step_fn(params, opt_state, batch, step_key)
+                loss, grads, masked_count_array = grad_fn(params, batch, step_key)
                 loss_value = float(loss)
+                masked_count = float(masked_count_array)
 
-            step += 1
+            if masked_count <= 0:
+                continue
+
+            micro_steps += 1
+            pending_real_tokens += batch_real_tokens
+            pending_masked_positions += batch_masked_positions
+            pending_max_token_slots += batch_max_token_slots
+            pending_real_tokens_estimated = pending_real_tokens_estimated or estimated
+            if not run_pmap:
+                scaled_grads = jax.tree_util.tree_map(
+                    lambda grad: grad / gradient_accumulation_steps, grads
+                )
+                pending_grads = (
+                    scaled_grads
+                    if pending_grads is None
+                    else jax.tree_util.tree_map(
+                        lambda left, right: left + right,
+                        pending_grads,
+                        scaled_grads,
+                    )
+                )
+            pending_losses.append(loss_value)
+            pending_micro_batches += 1
+
+            if pending_micro_batches < gradient_accumulation_steps:
+                continue
+
+            if not run_pmap:
+                params, opt_state = update_fn(params, opt_state, pending_grads)
+
+            real_tokens_seen += pending_real_tokens
+            masked_positions_seen += pending_masked_positions
+            max_token_slots_seen += pending_max_token_slots
+            real_tokens_seen_estimated = (
+                real_tokens_seen_estimated or pending_real_tokens_estimated
+            )
+            loss_value = float(np.mean(pending_losses))
+
+            update_step += 1
             losses.append(loss_value)
             if len(rolling_losses) == rolling_losses.maxlen:
                 rolling_loss_sum -= rolling_losses[0]
@@ -609,16 +773,28 @@ def train_backprop_mlm(
                     else max(0, getattr(train_loader, "_epoch", 1) - 1)
                 ),
                 "batch_in_epoch": next_batch,
+                "micro_steps": micro_steps,
+                "real_tokens_seen": real_tokens_seen,
+                "real_tokens_seen_estimated": real_tokens_seen_estimated,
+                "masked_positions_seen": masked_positions_seen,
+                "max_token_slots_seen": max_token_slots_seen,
             }
+            pending_real_tokens = 0
+            pending_masked_positions = 0
+            pending_max_token_slots = 0
+            pending_real_tokens_estimated = False
+            pending_grads = None
+            pending_losses = []
+            pending_micro_batches = 0
 
-            if verbose and log_interval > 0 and step % log_interval == 0:
+            if verbose and log_interval > 0 and update_step % log_interval == 0:
                 rolling_average = rolling_loss_sum / len(rolling_losses)
                 print(
-                    f"step={step} masked_loss={loss_value:.4f} "
+                    f"step={update_step} masked_loss={loss_value:.4f} "
                     f"masked_loss_avg{len(rolling_losses)}={rolling_average:.4f}"
                 )
 
-            checkpoint_due = checkpoint_path and step % checkpoint_interval == 0
+            checkpoint_due = checkpoint_path and update_step % checkpoint_interval == 0
             if checkpoint_due:
                 checkpoint_params = (
                     jax.tree_util.tree_map(lambda x: x[0], params)
@@ -634,30 +810,36 @@ def train_backprop_mlm(
                     checkpoint_path,
                     params=checkpoint_params,
                     opt_state=checkpoint_opt_state,
-                    step=step,
-                    config=config,
+                    step=update_step,
+                    config=_serializable_training_config(config),
                     rng_key=rng_key,
                     loader_state=last_loader_state,
                 )
 
             if (
-                val_loader is not None
+                (val_loader is not None or validation_fn is not None)
                 and validation_interval > 0
-                and step % validation_interval == 0
+                and update_step % validation_interval == 0
             ):
                 eval_params = (
                     jax.tree_util.tree_map(lambda x: x[0], params)
                     if run_pmap
                     else params
                 )
-                validation_metrics = evaluate_mlm(
-                    eval_params, structure, val_loader, rng_key
+                validation_metrics = (
+                    validation_fn(eval_params, rng_key)
+                    if validation_fn is not None
+                    else evaluate_mlm(eval_params, structure, val_loader, rng_key)
                 )
-                validation_record = {"step": step, **validation_metrics}
+                validation_record = {"step": update_step, **validation_metrics}
                 validation.append(validation_record)
+                _append_metrics_jsonl(
+                    metrics_jsonl,
+                    {"event": "validation", **validation_record},
+                )
                 if verbose:
                     print(
-                        f"step={step} validation_masked_loss="
+                        f"step={update_step} validation_masked_loss="
                         f"{validation_metrics['masked_loss']:.4f} "
                         f"validation_masked_accuracy="
                         f"{validation_metrics['masked_accuracy']:.4f} "
@@ -678,8 +860,8 @@ def train_backprop_mlm(
             checkpoint_path,
             params=final_params,
             opt_state=final_opt_state,
-            step=step,
-            config=config,
+            step=update_step,
+            config=_serializable_training_config(config),
             rng_key=rng_key,
             loader_state=last_loader_state,
         )
@@ -687,10 +869,36 @@ def train_backprop_mlm(
     if verbose:
         final_loss = losses[-1] if losses else 0.0
         print(
-            f"done step={step} final_masked_loss={final_loss:.4f} losses={len(losses)}"
+            f"done step={update_step} final_masked_loss={final_loss:.4f} losses={len(losses)}"
         )
 
-    return final_params, {"step": step, "losses": losses, "validation": validation}
+    epochs_equivalent = (
+        real_tokens_seen / source_token_count if source_token_count > 0 else None
+    )
+    exposure_metadata = {
+        "real_tokens_seen": real_tokens_seen,
+        "real_tokens_seen_estimated": real_tokens_seen_estimated,
+        "masked_positions_seen": masked_positions_seen,
+        "max_token_slots_seen": max_token_slots_seen,
+        "epochs_equivalent": epochs_equivalent,
+        "tokens_per_update": tokens_per_update,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "micro_steps": micro_steps,
+        "update_steps": update_step,
+        "max_tokens_per_micro_batch": max_tokens_per_micro_batch or None,
+        "loader_metadata": train_metadata,
+    }
+    _append_metrics_jsonl(
+        metrics_jsonl,
+        {"event": "final", "step": update_step, **exposure_metadata},
+    )
+
+    return final_params, {
+        "step": update_step,
+        "losses": losses,
+        "validation": validation,
+        **exposure_metadata,
+    }
 
 
 def train_backprop(

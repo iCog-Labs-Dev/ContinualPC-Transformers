@@ -132,6 +132,7 @@ class MlmTextBatcher:
         shuffle: bool = True,
         max_sequences: int | None = None,
         random_replacement_excludes_special: bool = True,
+        token_unit: str = "unknown",
     ):
         if seq_len <= 0:
             raise ValueError("seq_len must be positive")
@@ -141,6 +142,8 @@ class MlmTextBatcher:
             raise ValueError("vocab_size must be positive")
         if not 0.0 <= mask_prob <= 1.0:
             raise ValueError("mask_prob must be in [0, 1]")
+        if token_unit not in {"word", "subword", "unknown"}:
+            raise ValueError("token_unit must be 'word', 'subword', or 'unknown'")
         if cls_token_id is not None and seq_len < 2:
             raise ValueError("seq_len must be at least 2 when cls_token_id is set")
 
@@ -163,6 +166,8 @@ class MlmTextBatcher:
         self.stream_window = stream_window
         self.shuffle = shuffle
         self.random_replacement_excludes_special = random_replacement_excludes_special
+        self.source_token_count = int(np.sum(self.token_ids != self.pad_token_id))
+        self.token_unit = token_unit
         self._epoch = 0
 
         starts = list(range(0, len(self.token_ids), self.stride))
@@ -170,9 +175,27 @@ class MlmTextBatcher:
             starts = starts[:max_sequences]
         self.starts = np.array(starts, dtype=np.int32)
         self._num_batches = len(self.starts) // batch_size
+        self.num_windows = int(len(self.starts))
+        self.num_full_batches = int(self._num_batches)
+        self.max_tokens_per_batch = int(self.batch_size * self.seq_len)
+        self.max_tokens_per_epoch = int(
+            self.num_full_batches * self.max_tokens_per_batch
+        )
 
     def __len__(self):
         return self._num_batches
+
+    @property
+    def metadata(self) -> dict[str, int | str]:
+        return {
+            "source_token_count": self.source_token_count,
+            "token_unit": self.token_unit,
+            "num_windows": self.num_windows,
+            "num_full_batches": self.num_full_batches,
+            "max_tokens_per_batch": self.max_tokens_per_batch,
+            "max_tokens_per_epoch": self.max_tokens_per_epoch,
+            "pad_token_id": int(self.pad_token_id),
+        }
 
     def state_dict(self) -> dict[str, int]:
         return {"epoch": self._epoch}
@@ -351,6 +374,7 @@ def load_tokenized_mlm_loader(
         stride=stride,
         shuffle=shuffle,
         max_sequences=max_sequences,
+        token_unit="subword",
     )
 
 

@@ -183,6 +183,47 @@ def test_mlm_text_batcher_allows_zero_mask_probability():
     assert not np.any(batch["loss_mask"])
 
 
+def test_mlm_text_batcher_metadata_reports_exposure_bounds():
+    batcher = MlmTextBatcher(
+        token_ids=np.arange(10, dtype=np.int32),
+        seq_len=4,
+        batch_size=2,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=16,
+        special_token_ids={0, 1, 2, 3},
+        seed=0,
+        mask_prob=0.0,
+        shuffle=False,
+        token_unit="word",
+    )
+
+    assert batcher.metadata == {
+        "source_token_count": 9,
+        "token_unit": "word",
+        "num_windows": 3,
+        "num_full_batches": 1,
+        "max_tokens_per_batch": 8,
+        "max_tokens_per_epoch": 8,
+        "pad_token_id": 0,
+    }
+
+
+def test_mlm_text_batcher_source_count_excludes_padding_tokens():
+    batcher = MlmTextBatcher(
+        token_ids=np.array([1, 5, 0, 0, 2, 6], dtype=np.int32),
+        seq_len=4,
+        batch_size=1,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=16,
+        special_token_ids={0, 1, 2, 3},
+        shuffle=False,
+    )
+
+    assert batcher.metadata["source_token_count"] == 4
+
+
 def test_apply_mlm_mask_random_replacements_exclude_special_tokens():
     tokens = np.tile(np.array([[4, 5, 6, 7]], dtype=np.int32), (20, 1))
 

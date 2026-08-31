@@ -1,6 +1,7 @@
 """Tests for the minimal BERT-style masked-language-model path."""
 
 import os
+import json
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -447,6 +448,200 @@ def test_train_backprop_mlm_records_validation_steps(tmp_path, rng_key):
     )
 
     assert [record["step"] for record in state["validation"]] == [1, 2]
+
+
+def test_train_backprop_mlm_records_exposure_and_jsonl(tmp_path, rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    metrics_path = tmp_path / "metrics.jsonl"
+    loader = MlmTextBatcher(
+        token_ids=np.array([1, 5, 6, 7, 0, 0, 1, 8, 9, 2], dtype=np.int32),
+        seq_len=6,
+        batch_size=2,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=1.0,
+        stride=6,
+        shuffle=False,
+    )
+
+    _, state = train_backprop_mlm(
+        params,
+        structure,
+        loader,
+        optimizer,
+        {"max_steps": 1, "metrics_jsonl": str(metrics_path)},
+        rng_key,
+        verbose=False,
+    )
+
+    assert state["real_tokens_seen"] == 8
+    assert state["real_tokens_seen_estimated"] is False
+    assert state["max_token_slots_seen"] == 12
+    assert state["masked_positions_seen"] == 5
+    assert state["epochs_equivalent"] == 1.0
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
+    assert records[-1]["event"] == "final"
+    assert records[-1]["real_tokens_seen"] == 8
+
+
+def test_train_backprop_mlm_counts_max_steps_as_optimizer_updates(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    loader = MlmTextBatcher(
+        token_ids=np.array(
+            [1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 12, 2, 1, 13, 14, 15, 16, 2, 1, 17, 18, 5, 6, 2],
+            dtype=np.int32,
+        ),
+        seq_len=6,
+        batch_size=1,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=1.0,
+        stride=6,
+        shuffle=False,
+    )
+
+    _, state = train_backprop_mlm(
+        params,
+        structure,
+        loader,
+        optimizer,
+        {"max_steps": 2, "gradient_accumulation_steps": 2},
+        rng_key,
+        verbose=False,
+    )
+
+    assert state["step"] == 2
+    assert state["update_steps"] == 2
+    assert state["micro_steps"] == 4
+    assert len(state["losses"]) == 2
+
+
+def test_train_backprop_mlm_does_not_count_trailing_partial_accumulation(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    loader = MlmTextBatcher(
+        token_ids=np.array(
+            [1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 12, 2, 1, 13, 14, 15, 16, 2],
+            dtype=np.int32,
+        ),
+        seq_len=6,
+        batch_size=1,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=1.0,
+        stride=6,
+        shuffle=False,
+    )
+
+    _, state = train_backprop_mlm(
+        params,
+        structure,
+        loader,
+        optimizer,
+        {"max_steps": 1, "gradient_accumulation_steps": 2},
+        rng_key,
+        verbose=False,
+    )
+
+    assert state["step"] == 1
+    assert state["micro_steps"] == 2
+    assert state["real_tokens_seen"] == 12
+
+
+def test_train_backprop_mlm_uses_validation_fn_for_interval_average(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    loader = MlmTextBatcher(
+        token_ids=np.array([1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 12, 2], dtype=np.int32),
+        seq_len=6,
+        batch_size=1,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=1.0,
+        stride=6,
+        shuffle=False,
+    )
+
+    def validation_fn(_params, _rng_key):
+        return {"masked_loss": 1.5, "masked_accuracy": 0.25, "num_masked_tokens": 4}
+
+    _, state = train_backprop_mlm(
+        params,
+        structure,
+        loader,
+        optimizer,
+        {"max_steps": 2, "validation_interval": 1, "validation_fn": validation_fn},
+        rng_key,
+        verbose=False,
+    )
+
+    assert [record["masked_loss"] for record in state["validation"]] == [1.5, 1.5]
+
+
+def test_train_backprop_mlm_resume_rejects_accumulation_mismatch(tmp_path, rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adamw(1e-2)
+    checkpoint_path = tmp_path / "mlm.json"
+    loader_kwargs = dict(
+        token_ids=np.array([1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 12, 2], dtype=np.int32),
+        seq_len=6,
+        batch_size=1,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=20,
+        special_token_ids={0, 1, 2, 3},
+        seed=2,
+        mask_prob=1.0,
+        stride=6,
+        shuffle=False,
+    )
+    train_backprop_mlm(
+        params,
+        structure,
+        MlmTextBatcher(**loader_kwargs),
+        optimizer,
+        {
+            "max_steps": 1,
+            "gradient_accumulation_steps": 2,
+            "checkpoint_path": str(checkpoint_path),
+        },
+        rng_key,
+        verbose=False,
+    )
+
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        train_backprop_mlm(
+            params,
+            structure,
+            MlmTextBatcher(**loader_kwargs),
+            optimizer,
+            {
+                "max_steps": 2,
+                "gradient_accumulation_steps": 1,
+                "resume_from": str(checkpoint_path),
+            },
+            rng_key,
+            verbose=False,
+        )
 
 
 def test_load_mlm_training_checkpoint_rejects_unknown_version(tmp_path, rng_key):
