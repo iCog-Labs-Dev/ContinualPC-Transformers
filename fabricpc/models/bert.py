@@ -232,6 +232,9 @@ def _build_encoder_backbone(
     seq_len: int,
     vocab_size: int,
     weight_init: InitializerBase,
+    embedding_init: InitializerBase,
+    position_init: InitializerBase,
+    dropout_rate: float = 0.0,
     use_attention_mask: bool = False,
 ) -> tuple[IdentityNode, Optional[IdentityNode], NodeBase, list[NodeBase], list[Edge]]:
     input_node = IdentityNode(shape=(seq_len,), name="input_ids")
@@ -245,14 +248,14 @@ def _build_encoder_backbone(
         shape=(seq_len, embed_dim),
         vocab_size=vocab_size,
         embed_dim=embed_dim,
-        weight_init=NormalInitializer(std=1.0),
+        weight_init=embedding_init,
     )
     positions = AddPositionEmbeddingNode(
         name="position_embeddings",
         shape=(seq_len, embed_dim),
         seq_len=seq_len,
         embed_dim=embed_dim,
-        weight_init=weight_init,
+        weight_init=position_init,
     )
 
     nodes: list[NodeBase] = [input_node, embed, positions]
@@ -289,6 +292,16 @@ def _build_encoder_backbone(
             weight_init=weight_init,
         )
         nodes.extend([mha, mlp1, mlp2])
+        mha_dropout = None
+        mlp2_dropout = None
+        if dropout_rate > 0.0:
+            mha_dropout = IdentityNode(
+                shape=(seq_len, embed_dim), name=f"dropout_mask_L{i}_mha"
+            )
+            mlp2_dropout = IdentityNode(
+                shape=(seq_len, embed_dim), name=f"dropout_mask_L{i}_mlp2"
+            )
+            nodes.extend([mha_dropout, mlp2_dropout])
         edges.extend(
             [
                 Edge(source=previous_residual, target=mha.slot("in")),
@@ -301,6 +314,13 @@ def _build_encoder_backbone(
         if attention_mask_node is not None:
             edges.append(
                 Edge(source=attention_mask_node, target=mha.slot("attention_mask"))
+            )
+        if mha_dropout is not None and mlp2_dropout is not None:
+            edges.extend(
+                [
+                    Edge(source=mha_dropout, target=mha.slot("dropout_mask")),
+                    Edge(source=mlp2_dropout, target=mlp2.slot("dropout_mask")),
+                ]
             )
         previous_residual = mlp2
 
@@ -322,6 +342,7 @@ def _validate_encoder_config(
     mlp_dim: int,
     seq_len: int,
     vocab_size: int,
+    dropout_rate: float,
 ) -> None:
     values = {
         "depth": depth,
@@ -336,6 +357,8 @@ def _validate_encoder_config(
             raise ValueError(f"{name} must be positive")
     if embed_dim % num_heads != 0:
         raise ValueError("embed_dim must be divisible by num_heads")
+    if not 0.0 <= dropout_rate < 1.0:
+        raise ValueError("dropout_rate must be in [0, 1)")
 
 
 def create_encoder_sentiment_classifier(
@@ -349,6 +372,10 @@ def create_encoder_sentiment_classifier(
     num_classes: int,
     inference: InferenceBase,
     weight_init: Optional[InitializerBase] = None,
+    dropout_rate: float = 0.0,
+    embedding_init_std: float = 1.0,
+    position_init_std: float = 0.02,
+    transformer_init_std: float = 0.02,
     use_attention_mask: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for sequence classification."""
@@ -359,11 +386,12 @@ def create_encoder_sentiment_classifier(
         mlp_dim=mlp_dim,
         seq_len=seq_len,
         vocab_size=vocab_size,
+        dropout_rate=dropout_rate,
     )
     if num_classes <= 0:
         raise ValueError("num_classes must be positive")
     if weight_init is None:
-        weight_init = NormalInitializer(std=0.02)
+        weight_init = NormalInitializer(std=transformer_init_std)
 
     input_node, attention_mask_node, final_ln, nodes, edges = _build_encoder_backbone(
         depth=depth,
@@ -373,6 +401,9 @@ def create_encoder_sentiment_classifier(
         seq_len=seq_len,
         vocab_size=vocab_size,
         weight_init=weight_init,
+        embedding_init=NormalInitializer(std=embedding_init_std),
+        position_init=NormalInitializer(std=position_init_std),
+        dropout_rate=dropout_rate,
         use_attention_mask=use_attention_mask,
     )
     pool = FirstTokenPoolNode(shape=(embed_dim,), name="pooler")
@@ -391,17 +422,33 @@ def create_encoder_sentiment_classifier(
         ]
     )
 
-    return graph(
+    task_kwargs = {
+        **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
+        **{
+            f"dropout_L{i}_mha": f"dropout_mask_L{i}_mha"
+            for i in range(depth)
+            if dropout_rate > 0.0
+        },
+        **{
+            f"dropout_L{i}_mlp2": f"dropout_mask_L{i}_mlp2"
+            for i in range(depth)
+            if dropout_rate > 0.0
+        },
+    }
+    structure = graph(
         nodes=nodes,
         edges=edges,
         task_map=TaskMap(
             x=input_node,
             y=classifier,
-            **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
+            **task_kwargs,
         ),
         inference=inference,
         scaling=MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),
+    )
+    return structure._replace(
+        config={**structure.config, "dropout_rate": float(dropout_rate)}
     )
 
 
@@ -415,6 +462,10 @@ def create_encoder_mlm_model(
     vocab_size: int,
     inference: InferenceBase,
     weight_init: Optional[InitializerBase] = None,
+    dropout_rate: float = 0.0,
+    embedding_init_std: float = 1.0,
+    position_init_std: float = 0.02,
+    transformer_init_std: float = 0.02,
     use_attention_mask: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked LM pretraining."""
@@ -425,9 +476,10 @@ def create_encoder_mlm_model(
         mlp_dim=mlp_dim,
         seq_len=seq_len,
         vocab_size=vocab_size,
+        dropout_rate=dropout_rate,
     )
     if weight_init is None:
-        weight_init = NormalInitializer(std=0.02)
+        weight_init = NormalInitializer(std=transformer_init_std)
 
     input_node, attention_mask_node, final_ln, nodes, edges = _build_encoder_backbone(
         depth=depth,
@@ -437,6 +489,9 @@ def create_encoder_mlm_model(
         seq_len=seq_len,
         vocab_size=vocab_size,
         weight_init=weight_init,
+        embedding_init=NormalInitializer(std=embedding_init_std),
+        position_init=NormalInitializer(std=position_init_std),
+        dropout_rate=dropout_rate,
         use_attention_mask=use_attention_mask,
     )
     mlm_head = VocabProjectionNode(
@@ -449,17 +504,33 @@ def create_encoder_mlm_model(
     nodes.append(mlm_head)
     edges.append(Edge(source=final_ln, target=mlm_head.slot("in")))
 
-    return graph(
+    task_kwargs = {
+        **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
+        **{
+            f"dropout_L{i}_mha": f"dropout_mask_L{i}_mha"
+            for i in range(depth)
+            if dropout_rate > 0.0
+        },
+        **{
+            f"dropout_L{i}_mlp2": f"dropout_mask_L{i}_mlp2"
+            for i in range(depth)
+            if dropout_rate > 0.0
+        },
+    }
+    structure = graph(
         nodes=nodes,
         edges=edges,
         task_map=TaskMap(
             x=input_node,
             y=mlm_head,
-            **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
+            **task_kwargs,
         ),
         inference=inference,
         scaling=MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),
+    )
+    return structure._replace(
+        config={**structure.config, "dropout_rate": float(dropout_rate)}
     )
 
 

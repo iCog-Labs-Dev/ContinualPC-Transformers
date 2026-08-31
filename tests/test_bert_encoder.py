@@ -10,6 +10,7 @@ import optax
 import pytest
 
 from examples.bert_demo import build_optimizer
+from fabricpc.training.train_backprop import compute_forward_pass
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
@@ -50,6 +51,25 @@ def test_encoder_topology_is_bidirectional():
     assert structure.nodes["classifier"].node_info.weight_init.config["std"] == 0.02
     assert structure.task_map["x"] == "input_ids"
     assert structure.task_map["y"] == "classifier"
+
+
+def test_encoder_dropout_tasks_connect_to_residual_slots():
+    structure = create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        dropout_rate=0.1,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+
+    assert structure.config["dropout_rate"] == 0.1
+    assert structure.task_map["dropout_L0_mha"] == "dropout_mask_L0_mha"
+    assert structure.task_map["dropout_L0_mlp2"] == "dropout_mask_L0_mlp2"
+    assert "dropout_mask_L0_mha->L0_mha:dropout_mask" in structure.edges
+    assert "dropout_mask_L0_mlp2->L0_mlp2:dropout_mask" in structure.edges
 
 
 def test_encoder_weightless_transform_slots_are_not_mupc_scaled():
@@ -143,6 +163,32 @@ def test_encoder_forward_shape_smoke():
     assert probs.shape == (2, 2)
     assert jnp.all(jnp.isfinite(probs))
     assert jnp.allclose(jnp.sum(probs, axis=-1), 1.0, atol=1e-5)
+
+
+def test_encoder_dropout_train_eval_smoke():
+    rng_key = jax.random.PRNGKey(4)
+    structure = create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        dropout_rate=0.5,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=3, max_norm=5.0),
+    )
+    params = initialize_params(structure, rng_key)
+    batch = {"x": jnp.array([[1, 2, 3, 4, 0, 0]], dtype=jnp.int32)}
+
+    eval_a = compute_forward_pass(params, structure, batch, rng_key, training=False)
+    eval_b = compute_forward_pass(params, structure, batch, rng_key, training=False)
+    train_a = compute_forward_pass(params, structure, batch, rng_key, training=True)
+    train_b = compute_forward_pass(
+        params, structure, batch, jax.random.PRNGKey(5), training=True
+    )
+
+    assert jnp.allclose(eval_a.nodes["mlm_head"].z_mu, eval_b.nodes["mlm_head"].z_mu)
+    assert not jnp.allclose(train_a.nodes["mlm_head"].z_mu, train_b.nodes["mlm_head"].z_mu)
 
 
 def test_future_token_can_affect_first_position_attention():
