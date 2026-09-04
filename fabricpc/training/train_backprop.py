@@ -415,7 +415,6 @@ def train_backprop_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
-    force_single_device: bool = False,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main autoregressive backprop training loop.
@@ -441,9 +440,8 @@ def train_backprop_autoregressive(
     """
     validate_feedforward_init(structure)
 
-    force_single = force_single_device or config.get("force_single_device", False)
-    n_devices = 1 if force_single else jax.local_device_count()
-    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+    n_devices = jax.local_device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
     opt_state = optimizer.init(params)
     if use_pmap:
@@ -714,7 +712,6 @@ def evaluate_backprop_autoregressive(
     rng_key: jax.Array,
     debug: bool = False,
     pmap_single_device: bool = False,
-    force_single_device: bool = False,
 ) -> Dict[str, float]:
 
     """
@@ -739,9 +736,8 @@ def evaluate_backprop_autoregressive(
 
     validate_feedforward_init(structure)
 
-    force_single = force_single_device or config.get("force_single_device", False)
-    n_devices = 1 if force_single else jax.local_device_count()
-    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+    n_devices = jax.local_device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
     use_causal_mask = config.get("use_causal_mask", True)
 
