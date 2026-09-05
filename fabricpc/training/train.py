@@ -217,10 +217,10 @@ def train_step_pmap(
     optimizer: optax.GradientTransformation,
 ) -> Tuple[GraphParams, optax.OptState, jnp.ndarray, GraphState]:
     """
-    Training step for pmap: compute grads, average across devices, update.
+    Training step for pmap: compute grads, sum across devices, update.
 
     Uses local Hebbian learning (same as single-device) via shared
-    get_graph_param_gradient, then averages gradients across devices.
+    get_graph_param_gradient, then sums gradients across devices.
 
     Args:
         params: Replicated parameters (has device axis)
@@ -237,8 +237,8 @@ def train_step_pmap(
         params, batch, structure, rng_key
     )
 
-    # Average gradients across all devices (data parallelism)
-    grads = jax.lax.pmean(grads, axis_name="devices")
+    # Sum per-device batch gradients (energy is an unnormalized sum)
+    grads = jax.lax.psum(grads, axis_name="devices")
 
     # Update parameters (each device now has same gradients)
     updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -467,7 +467,7 @@ def train_pcn(
 
     progress.close()
 
-    # Extract params from first device (all devices have same params due to pmean)
+    # Extract params from first device (all devices have same params due to all-reduce)
     if use_pmap:
         params = jax.tree_util.tree_map(lambda x: x[0], params)
 
