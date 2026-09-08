@@ -26,7 +26,7 @@ import optax
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.types import GraphParams, NodeParams
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.models import (
+from fabricpc.nodes.encoder_transformer import (
     copy_encoder_params,
     create_encoder_mlm_model,
     create_encoder_sentiment_classifier,

@@ -63,7 +63,9 @@ runs/
 /data/
 datasets/
 checkpoints/
-/models/
+models/
+models/*.pt
+models/*.pth
 *.pt
 *.pth
 

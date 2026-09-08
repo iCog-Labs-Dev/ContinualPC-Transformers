@@ -9,7 +9,7 @@ classification head.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple, Any, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -29,15 +29,14 @@ from fabricpc.core.types import (
 )
 from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import FeedforwardStateInit
-from fabricpc.nodes import (
+from fabricpc.nodes.base import NodeBase, SlotSpec
+from fabricpc.nodes.identity import IdentityNode
+from fabricpc.nodes.linear import Linear
+from fabricpc.nodes.transformer_v2 import (
     EmbeddingNode,
-    IdentityNode,
-    Linear,
     LnMlp1Node,
     MhaResidualNode,
     Mlp2ResidualNode,
-    NodeBase,
-    SlotSpec,
     VocabProjectionNode,
 )
 from fabricpc.utils.helpers import layernorm

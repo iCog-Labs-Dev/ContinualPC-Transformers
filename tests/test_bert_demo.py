@@ -121,7 +121,7 @@ def test_validation_mask_seed_parser_and_step_derivation(rng_key):
 
     from fabricpc.core.inference import InferenceSGDNormClip
     from fabricpc.graph_initialization import initialize_params
-    from fabricpc.models import create_encoder_mlm_model
+    from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 
     structure = create_encoder_mlm_model(
         depth=1,

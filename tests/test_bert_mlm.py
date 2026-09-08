@@ -17,7 +17,7 @@ from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.types import GraphParams, GraphState, NodeState
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.models import (
+from fabricpc.nodes.encoder_transformer import (
     copy_encoder_params,
     create_encoder_mlm_model,
     create_encoder_sentiment_classifier,

@@ -15,7 +15,7 @@ from fabricpc.training.train_backprop import compute_forward_pass
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.models.bert import (
+from fabricpc.nodes.encoder_transformer import (
     AddPositionEmbeddingNode,
     FinalLayerNormNode,
     FirstTokenPoolNode,
