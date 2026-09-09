@@ -40,11 +40,47 @@ def test_parse_finetune_backprop_args():
     assert args.data_source == "synthetic"
 
 
-def test_pc_pretrain_fails_clearly():
-    args = parse_args(["--stage", "pretrain", "--mode", "pc"])
+def test_pc_pretrain_tiny_smoke(tmp_path):
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--mode",
+            "pc",
+            "--data_source",
+            "tiny",
+            "--seq_len",
+            "6",
+            "--embed_dim",
+            "16",
+            "--num_heads",
+            "4",
+            "--mlp_dim",
+            "32",
+            "--depth",
+            "1",
+            "--batch_size",
+            "1",
+            "--vocab_size",
+            "16",
+            "--max_steps",
+            "1",
+            "--checkpoint_interval",
+            "1",
+            "--validation_interval",
+            "0",
+            "--log_interval",
+            "0",
+            "--dropout_rate",
+            "0.0",
+            "--checkpoint",
+            str(tmp_path / "pc_transfer.json"),
+        ]
+    )
 
-    with pytest.raises(NotImplementedError, match=PC_UNSUPPORTED_MESSAGE):
-        run_pretrain(args)
+    run_pretrain(args)
+
+    assert (tmp_path / "pc_transfer.json").exists()
 
 
 def test_pc_finetune_fails_clearly():
@@ -89,7 +125,9 @@ def test_deterministic_fraction_split_preserves_order_and_validates_sum():
 
 
 def test_train_and_eval_window_shuffle_defaults_are_applied():
-    args = parse_args(["--stage", "pretrain", "--data_source", "tiny", "--seq_len", "6"])
+    args = parse_args(
+        ["--stage", "pretrain", "--data_source", "tiny", "--seq_len", "6"]
+    )
 
     train_loader, _, _ = build_mlm_loader(args, split="train", seed=0)
     dev_loader, _, _ = build_mlm_loader(args, split="dev", seed=0)
@@ -141,7 +179,9 @@ def test_validation_mask_seed_parser_and_step_derivation(rng_key):
 def test_tokenized_validation_requires_distinct_token_path(tmp_path):
     tokenizers = pytest.importorskip("tokenizers")
     tokenizer = tokenizers.Tokenizer(
-        tokenizers.models.BPE(vocab={"[UNK]": 0, "warm": 1}, merges=[], unk_token="[UNK]")
+        tokenizers.models.BPE(
+            vocab={"[UNK]": 0, "warm": 1}, merges=[], unk_token="[UNK]"
+        )
     )
     tokenizer.add_special_tokens(["[PAD]", "[MASK]", "[CLS]", "[SEP]"])
     tokenizer_path = tmp_path / "tokenizer.json"

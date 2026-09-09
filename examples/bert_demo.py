@@ -35,16 +35,15 @@ from fabricpc.training.optimizers import build_warmup_cosine_adamw
 from fabricpc.training.train_backprop import (
     compute_forward_pass,
     evaluate_mlm,
-    train_backprop_mlm,
     train_step_backprop,
 )
+from fabricpc.training.train_mlm import train_mlm
 from fabricpc.utils.data import (
     MLM_SPECIAL_TOKENS,
     MlmTextBatcher,
     load_tokenized_mlm_loader,
     prepare_bpe_tokenized_texts,
 )
-
 
 PC_UNSUPPORTED_MESSAGE = (
     "PC encoder pretraining/fine-tuning is not implemented yet; use --mode backprop."
@@ -231,7 +230,10 @@ def evaluate_mlm_with_mask_seeds(
 ) -> dict[str, float]:
     selected_seeds = [seeds[0]] if strategy == "fixed" else list(seeds)
     return average_mlm_metrics(
-        [evaluate_mlm(params, structure, loader_factory(seed), rng_key) for seed in selected_seeds]
+        [
+            evaluate_mlm(params, structure, loader_factory(seed), rng_key)
+            for seed in selected_seeds
+        ]
     )
 
 
@@ -242,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=["backprop", "pc"],
         default="backprop",
-        help="Training mode. PC is reserved for future encoder objective work.",
+        help="Training mode. PC currently supports MLM pretraining only.",
     )
     parser.add_argument(
         "--data_source",
@@ -306,6 +308,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--validation_mask_strategy", choices=["fixed", "average"], default="fixed"
     )
     parser.add_argument("--dropout_rate", type=float, default=0.0)
+    parser.add_argument("--pc_infer_steps", type=int, default=10)
+    parser.add_argument("--pc_eta_infer", type=float, default=0.01)
+    parser.add_argument("--pc_max_norm", type=float, default=5.0)
+    parser.add_argument("--pc_output_energy_scale", type=float, default=1.0)
     parser.add_argument("--embedding_init_std", type=float, default=1.0)
     parser.add_argument("--position_init_std", type=float, default=0.02)
     parser.add_argument("--transformer_init_std", type=float, default=0.02)
@@ -678,6 +684,7 @@ def _model_config(args: argparse.Namespace, vocab_size: int) -> dict[str, int | 
         "embedding_init_std": args.embedding_init_std,
         "position_init_std": args.position_init_std,
         "transformer_init_std": args.transformer_init_std,
+        "pc_output_energy_scale": args.pc_output_energy_scale,
     }
 
 
@@ -734,7 +741,9 @@ def build_validation_mlm_loader(
     validation_split = args.validation_split
     if args.data_source == "hf" and validation_split == args.split:
         validation_split = "dev"
-    if args.data_source == "tiny" and args.vocab_size <= len(build_tiny_vocab(TINY_MLM_CORPUS)):
+    if args.data_source == "tiny" and args.vocab_size <= len(
+        build_tiny_vocab(TINY_MLM_CORPUS)
+    ):
         loader, _, _ = build_mlm_loader(args, split=validation_split, seed=seed)
         return loader
     if args.data_source in {"tiny", "hf"}:
@@ -750,7 +759,8 @@ def build_validation_mlm_loader(
 
 
 def run_pretrain(args: argparse.Namespace) -> None:
-    _reject_unsupported_pc(args)
+    if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
+        raise ValueError("--pc_output_energy_scale must be positive for PC pretraining")
     validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)
     train_loader, vocab, tokenizer_json = build_mlm_loader(
@@ -767,12 +777,17 @@ def run_pretrain(args: argparse.Namespace) -> None:
         mlp_dim=args.mlp_dim,
         seq_len=args.seq_len,
         vocab_size=train_loader.vocab_size,
-        inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
+        inference=InferenceSGDNormClip(
+            eta_infer=args.pc_eta_infer if args.mode == "pc" else 0.05,
+            infer_steps=args.pc_infer_steps if args.mode == "pc" else 5,
+            max_norm=args.pc_max_norm,
+        ),
         use_attention_mask=True,
         dropout_rate=args.dropout_rate,
         embedding_init_std=args.embedding_init_std,
         position_init_std=args.position_init_std,
         transformer_init_std=args.transformer_init_std,
+        pc_output_energy_scale=args.pc_output_energy_scale,
     )
     params = initialize_params(structure, rng_key)
     init_diagnostics = {
@@ -790,7 +805,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         warmup_steps=args.warmup_steps,
         total_steps=max_steps,
     )
-    params, state = train_backprop_mlm(
+    params, state = train_mlm(
         params,
         structure,
         train_loader,
@@ -805,6 +820,18 @@ def run_pretrain(args: argparse.Namespace) -> None:
             "pmap_single_device": args.pmap_single_device,
             "log_interval": args.log_interval,
             "rolling_loss_window": args.rolling_loss_window,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "grad_clip": args.grad_clip,
+            "warmup_steps": args.warmup_steps,
+            "optimizer_identity": {
+                "type": "warmup_cosine_adamw",
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "grad_clip": args.grad_clip,
+                "warmup_steps": args.warmup_steps,
+                "total_steps": max_steps,
+            },
             "tokens_per_update": args.tokens_per_update,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "metrics_jsonl": args.metrics_jsonl,
@@ -813,6 +840,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             "validation_fn": None,
         },
         rng_key,
+        mode=args.mode,
         val_loader=val_loader,
     )
     if args.checkpoint:
