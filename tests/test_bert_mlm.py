@@ -22,7 +22,6 @@ from fabricpc.nodes.encoder_transformer import (
     create_encoder_mlm_model,
     create_encoder_sentiment_classifier,
 )
-from fabricpc.nodes import VocabProjectionNode
 import fabricpc.training as training
 from fabricpc.training.train_backprop import (
     compute_loss,
@@ -79,10 +78,12 @@ def test_mlm_model_forward_shape_smoke(rng_key):
     assert jnp.allclose(jnp.sum(probs, axis=-1), 1.0, atol=1e-5)
 
 
-def test_mlm_head_uses_vocab_projection_node():
+def test_mlm_head_uses_masked_vocab_projection_node():
     structure = build_small_mlm()
 
-    assert structure.nodes["mlm_head"].node_info.node_class is VocabProjectionNode
+    from fabricpc.nodes.encoder_transformer import MaskedVocabProjectionNode
+
+    assert structure.nodes["mlm_head"].node_info.node_class is MaskedVocabProjectionNode
 
 
 def test_mlm_training_helpers_are_exported_from_training_package():
@@ -495,7 +496,32 @@ def test_train_backprop_mlm_counts_max_steps_as_optimizer_updates(rng_key):
     optimizer = optax.adamw(1e-2)
     loader = MlmTextBatcher(
         token_ids=np.array(
-            [1, 5, 6, 7, 8, 2, 1, 9, 10, 11, 12, 2, 1, 13, 14, 15, 16, 2, 1, 17, 18, 5, 6, 2],
+            [
+                1,
+                5,
+                6,
+                7,
+                8,
+                2,
+                1,
+                9,
+                10,
+                11,
+                12,
+                2,
+                1,
+                13,
+                14,
+                15,
+                16,
+                2,
+                1,
+                17,
+                18,
+                5,
+                6,
+                2,
+            ],
             dtype=np.int32,
         ),
         seq_len=6,

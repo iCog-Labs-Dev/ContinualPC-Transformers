@@ -37,7 +37,6 @@ from fabricpc.nodes.transformer_v2 import (
     LnMlp1Node,
     MhaResidualNode,
     Mlp2ResidualNode,
-    VocabProjectionNode,
 )
 from fabricpc.utils.helpers import layernorm
 
@@ -220,6 +219,109 @@ class FinalLayerNormNode(NodeBase):
         state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
         return jnp.sum(state.energy), state
+
+
+def _input_by_slot(inputs: Dict[str, jnp.ndarray], slot_name: str) -> jnp.ndarray:
+    matches = [value for key, value in inputs.items() if key.endswith(f":{slot_name}")]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one input for slot {slot_name!r}")
+    return matches[0]
+
+
+class MaskedVocabProjectionNode(NodeBase):
+    """Vocabulary projection whose PC output energy is masked by MLM positions."""
+
+    DEFAULT_ENERGY = CrossEntropyEnergy
+    DEFAULT_ACTIVATION = SoftmaxActivation
+
+    def __init__(
+        self,
+        shape,
+        name,
+        vocab_size,
+        embed_dim,
+        output_energy_scale: float = 1.0,
+        activation=None,
+        weight_init=None,
+        latent_init=None,
+        energy=None,
+        **kwargs,
+    ):
+        super().__init__(
+            shape=shape,
+            name=name,
+            vocab_size=vocab_size,
+            embed_dim=embed_dim,
+            output_energy_scale=output_energy_scale,
+            activation=activation or SoftmaxActivation(),
+            weight_init=weight_init or NormalInitializer(),
+            latent_init=latent_init or NormalInitializer(),
+            energy=energy or CrossEntropyEnergy(),
+            **kwargs,
+        )
+
+    @staticmethod
+    def get_slots() -> Dict[str, SlotSpec]:
+        return {
+            "in": SlotSpec("in", is_multi_input=False),
+            "loss_mask": SlotSpec(
+                "loss_mask",
+                is_multi_input=False,
+                is_variance_scalable=False,
+            ),
+        }
+
+    @staticmethod
+    def initialize_params(
+        key: jax.Array,
+        node_shape: Tuple[int, ...],
+        input_shapes: Dict[str, Tuple[int, ...]],
+        weight_init: InitializerBase,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> NodeParams:
+        if config is None:
+            config = {}
+        vocab, dim = config["vocab_size"], config["embed_dim"]
+        return NodeParams(
+            weights={"W_out": initialize(key, (dim, vocab), weight_init)},
+            biases={"b_out": jnp.zeros((vocab,))},
+        )
+
+    @staticmethod
+    def forward(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+    ) -> Tuple[jax.Array, NodeState]:
+        hidden = _input_by_slot(inputs, "in")
+        loss_mask = _input_by_slot(inputs, "loss_mask")
+        if loss_mask.shape != hidden.shape[:2]:
+            raise ValueError(
+                "MLM loss_mask shape must match hidden token shape exactly; "
+                f"got {loss_mask.shape}, expected {hidden.shape[:2]}"
+            )
+
+        logits = jnp.dot(hidden, params.weights["W_out"]) + params.biases["b_out"]
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        probs = jnp.exp(log_probs)
+        mask = jax.lax.stop_gradient(loss_mask.astype(logits.dtype))
+        target = state.z_latent
+        per_token_ce = -jnp.sum(target * log_probs, axis=-1)
+        masked_ce = per_token_ce * mask
+        masked_count = jnp.maximum(jnp.sum(mask), 1.0)
+        output_energy_scale = float(
+            node_info.node_config.get("output_energy_scale", 1.0)
+        )
+        energy = output_energy_scale * jnp.sum(masked_ce, axis=-1) / masked_count
+        error = (target - probs) * mask[..., None]
+        state = state._replace(
+            pre_activation=logits,
+            z_mu=probs,
+            error=error,
+            energy=energy,
+        )
+        return jnp.sum(energy), state
 
 
 def _build_encoder_backbone(
@@ -466,6 +568,7 @@ def create_encoder_mlm_model(
     position_init_std: float = 0.02,
     transformer_init_std: float = 0.02,
     use_attention_mask: bool = False,
+    pc_output_energy_scale: float = 1.0,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked LM pretraining."""
     _validate_encoder_config(
@@ -493,15 +596,22 @@ def create_encoder_mlm_model(
         dropout_rate=dropout_rate,
         use_attention_mask=use_attention_mask,
     )
-    mlm_head = VocabProjectionNode(
+    loss_mask_node = IdentityNode(shape=(seq_len,), name="mlm_loss_mask")
+    mlm_head = MaskedVocabProjectionNode(
         shape=(seq_len, vocab_size),
         name="mlm_head",
         vocab_size=vocab_size,
         embed_dim=embed_dim,
+        output_energy_scale=pc_output_energy_scale,
         weight_init=NormalInitializer(std=float(jnp.sqrt(1.0 / embed_dim))),
     )
-    nodes.append(mlm_head)
-    edges.append(Edge(source=final_ln, target=mlm_head.slot("in")))
+    nodes.extend([loss_mask_node, mlm_head])
+    edges.extend(
+        [
+            Edge(source=final_ln, target=mlm_head.slot("in")),
+            Edge(source=loss_mask_node, target=mlm_head.slot("loss_mask")),
+        ]
+    )
 
     task_kwargs = {
         **({"attention_mask": attention_mask_node} if attention_mask_node else {}),
@@ -522,6 +632,7 @@ def create_encoder_mlm_model(
         task_map=TaskMap(
             x=input_node,
             y=mlm_head,
+            loss_mask=loss_mask_node,
             **task_kwargs,
         ),
         inference=inference,

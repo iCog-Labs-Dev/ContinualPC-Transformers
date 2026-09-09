@@ -89,7 +89,7 @@ def compute_forward_pass(
     # Clamp inputs and auxiliary non-target nodes (not output!) - key difference from PC
     clamps = {}
     for task_name, task_value in batch.items():
-        if task_name in structure.task_map and task_name not in {"y", "loss_mask"}:
+        if task_name in structure.task_map and task_name != "y":
             clamps[structure.task_map[task_name]] = task_value
     dropout_key, state_key = jax.random.split(rng_key)
     clamps.update(
@@ -268,7 +268,9 @@ def _apply_optimizer_update(
     return params, opt_state
 
 
-def _validate_resume_config(saved_config: dict[str, Any], current_config: dict[str, Any]) -> None:
+def _validate_resume_config(
+    saved_config: dict[str, Any], current_config: dict[str, Any]
+) -> None:
     for key in ("gradient_accumulation_steps", "tokens_per_update"):
         if saved_config.get(key) != current_config.get(key):
             raise ValueError(
@@ -537,7 +539,11 @@ def _count_exposure_tokens(
 ) -> tuple[int, bool]:
     if isinstance(batch_data, dict) and "attention_mask" in batch_data:
         return int(np.asarray(batch_data["attention_mask"]).sum()), False
-    if isinstance(batch_data, dict) and "x" in batch_data and "pad_token_id" in loader_metadata:
+    if (
+        isinstance(batch_data, dict)
+        and "x" in batch_data
+        and "pad_token_id" in loader_metadata
+    ):
         pad_token_id = int(loader_metadata["pad_token_id"])
         return int(np.sum(np.asarray(batch_data["x"]) != pad_token_id)), False
     if isinstance(batch_data, dict) and "x" in batch_data:
@@ -618,7 +624,9 @@ def train_backprop_mlm(
     n_devices = jax.device_count()
     run_pmap = use_pmap and ((n_devices > 1) or pmap_single_device)
     if run_pmap and gradient_accumulation_steps > 1:
-        raise ValueError("gradient accumulation is not supported with pmap MLM training")
+        raise ValueError(
+            "gradient accumulation is not supported with pmap MLM training"
+        )
 
     opt_state = optimizer.init(params)
     start_step = 0
@@ -627,7 +635,9 @@ def train_backprop_mlm(
         loaded = load_mlm_training_checkpoint(
             config["resume_from"], opt_state_template=opt_state
         )
-        params, opt_state, start_step, saved_config, saved_rng_key, loader_state = loaded
+        params, opt_state, start_step, saved_config, saved_rng_key, loader_state = (
+            loaded
+        )
         _validate_resume_config(saved_config, config)
         if saved_rng_key is not None:
             rng_key = saved_rng_key
@@ -647,13 +657,9 @@ def train_backprop_mlm(
         step_fn = create_pmap_train_step_backprop_mlm(structure, optimizer)
     else:
         grad_fn = jax.jit(
-            lambda p, b, k: _loss_and_grad_backprop_mlm_no_update(
-                p, b, structure, k
-            )
+            lambda p, b, k: _loss_and_grad_backprop_mlm_no_update(p, b, structure, k)
         )
-        update_fn = jax.jit(
-            lambda p, o, g: _apply_optimizer_update(p, o, g, optimizer)
-        )
+        update_fn = jax.jit(lambda p, o, g: _apply_optimizer_update(p, o, g, optimizer))
 
     losses: list[float] = []
     rolling_losses: deque[float] = deque(maxlen=rolling_loss_window)
@@ -662,9 +668,7 @@ def train_backprop_mlm(
     update_step = start_step
     train_metadata = _loader_metadata(train_loader)
     source_token_count = int(train_metadata.get("source_token_count", 0) or 0)
-    max_tokens_per_micro_batch = int(
-        train_metadata.get("max_tokens_per_batch", 0) or 0
-    )
+    max_tokens_per_micro_batch = int(train_metadata.get("max_tokens_per_batch", 0) or 0)
     tokens_per_update = config.get("tokens_per_update")
     if tokens_per_update is None and max_tokens_per_micro_batch:
         tokens_per_update = max_tokens_per_micro_batch * gradient_accumulation_steps
@@ -703,7 +707,9 @@ def train_backprop_mlm(
                 else 0
             )
             batch_max_token_slots = (
-                int(np.asarray(batch_data["x"]).size) if isinstance(batch_data, dict) else 0
+                int(np.asarray(batch_data["x"]).size)
+                if isinstance(batch_data, dict)
+                else 0
             )
             batch = _convert_batch(batch_data)
             _validate_mlm_batch(batch)
