@@ -7,6 +7,7 @@ from typing import Any, Dict, Tuple, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from fabricpc.core.inference import run_inference
@@ -142,6 +143,12 @@ def _validate_pcn_mlm_batch(
         )
 
 
+def _raw_batch_has_masked_tokens(batch_data: Any) -> bool:
+    if not isinstance(batch_data, dict) or "loss_mask" not in batch_data:
+        return True
+    return bool(np.asarray(batch_data["loss_mask"]).sum() > 0)
+
+
 def _masked_accuracy(
     free_state: GraphState,
     batch: Dict[str, jnp.ndarray],
@@ -221,6 +228,26 @@ def get_graph_param_gradient_pcn_mlm(
     return grads, metrics, initial_state, free_state, final_state
 
 
+def get_graph_param_gradient_pcn_mlm_accumulation(
+    params: GraphParams,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    rng_key: jax.Array,
+) -> tuple[GraphParams, jax.Array, jax.Array]:
+    """Compute lean PC MLM grads and loss totals for accumulated training."""
+    grads, metrics, _initial_state, _free_state, _final_state = (
+        get_graph_param_gradient_pcn_mlm(
+            params,
+            batch,
+            structure,
+            rng_key,
+        )
+    )
+    masked_count = metrics["num_masked_tokens"]
+    loss_numerator = metrics["masked_loss"] * masked_count
+    return grads, loss_numerator, masked_count
+
+
 def train_step_pcn_mlm(
     params: GraphParams,
     opt_state: optax.OptState,
@@ -255,6 +282,28 @@ def train_step_pcn_mlm(
     return params, opt_state, metrics, initial_state, free_state, final_state
 
 
+def create_jit_gradient_step_pcn_mlm(structure: GraphStructure):
+    """Create a JIT-compiled PC MLM gradient step for accumulation."""
+    return jax.jit(
+        lambda p, b, k: get_graph_param_gradient_pcn_mlm_accumulation(
+            p, b, structure, k
+        )
+    )
+
+
+def create_jit_update_step_pcn_mlm(optimizer: optax.GradientTransformation):
+    """Create a JIT-compiled optimizer update for accumulated PC MLM grads."""
+    return jax.jit(
+        lambda p, o, g, c: _apply_optimizer_update_when_masked(
+            params=p,
+            opt_state=o,
+            grads=g,
+            optimizer=optimizer,
+            masked_count=c,
+        )
+    )
+
+
 def train_pcn_mlm(
     params: GraphParams,
     structure: GraphStructure,
@@ -270,16 +319,33 @@ def train_pcn_mlm(
         raise ValueError("pmap PC MLM training is not implemented yet")
     if config.get("pmap_single_device"):
         raise ValueError("pmap PC MLM training is not implemented yet")
-    if config.get("tokens_per_update") is not None:
-        raise ValueError("tokens_per_update is not implemented for PC MLM training yet")
-    if int(config.get("gradient_accumulation_steps", 1)) != 1:
-        raise ValueError(
-            "gradient accumulation is not implemented for PC MLM training yet"
-        )
     if config.get("metrics_jsonl"):
         raise ValueError("PC MLM metrics_jsonl logging is not implemented yet")
     if config.get("validation_fn") is not None:
         raise ValueError("custom PC MLM validation_fn is not implemented yet")
+    train_metadata = _loader_metadata(train_loader)
+    max_tokens_per_micro_batch = int(train_metadata.get("max_tokens_per_batch", 0) or 0)
+    tokens_per_update = config.get("tokens_per_update")
+    requested_accumulation_steps = config.get("gradient_accumulation_steps")
+    if requested_accumulation_steps is None and tokens_per_update is not None:
+        requested_tokens_per_update = int(tokens_per_update)
+        if requested_tokens_per_update < 1:
+            raise ValueError("tokens_per_update must be positive")
+        if max_tokens_per_micro_batch < 1:
+            raise ValueError(
+                "tokens_per_update requires loader metadata with max_tokens_per_batch "
+                "or an explicit gradient_accumulation_steps value"
+            )
+        gradient_accumulation_steps = max(
+            1,
+            (requested_tokens_per_update + max_tokens_per_micro_batch - 1)
+            // max_tokens_per_micro_batch,
+        )
+    else:
+        gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1))
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+
     max_steps = int(config.get("max_steps", len(train_loader)))
     checkpoint_path = config.get("checkpoint_path")
     checkpoint_requested = checkpoint_path or config.get("resume_from")
@@ -304,6 +370,8 @@ def train_pcn_mlm(
     log_interval = int(config.get("log_interval", 1))
     validation_interval = int(config.get("validation_interval", 0))
     opt_state = optimizer.init(params)
+    grad_fn = create_jit_gradient_step_pcn_mlm(structure)
+    update_fn = create_jit_update_step_pcn_mlm(optimizer)
     losses: list[float] = []
     validation: list[dict[str, float]] = []
     if config.get("resume_from"):
@@ -340,6 +408,14 @@ def train_pcn_mlm(
         start_batch_in_epoch = 0
         loader_state = {"epoch": 0, "batch_in_epoch": 0}
 
+    if tokens_per_update is None and max_tokens_per_micro_batch:
+        tokens_per_update = max_tokens_per_micro_batch * gradient_accumulation_steps
+    micro_steps = int(loader_state.get("micro_steps", 0))
+    pending_grads = None
+    pending_micro_batches = 0
+    pending_loss_numerator = jnp.array(0.0)
+    pending_masked_count = jnp.array(0.0)
+
     while step < max_steps:
         progressed = False
         for batch_idx, batch_data in enumerate(train_loader):
@@ -348,21 +424,41 @@ def train_pcn_mlm(
             start_batch_in_epoch = 0
             if step >= max_steps:
                 break
+            if not _raw_batch_has_masked_tokens(batch_data):
+                continue
             batch = _convert_batch(batch_data)
             _validate_pcn_mlm_batch(batch, structure)
-            if float(jnp.sum(batch["loss_mask"].astype(jnp.float32))) <= 0:
-                continue
             rng_key, step_key = jax.random.split(rng_key)
-            params, opt_state, metrics, _initial, _free, _final = train_step_pcn_mlm(
+            grads, loss_numerator, masked_count = grad_fn(params, batch, step_key)
+            scaled_grads = jax.tree_util.tree_map(
+                lambda grad: grad / gradient_accumulation_steps,
+                grads,
+            )
+            pending_grads = (
+                scaled_grads
+                if pending_grads is None
+                else jax.tree_util.tree_map(
+                    lambda left, right: left + right,
+                    pending_grads,
+                    scaled_grads,
+                )
+            )
+            pending_loss_numerator = pending_loss_numerator + loss_numerator
+            pending_masked_count = pending_masked_count + masked_count
+            pending_micro_batches += 1
+            micro_steps += 1
+            progressed = True
+
+            if pending_micro_batches < gradient_accumulation_steps:
+                continue
+
+            params, opt_state = update_fn(
                 params,
                 opt_state,
-                batch,
-                structure,
-                optimizer,
-                step_key,
+                pending_grads,
+                pending_masked_count,
             )
             step += 1
-            progressed = True
             try:
                 num_train_batches = len(train_loader)
             except TypeError:
@@ -375,9 +471,16 @@ def train_pcn_mlm(
                     else max(0, getattr(train_loader, "_epoch", 1) - 1)
                 ),
                 "batch_in_epoch": next_batch,
+                "micro_steps": micro_steps,
             }
-            loss = float(metrics["masked_loss"])
+            loss = float(
+                pending_loss_numerator / jnp.maximum(pending_masked_count, 1.0)
+            )
             losses.append(loss)
+            pending_grads = None
+            pending_micro_batches = 0
+            pending_loss_numerator = jnp.array(0.0)
+            pending_masked_count = jnp.array(0.0)
             if verbose and log_interval > 0 and step % log_interval == 0:
                 print(f"step={step} masked_loss={loss:.4f}")
             if checkpoint_path and step % checkpoint_interval == 0:
@@ -416,6 +519,10 @@ def train_pcn_mlm(
         "losses": losses,
         "validation": validation,
         "mode": "pc",
+        "micro_steps": micro_steps,
+        "tokens_per_update": tokens_per_update,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "max_tokens_per_micro_batch": max_tokens_per_micro_batch or None,
     }
 
 
