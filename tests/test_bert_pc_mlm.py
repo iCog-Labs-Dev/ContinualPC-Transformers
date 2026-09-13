@@ -233,6 +233,93 @@ def test_train_mlm_pc_saves_and_resumes_checkpoint(tmp_path, rng_key):
     assert tree_any_changed(params, resumed_params)
 
 
+def test_train_mlm_pc_supports_gradient_accumulation(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adam(1e-2)
+
+    updated_params, state = train_mlm(
+        params,
+        structure,
+        [tiny_batch(), tiny_batch()],
+        optimizer,
+        {
+            "max_steps": 1,
+            "gradient_accumulation_steps": 2,
+        },
+        rng_key,
+        mode="pc",
+        verbose=False,
+    )
+
+    assert state["step"] == 1
+    assert state["micro_steps"] == 2
+    assert state["gradient_accumulation_steps"] == 2
+    assert tree_any_changed(params, updated_params)
+
+
+def test_train_mlm_pc_derives_accumulation_from_tokens_per_update(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adam(1e-2)
+
+    _updated_params, state = train_mlm(
+        params,
+        structure,
+        tiny_loader(mask_prob=1.0),
+        optimizer,
+        {"max_steps": 1, "tokens_per_update": 12},
+        rng_key,
+        mode="pc",
+        verbose=False,
+    )
+
+    assert state["step"] == 1
+    assert state["micro_steps"] == 2
+    assert state["gradient_accumulation_steps"] == 2
+
+
+def test_train_mlm_pc_empty_mask_batches_do_not_count_toward_accumulation(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adam(1e-2)
+    empty_batch = tiny_batch(loss_mask=jnp.zeros((1, 6), dtype=jnp.float32))
+
+    updated_params, state = train_mlm(
+        params,
+        structure,
+        [empty_batch, tiny_batch(), tiny_batch()],
+        optimizer,
+        {"max_steps": 1, "gradient_accumulation_steps": 2},
+        rng_key,
+        mode="pc",
+        verbose=False,
+    )
+
+    assert state["step"] == 1
+    assert state["micro_steps"] == 2
+    assert tree_any_changed(params, updated_params)
+
+
+def test_train_mlm_pc_all_empty_masks_fail_clearly(rng_key):
+    structure = build_small_mlm()
+    params = initialize_params(structure, rng_key)
+    optimizer = optax.adam(1e-2)
+    empty_batch = tiny_batch(loss_mask=jnp.zeros((1, 6), dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match="supervised MLM batches"):
+        train_mlm(
+            params,
+            structure,
+            [empty_batch],
+            optimizer,
+            {"max_steps": 1},
+            rng_key,
+            mode="pc",
+            verbose=False,
+        )
+
+
 def test_train_mlm_pc_resume_rejects_training_identity_mismatch(tmp_path, rng_key):
     structure = build_small_mlm()
     params = initialize_params(structure, rng_key)
