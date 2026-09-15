@@ -61,7 +61,7 @@ def test_classification_batcher_shapes_shuffle_and_label_validation():
 
 
 def test_validate_task_names_rejects_duplicates_and_unsupported():
-    specs = {"sst2": DatasetSpec("sst2", "glue", "sst2", "sentence", "label")}
+    specs = {"sst2": DatasetSpec("sst2", "nyu-mll/glue", "sst2", "sentence", "label")}
 
     assert validate_task_names(["sst2"], specs) == ["sst2"]
     with pytest.raises(ValueError, match="Duplicate"):

@@ -49,11 +49,11 @@ class DatasetSpec:
 
 DATASET_REGISTRY = {
     "sst2": DatasetSpec(
-        "sst2", "glue", "sst2", "sentence", "label", "train", "validation"
+        "sst2", "nyu-mll/glue", "sst2", "sentence", "label", "train", "validation"
     ),
-    "imdb": DatasetSpec("imdb", "imdb", None, "text", "label"),
+    "imdb": DatasetSpec("imdb", "stanfordnlp/imdb", None, "text", "label"),
     "yelp_polarity": DatasetSpec(
-        "yelp_polarity", "yelp_polarity", None, "text", "label"
+        "yelp_polarity", "fancyzhx/yelp_polarity", None, "text", "label"
     ),
 }
 
