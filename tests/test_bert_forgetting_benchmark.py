@@ -12,6 +12,7 @@ from examples.bert_forgetting_benchmark import (
     make_evaluation_records,
     parse_args,
     run_sequential_benchmark,
+    select_stratified_examples,
     validate_task_names,
     validate_sample_limit,
     write_benchmark_outputs,
@@ -113,6 +114,22 @@ def test_validate_sample_limit_rejects_non_positive_values():
         validate_sample_limit(0, "max_eval_samples")
     with pytest.raises(ValueError, match="positive"):
         validate_sample_limit(-1, "max_train_samples")
+
+
+def test_select_stratified_examples_balances_ordered_binary_data():
+    examples = [(f"negative {index}", 0) for index in range(10)] + [
+        (f"positive {index}", 1) for index in range(10)
+    ]
+
+    first = select_stratified_examples(examples, max_samples=6, seed=3)
+    second = select_stratified_examples(examples, max_samples=6, seed=3)
+    labels = [label for _, label in first]
+
+    assert first == second
+    assert len(first) == 6
+    assert labels.count(0) == 3
+    assert labels.count(1) == 3
+    assert first != examples[:6]
 
 
 def test_write_benchmark_outputs_json_and_jsonl(tmp_path):

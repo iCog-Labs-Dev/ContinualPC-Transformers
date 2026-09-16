@@ -219,6 +219,50 @@ def validate_sample_limit(value: int | None, flag_name: str) -> None:
         raise ValueError(f"{flag_name} must be positive when provided")
 
 
+def select_stratified_examples(
+    examples: Sequence[tuple[str, int]],
+    max_samples: int | None,
+    seed: int,
+) -> list[tuple[str, int]]:
+    """Return a deterministic, label-balanced sample for binary tasks."""
+    if max_samples is None or len(examples) <= max_samples:
+        selected = list(examples)
+    else:
+        by_label = {
+            0: [example for example in examples if example[1] == 0],
+            1: [example for example in examples if example[1] == 1],
+        }
+        if not by_label[0] or not by_label[1]:
+            raise ValueError("stratified sampling requires both binary labels")
+
+        rng = np.random.default_rng(seed)
+        base_per_label = max_samples // 2
+        remainder = max_samples % 2
+        selected = []
+        for label in (0, 1):
+            target = min(
+                base_per_label + (1 if label < remainder else 0), len(by_label[label])
+            )
+            indices = rng.choice(len(by_label[label]), size=target, replace=False)
+            selected.extend(by_label[label][int(index)] for index in indices)
+
+        if len(selected) < max_samples:
+            selected_keys = {id(example) for example in selected}
+            leftovers = [
+                example for example in examples if id(example) not in selected_keys
+            ]
+            extra_count = min(max_samples - len(selected), len(leftovers))
+            if extra_count > 0:
+                extra_indices = rng.choice(
+                    len(leftovers), size=extra_count, replace=False
+                )
+                selected.extend(leftovers[int(index)] for index in extra_indices)
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(selected)) if selected else []
+    return [selected[int(index)] for index in order]
+
+
 def make_evaluation_records(
     task_names: Sequence[str],
     accuracy_matrix: Sequence[Sequence[float]],
@@ -332,10 +376,9 @@ def load_hf_classification_loader(
         label = row.get(spec.label_field)
         if isinstance(text, str) and label in (0, 1):
             examples.append((text, int(label)))
-        if max_samples is not None and len(examples) >= max_samples:
-            break
     if not examples:
         raise ValueError(f"No examples loaded for task {task_name!r} split {split!r}")
+    examples = select_stratified_examples(examples, max_samples, seed)
     return ClassificationBatcher(
         examples,
         vocab,
