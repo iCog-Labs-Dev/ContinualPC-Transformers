@@ -32,6 +32,10 @@ from fabricpc.nodes.linear_residual import LinearResidual
 from fabricpc.nodes.convolutional import ConvNode
 from fabricpc.nodes.pooling import MaxPool, AvgPool
 from fabricpc.nodes.patch_embed import PatchEmbeddingNode
+from fabricpc.nodes.learned_position_embedding import (
+    LearnedPositionEmbeddingNode,
+    interpolate_position_embeddings,
+)
 
 __all__ = [
     # Base classes and mixins
@@ -57,4 +61,6 @@ __all__ = [
     "SkipConnection",
     "LinearResidual",
     "PatchEmbeddingNode",
+    "LearnedPositionEmbeddingNode",
+    "interpolate_position_embeddings",
 ]
