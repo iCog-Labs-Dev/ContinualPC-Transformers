@@ -585,6 +585,29 @@ class TestInterpolation:
         assert jnp.array_equal(resized[:1], prefix)
         assert jnp.allclose(resized[1:], 3.5, atol=1e-5)
 
+    def test_upsampling_preserves_ramp_orientation(self):
+        """A width-varying ramp catches a transposed grid reshape.
+
+        Constant-table tests pass for any reshape order; here rows must
+        stay constant and columns must increase monotonically.
+        """
+        ramp = jnp.tile(
+            jnp.arange(3, dtype=jnp.float32)[None, :, None], (2, 1, 1)
+        )
+        positions = jnp.concatenate(
+            [jnp.zeros((1, 1)), ramp.reshape(6, 1)], axis=0
+        )
+        resized = interpolate_position_embeddings(
+            positions,
+            (2, 3),
+            (4, 6),
+            num_prefix_tokens=1,
+        )
+        assert resized.shape == (25, 1)
+        grid = resized[1:].reshape(4, 6)
+        assert jnp.allclose(grid, grid[:1, :], atol=1e-4)
+        assert jnp.all(jnp.diff(grid, axis=1) >= -1e-5)
+
     def test_same_grid_returns_unchanged_values(self):
         positions = jax.random.normal(jax.random.PRNGKey(6), (7, 4))
         resized = interpolate_position_embeddings(
