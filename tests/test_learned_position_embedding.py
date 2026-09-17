@@ -188,6 +188,11 @@ class TestSlotsAndParams:
         assert jnp.all(params.weights["position_embeddings"] == 1)
         assert jnp.all(params.weights["cls_token"] == 1)
 
+    def test_weight_init_none_falls_back_to_default(self):
+        params = _make_params(initializer=None)
+        assert params.weights["position_embeddings"].shape == OUTPUT_SHAPE
+        assert params.weights["cls_token"].shape == (NUM_PREFIX_TOKENS, EMBED_DIM)
+
     @pytest.mark.parametrize(
         "input_shapes",
         [

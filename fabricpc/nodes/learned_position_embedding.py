@@ -220,6 +220,9 @@ class LearnedPositionEmbeddingNode(NodeBase):
         if config is None:
             config = {}
 
+        if weight_init is None:
+            weight_init = NormalInitializer(std=0.02)
+
         num_prefix_tokens = config.get("num_prefix_tokens", 1)
         input_shape = next(iter(input_shapes.values()))
         if len(input_shape) != 2:
