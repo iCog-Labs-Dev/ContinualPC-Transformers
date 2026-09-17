@@ -86,7 +86,6 @@ IMAGE_H, IMAGE_W = 224, 224
 NUM_PATCHES = (IMAGE_H // PATCH_SIZE) * (IMAGE_W // PATCH_SIZE)  # 196
 
 
-
 class TestPatchEmbeddingConstruction:
     """Tests for constructor argument validation."""
 
@@ -629,9 +628,9 @@ class TestPatchEmbeddingForward:
         # patch 3 (bottom-right): 4 × 4.0 = 16.0
         z_mu = new_state.z_mu[0, :, 0]  # (N,)
         expected = jnp.array([4.0, 8.0, 12.0, 16.0])
-        assert jnp.allclose(
-            z_mu, expected, atol=1e-5
-        ), f"Raster order mismatch: got {z_mu}, expected {expected}"
+        assert jnp.allclose(z_mu, expected, atol=1e-5), (
+            f"Raster order mismatch: got {z_mu}, expected {expected}"
+        )
 
 
 class TestPatchEmbeddingAutodiff:
@@ -837,6 +836,7 @@ class TestPatchEmbeddingVariants:
 
 # validation and integration coverage
 
+
 @pytest.mark.parametrize(
     "arg_name,bad_value",
     [
@@ -945,6 +945,7 @@ def test_matches_explicit_patch_projection_equation():
 
 # Non-square images, square-patch-only API, and property-based equivalence
 
+
 def _explicit_patch_projection(x, kernel, patch_size):
     """Reference implementation of ViT Eq. 1: raster-order x_p^i @ E."""
     batch_size, height, width, _ = x.shape
@@ -1023,9 +1024,7 @@ def test_non_square_image_raster_order_is_width_major():
     # Pixel value = raster index of the patch it belongs to.
     img = jnp.array(
         [[[float((r // P) * grid_w + (c // P))] for c in range(W)] for r in range(H)]
-    )[
-        None
-    ]  # (1, 6, 4, 1)
+    )[None]  # (1, 6, 4, 1)
 
     # Kernel of ones averages -> sum = P*P * patch_index.
     kernel = jnp.ones((P, P, C, D))
@@ -1033,8 +1032,7 @@ def test_non_square_image_raster_order_is_width_major():
 
     expected = jnp.arange(N, dtype=jnp.float32) * (P * P)
     assert jnp.allclose(z_mu[0, :, 0], expected), (
-        f"Non-square raster order mismatch: got {z_mu[0, :, 0]}, "
-        f"expected {expected}"
+        f"Non-square raster order mismatch: got {z_mu[0, :, 0]}, expected {expected}"
     )
 
 
@@ -1243,3 +1241,24 @@ def test_mupc_scaling_uses_patch_receptive_field():
 
     assert scaling is not None
     assert scaling.forward_scale[edge_key] == pytest.approx(1.0 / 4.0)
+
+
+def test_weight_init_none_falls_back_to_default():
+    "weight_init=None uses the node default instaead of crashing."
+    node = PatchEmbeddingNode(
+        shape=(4, 8),
+        name="patch",
+        patch_size=4,
+        embed_dim=8,
+        in_channels=1,
+        weight_init=None,
+    )
+    params = PatchEmbeddingNode.initialize_params(
+        key=jax.random.PRNGKey(0),
+        node_shape=node.shape,
+        input_shapes={"src->dst:in": (8, 8, 1)},
+        weight_init=None,
+        config=node._extra_config,
+    )
+
+    assert params.weights["proj_kernel"].shape == (4,4,1,8)
