@@ -203,6 +203,9 @@ class PatchEmbeddingNode(NodeBase):
         if config is None:
             config = {}
 
+        if weight_init is None:
+            weight_init = KaimingInitializer(gain=2**-0.5)
+
         patch_size = config["patch_size"]
         embed_dim = config["embed_dim"]
         in_channels = config["in_channels"]
