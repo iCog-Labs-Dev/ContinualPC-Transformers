@@ -152,7 +152,8 @@ class LearnedPositionEmbeddingNode(NodeBase):
 
     Input shape excluding batch: ``(N, D)`` — patch embeddings from
     ``PatchEmbeddingNode``. Output shape: ``(N + K, D)`` where
-    ``K = num_prefix_tokens``.
+    ``K = num_prefix_tokens``. Activation is fixed to identity because the
+    prediction is a plain additive sum with no nonlinear transfer.
 
     Parameters
     cls_token:
