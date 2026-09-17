@@ -667,6 +667,16 @@ class TestInterpolation:
                 num_prefix_tokens=prefix,
             )
 
+    def test_interpolation_rejects_unknown_method(self):
+        with pytest.raises(ValueError, match="method must be one of"):
+            interpolate_position_embeddings(
+                jnp.zeros((7, 4)),
+                (2, 3),
+                (3, 3),
+                num_prefix_tokens=1,
+                method="foo",
+            )
+
 
 def _build_position_graph(with_mupc=False):
     tokens = IdentityNode(shape=PATCH_SHAPE, name="tokens")

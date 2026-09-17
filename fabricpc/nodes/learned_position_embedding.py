@@ -45,6 +45,25 @@ if TYPE_CHECKING:
     from fabricpc.core.energy import EnergyFunctional
 
 
+_RESIZE_METHODS = frozenset(
+    {
+        "nearest",
+        "linear",
+        "bilinear",
+        "trilinear",
+        "triangle",
+        "cubic",
+        "bicubic",
+        "tricubic",
+        "cubic-pytorch",
+        "bicubic-pytorch",
+        "lanczos3",
+        "lanczos5",
+        "area",
+    }
+)
+
+
 def _validate_positive_int(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
@@ -96,8 +115,10 @@ def interpolate_position_embeddings(
             "position_embeddings must have shape (sequence_length, embed_dim), "
             f"got {position_embeddings.shape}"
         )
-    if not isinstance(method, str) or not method:
-        raise ValueError(f"method must be a non-empty string, got {method!r}")
+    if method not in _RESIZE_METHODS:
+        raise ValueError(
+            f"method must be one of {sorted(_RESIZE_METHODS)}, got {method!r}"
+        )
 
     source_height, source_width = source_grid_size
     target_height, target_width = target_grid_size
