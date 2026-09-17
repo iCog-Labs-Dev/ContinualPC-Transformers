@@ -31,6 +31,7 @@ from fabricpc.nodes.skip_connection import SkipConnection
 from fabricpc.nodes.linear_residual import LinearResidual
 from fabricpc.nodes.convolutional import ConvNode
 from fabricpc.nodes.pooling import MaxPool, AvgPool
+from fabricpc.nodes.patch_embed import PatchEmbeddingNode
 
 __all__ = [
     # Base classes and mixins
@@ -55,4 +56,5 @@ __all__ = [
     "StorkeyHopfield",
     "SkipConnection",
     "LinearResidual",
+    "PatchEmbeddingNode",
 ]
