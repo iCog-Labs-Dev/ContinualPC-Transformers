@@ -213,7 +213,7 @@ class ClassTokenReadoutNode(NodeBase):
 
         error = state.z_latent - z_mu
         state = state._replace(
-            pre_activation=cls_token,
+            pre_activation=z_ln,
             z_mu=z_mu,
             error=error,
         )
