@@ -212,17 +212,7 @@ def train_backprop(
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)
-        if use_pmap:
-            device_keys = (
-                jax.random.split(epoch_rng_key, n_devices)
-                if n_devices > 1
-                else epoch_rng_key[None, :]
-            )
-            batch_keys = jax.vmap(
-                lambda key: jax.random.split(key, max_batches)
-            )(device_keys)
-        else:
-            batch_keys = jax.random.split(epoch_rng_key, max_batches)
+        batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
         batch_losses = []
         epoch_loss = 0.0
@@ -269,9 +259,6 @@ def train_backprop(
 
         if verbose:
             print(f"Epoch {epoch_idx + 1}/{total_epochs}, Loss: {avg_loss:.4f}")
-
-    if use_pmap:
-        params = jax.tree_util.tree_map(lambda value: value[0], params)
 
     return params, iter_results, epoch_results
 
