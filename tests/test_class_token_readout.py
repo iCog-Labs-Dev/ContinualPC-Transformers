@@ -15,7 +15,6 @@ Run with:
     pytest tests/test_class_token_readout.py -v
 """
 
-import math
 from dataclasses import replace
 
 import jax
@@ -35,7 +34,8 @@ from fabricpc.core.types import NodeInfo, NodeState
 from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.nodes import ClassTokenReadoutNode, IdentityNode, Linear
+from fabricpc.nodes import IdentityNode, Linear
+from fabricpc.nodes.class_token_readout import ClassTokenReadoutNode
 from fabricpc.utils.helpers import layernorm
 
 
@@ -202,7 +202,7 @@ class TestClassTokenReadoutSlots:
         slots = ClassTokenReadoutNode.get_slots()
         assert set(slots) == {"in"}
         assert slots["in"].is_multi_input is False
-        assert slots["in"].is_variance_scalable is True
+        assert slots["in"].is_variance_scalable is False
         assert slots["in"].is_skip_connection is False
 
     def test_fan_in(self):
@@ -210,7 +210,7 @@ class TestClassTokenReadoutSlots:
             source_shape=(SEQ_LEN, EMBED_DIM),
             config={"embed_dim": EMBED_DIM},
         )
-        assert fan_in == EMBED_DIM
+        assert fan_in == 1
 
 
 
@@ -300,7 +300,7 @@ class TestClassTokenReadoutForward:
         )
         assert jnp.allclose(new_state.z_mu, expected, atol=1e-5)
         assert not jnp.allclose(new_state.z_mu, other, atol=1e-4)
-        assert jnp.allclose(new_state.pre_activation, x[:, 0, :], atol=1e-6)
+        assert jnp.allclose(new_state.pre_activation, expected, atol=1e-6)
 
     def test_layernorm_applied(self):
         B, S, D = 3, 10, 32
@@ -318,6 +318,48 @@ class TestClassTokenReadoutForward:
             eps=1e-6,
         )
         assert jnp.allclose(new_state.z_mu, expected, atol=1e-5)
+
+    def test_pre_activation_is_value_given_to_activation(self):
+        """pre_activation must contain the LayerNorm output passed to activation."""
+        batch_size, seq_len, embed_dim = 1, 2, 4
+        x = jnp.array(
+            [
+                [
+                    [1.0, 2.0, 4.0, 8.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                ]
+            ],
+            dtype=jnp.float32,
+        )
+        params = _make_params(node_shape=(embed_dim,), seq_len=seq_len)
+        state = _make_state(
+            jax.random.PRNGKey(0), batch_size, (embed_dim,)
+        )
+
+        _, new_state = _forward(
+            params,
+            x,
+            state,
+            node_shape=(embed_dim,),
+        )
+
+        expected_pre_activation = layernorm(
+            x[:, 0, :],
+            params.weights["ln_gamma"],
+            params.biases["ln_beta"],
+            eps=1e-6,
+        )
+
+        assert jnp.allclose(
+            new_state.pre_activation,
+            expected_pre_activation,
+            atol=1e-6,
+        )
+        assert jnp.allclose(
+            new_state.pre_activation,
+            new_state.z_mu,
+            atol=1e-6,
+        )
 
     def test_energy_is_nonneg(self):
         B, S, D = 2, 8, 16
@@ -350,7 +392,7 @@ class TestClassTokenReadoutForward:
             eps=1e-6,
         )
         assert jnp.allclose(new_state.z_mu, expected, atol=1e-5)
-        assert jnp.allclose(new_state.pre_activation, x[:, cls_index, :])
+        assert jnp.allclose(new_state.pre_activation, expected, atol=1e-6)
 
     def test_ln_eps_affects_output(self):
         """Near-zero variance makes the eps term dominate the LN denominator."""
@@ -517,9 +559,51 @@ class TestClassTokenReadoutGraphIntegration:
         scaling = readout_info.scaling_config
 
         assert scaling is not None
-        assert scaling.forward_scale[edge_key] == pytest.approx(
-            1.0 / math.sqrt(embed_dim)
+        assert edge_key not in scaling.forward_scale
+        assert edge_key not in scaling.topdown_grad_scale
+        assert edge_key not in scaling.weight_grad_scale
+
+    def test_mupc_preserves_class_token_readout_equation(self, rng_key):
+        """muPC must preserve the advertised y = LN(z_L^0) readout."""
+        seq_len = 2
+        embed_dim = 4
+        num_classes = 2
+        structure = _build_readout_graph(
+            seq_len=seq_len,
+            embed_dim=embed_dim,
+            num_classes=num_classes,
+            with_mupc=True,
         )
+        params = initialize_params(structure, rng_key)
+
+        cls_token = jnp.array(
+            [0.0, 1e-3, -1e-3, 2e-3],
+            dtype=jnp.float32,
+        )
+        x = jnp.stack(
+            [cls_token, jnp.zeros_like(cls_token)],
+            axis=0,
+        )[None, ...]
+        y = jnp.zeros((1, num_classes))
+
+        state = initialize_graph_state(
+            structure,
+            batch_size=1,
+            rng_key=rng_key,
+            clamps={"encoder_out": x, "head": y},
+            params=params,
+        )
+
+        readout_params = params.nodes["readout"]
+        expected = layernorm(
+            x[:, 0, :],
+            readout_params.weights["ln_gamma"],
+            readout_params.biases["ln_beta"],
+            eps=1e-6,
+        )
+        actual = state.nodes["readout"].z_mu
+
+        assert jnp.allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 
 class TestClassTokenReadoutVariants:
