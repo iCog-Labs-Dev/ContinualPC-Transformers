@@ -127,13 +127,19 @@ class ClassTokenReadoutNode(NodeBase):
 
     @staticmethod
     def get_slots() -> Dict[str, SlotSpec]:
-        """Single sequence input from the final encoder block (``z_L``)."""
-        return {"in": SlotSpec(name="in", is_multi_input=False)}
+        """Single unscaled sequence input from the final encoder block."""
+        return {
+            "in": SlotSpec(
+                name="in",
+                is_multi_input=False,
+                is_variance_scalable=False,
+            )
+        }
 
     @staticmethod
     def get_weight_fan_in(source_shape: Tuple[int, ...], config: Dict[str, Any]) -> int:
-        """fan_in = D, the feature dimension of the selected CLS token."""
-        return source_shape[-1]
+        """Return 1 because token selection and LayerNorm have no mixing weight."""
+        return 1
 
     @staticmethod
     def initialize_params(
