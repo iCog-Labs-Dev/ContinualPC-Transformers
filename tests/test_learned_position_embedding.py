@@ -749,6 +749,7 @@ def test_wired_after_patch_embedding_node(rng_key):
         shape=(num_patches, embed_dim),
         name="patch",
         patch_size=patch_size,
+        grid_size=grid_size,
         embed_dim=embed_dim,
         in_channels=channels,
     )

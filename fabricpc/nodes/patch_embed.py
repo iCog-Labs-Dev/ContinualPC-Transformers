@@ -37,6 +37,7 @@ Usage
         shape=(num_patches, embed_dim),   # (N, D) = (H*W/P², D)
         name="patch_embed",
         patch_size=16,
+        grid_size=(14, 14),
         embed_dim=768,
         in_channels=3,
     )
@@ -88,6 +89,8 @@ class PatchEmbeddingNode(NodeBase):
         patch_size:  Side length P of each square patch. Only square patches
                      are supported (ViT uses square patches); a non-integer
                      value such as a ``(Ph, Pw)`` tuple is rejected.
+        grid_size:   Expected patch-grid shape ``(H/P, W/P)``. Its product
+                     must equal N, and the input must produce this exact grid.
         embed_dim:   Embedding dimension D.
         in_channels: Number of input image channels C (e.g. 3 for RGB).
         activation:  Default: IdentityActivation. ViT Eq. 1 applies no
@@ -120,6 +123,7 @@ class PatchEmbeddingNode(NodeBase):
         shape: Tuple[int, ...],
         name: str,
         patch_size: int,
+        grid_size: Tuple[int, int],
         embed_dim: int,
         in_channels: int,
         activation: "ActivationBase" = IdentityActivation(),
@@ -160,6 +164,24 @@ class PatchEmbeddingNode(NodeBase):
                 f"must be a positive integer, got {shape[0]!r}"
             )
 
+        if (
+            not isinstance(grid_size, tuple)
+            or len(grid_size) != 2
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in grid_size
+            )
+        ):
+            raise ValueError(
+                f"PatchEmbeddingNode {name}: grid_size must be a pair of "
+                f"positive integers, got {grid_size!r}"
+            )
+        if shape[0] != grid_size[0] * grid_size[1]:
+            raise ValueError(
+                f"PatchEmbeddingNode '{name}': shape[0]={shape[0]} must equal "
+                f"grid_size product={grid_size[0] * grid_size[1]}"
+            )
+
         super().__init__(
             shape=shape,
             name=name,
@@ -168,6 +190,7 @@ class PatchEmbeddingNode(NodeBase):
             latent_init=latent_init,
             weight_init=weight_init,
             patch_size=patch_size,
+            grid_size=grid_size,
             embed_dim=embed_dim,
             in_channels=in_channels,
             use_bias=use_bias,
@@ -207,6 +230,7 @@ class PatchEmbeddingNode(NodeBase):
             weight_init = KaimingInitializer(gain=2**-0.5)
 
         patch_size = config["patch_size"]
+        grid_size = config.get("grid_size")
         embed_dim = config["embed_dim"]
         in_channels = config["in_channels"]
         use_bias = config.get("use_bias", True)
@@ -238,7 +262,13 @@ class PatchEmbeddingNode(NodeBase):
                     f"PatchEmbeddingNode: image size ({H}, {W}) is not evenly "
                     f"divisible by patch_size={patch_size}"
                 )
-            expected_num_patches = (H // patch_size) * (W // patch_size)
+            actual_grid_size = (H // patch_size, W // patch_size)
+            if grid_size is not None and actual_grid_size != grid_size:
+                raise ValueError(
+                    f"PatchEmbeddingNode: input image produces patch grid "
+                    f"{actual_grid_size}, but declared grid_size={grid_size}"
+                )
+            expected_num_patches = actual_grid_size[0] * actual_grid_size[1]
             declared_num_patches = node_shape[0]
             if expected_num_patches != declared_num_patches:
                 raise ValueError(
@@ -290,6 +320,13 @@ class PatchEmbeddingNode(NodeBase):
             padding="VALID",
             dimension_numbers=("NHWC", "HWIO", "NHWC"),
         )  # (B, H/P, W/P, D)
+
+        grid_size = config.get("grid_size")
+        if grid_size is not None and proj.shape[1:3] != grid_size:
+            raise ValueError(
+                f"PatchEmbeddingNode: input image produces patch grid "
+                f"{proj.shape[1:3]}, but declared grid_size={grid_size}"
+            )
 
         # 2. Flatten spatial grid → sequence (raster order, no transpose)
         # Reshaping to the declared (N, D) rather than (-1, D) keeps the node

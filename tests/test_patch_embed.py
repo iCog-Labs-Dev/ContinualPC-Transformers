@@ -84,6 +84,7 @@ EMBED_DIM = 768
 IN_CHANNELS = 3
 IMAGE_H, IMAGE_W = 224, 224
 NUM_PATCHES = (IMAGE_H // PATCH_SIZE) * (IMAGE_W // PATCH_SIZE)  # 196
+GRID_SIZE = (IMAGE_H // PATCH_SIZE, IMAGE_W // PATCH_SIZE)
 
 
 class TestPatchEmbeddingConstruction:
@@ -95,6 +96,7 @@ class TestPatchEmbeddingConstruction:
             shape=(NUM_PATCHES, EMBED_DIM),
             name="patch_embed",
             patch_size=PATCH_SIZE,
+            grid_size=GRID_SIZE,
             embed_dim=EMBED_DIM,
             in_channels=IN_CHANNELS,
         )
@@ -108,6 +110,7 @@ class TestPatchEmbeddingConstruction:
                 shape=(NUM_PATCHES,),  # 1D — wrong
                 name="bad",
                 patch_size=PATCH_SIZE,
+                grid_size=GRID_SIZE,
                 embed_dim=EMBED_DIM,
                 in_channels=IN_CHANNELS,
             )
@@ -119,6 +122,7 @@ class TestPatchEmbeddingConstruction:
                 shape=(14, 14, EMBED_DIM),  # 3D — wrong
                 name="bad",
                 patch_size=PATCH_SIZE,
+                grid_size=GRID_SIZE,
                 embed_dim=EMBED_DIM,
                 in_channels=IN_CHANNELS,
             )
@@ -130,6 +134,7 @@ class TestPatchEmbeddingConstruction:
                 shape=(NUM_PATCHES, 512),  # D=512 ≠ embed_dim=768
                 name="bad",
                 patch_size=PATCH_SIZE,
+                grid_size=GRID_SIZE,
                 embed_dim=EMBED_DIM,
                 in_channels=IN_CHANNELS,
             )
@@ -140,6 +145,7 @@ class TestPatchEmbeddingConstruction:
             shape=(NUM_PATCHES, EMBED_DIM),
             name="patch",
             patch_size=PATCH_SIZE,
+            grid_size=GRID_SIZE,
             embed_dim=EMBED_DIM,
             in_channels=IN_CHANNELS,
             activation=ReLUActivation(),
@@ -154,6 +160,7 @@ class TestPatchEmbeddingConstruction:
             shape=(N, EMBED_DIM),
             name="patch14",
             patch_size=P,
+            grid_size=(IMAGE_H // P, IMAGE_W // P),
             embed_dim=EMBED_DIM,
             in_channels=IN_CHANNELS,
         )
@@ -318,6 +325,25 @@ class TestPatchEmbeddingParams:
                 key=key,
                 node_shape=(100, EMBED_DIM),  # wrong: should be 196
                 input_shapes=input_shapes,
+                weight_init=KaimingInitializer(),
+                config=config,
+            )
+
+    def test_rejects_different_grid_with_same_patch_count(self):
+        """Equal patch counts do not hide a different spatial geometry."""
+        config = {
+            "patch_size": 4,
+            "grid_size": (2, 6),
+            "embed_dim": 8,
+            "in_channels": 1,
+            "use_bias": False,
+        }
+
+        with pytest.raises(ValueError, match="produces patch grid \\(3, 4\\)"):
+            PatchEmbeddingNode.initialize_params(
+                key=jax.random.PRNGKey(0),
+                node_shape=(12, 8),
+                input_shapes={"src->dst:in": (12, 16, 1)},
                 weight_init=KaimingInitializer(),
                 config=config,
             )
@@ -856,6 +882,7 @@ def test_dimension_arguments_must_be_positive_integers(arg_name, bad_value):
         "shape": (NUM_PATCHES, EMBED_DIM),
         "name": "bad",
         "patch_size": PATCH_SIZE,
+        "grid_size": GRID_SIZE,
         "embed_dim": EMBED_DIM,
         "in_channels": IN_CHANNELS,
     }
@@ -874,6 +901,7 @@ def test_num_patches_must_be_a_positive_integer(num_patches):
             shape=(num_patches, EMBED_DIM),
             name="bad",
             patch_size=PATCH_SIZE,
+            grid_size=GRID_SIZE,
             embed_dim=EMBED_DIM,
             in_channels=IN_CHANNELS,
         )
@@ -885,6 +913,7 @@ def test_default_initializer_preserves_linear_fan_in_variance():
         shape=(4, 32),
         name="patch",
         patch_size=4,
+        grid_size=(2, 2),
         embed_dim=32,
         in_channels=3,
     )
@@ -1043,6 +1072,7 @@ def test_non_square_patch_size_is_rejected():
             shape=(NUM_PATCHES, EMBED_DIM),
             name="bad",
             patch_size=(16, 8),  # non-square — unsupported
+            grid_size=GRID_SIZE,
             embed_dim=EMBED_DIM,
             in_channels=IN_CHANNELS,
         )
@@ -1111,6 +1141,7 @@ def test_initialize_params_accepts_any_valid_config_property(
         shape=(num_patches, embed_dim),
         name="patch",
         patch_size=patch_size,
+        grid_size=(grid_h, grid_w),
         embed_dim=embed_dim,
         in_channels=in_channels,
     )
@@ -1160,6 +1191,7 @@ def _build_patch_graph(with_mupc=False):
         shape=(4, 8),
         name="patch",
         patch_size=4,
+        grid_size=(2, 2),
         embed_dim=8,
         in_channels=1,
     )
@@ -1249,6 +1281,7 @@ def test_weight_init_none_falls_back_to_default():
         shape=(4, 8),
         name="patch",
         patch_size=4,
+        grid_size=(2, 2),
         embed_dim=8,
         in_channels=1,
         weight_init=None,
