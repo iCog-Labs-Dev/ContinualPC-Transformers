@@ -31,7 +31,10 @@ from fabricpc.training.train import (
     shard_batch,
     unshard_energies,
 )
-
+from fabricpc.core.fixed_prediction import (
+    InferenceSGDFixedPrediction,
+    fixed_prediction_inference_and_gradients,
+)
 
 def create_causal_mask(seq_len: int) -> jnp.ndarray:
     """
@@ -202,19 +205,40 @@ def get_graph_param_gradient_autoregressive(
         params=params,
     )
 
-    # Run inference
-    final_state = run_inference(params, init_state, clamps, structure)
+    # Run the matching inference and gradient-readout rule.
+    inference_obj = structure.config["inference"]
 
-    # Compute total energy (sum over nodes with in_degree>0)
+    if isinstance(inference_obj, InferenceSGDFixedPrediction):
+        grads, final_state, _feedforward_state = (
+            fixed_prediction_inference_and_gradients(
+                params,
+                init_state,
+                clamps,
+                structure,
+            )
+        )
+    else:
+        final_state = run_inference(
+            params,
+            init_state,
+            clamps,
+            structure,
+        )
+        grads = compute_local_weight_gradients(
+            params,
+            final_state,
+            structure,
+        )
+
+    # Compute total energy.
     energy = jnp.array(0.0)
     for node_name, node in structure.nodes.items():
         if node.node_info.in_degree > 0:
-            energy = energy + jnp.sum(final_state.nodes[node_name].energy)
+            energy = energy + jnp.sum(
+                final_state.nodes[node_name].energy
+            )
 
     avg_energy = energy / batch_size
-
-    # Compute local gradients
-    grads = compute_local_weight_gradients(params, final_state, structure)
 
     # Compute output cross-entropy loss for perplexity metric - not used for gradients
     output_cross_entropy = compute_loss(

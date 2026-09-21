@@ -49,6 +49,7 @@ from fabricpc.training import (
     generate_autoregressive,
 )
 from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.core.fixed_prediction import InferenceSGDFixedPrediction
 from fabricpc.nodes.transformer_v2 import create_deep_transformer
 from fabricpc.utils.data import CharDataLoader, BpeDataLoader
 import optax
@@ -174,7 +175,7 @@ def parse_args():
         "--max_train_samples",
         type=int,
         default=None,
-        help="Cap training sequences (e.g. 2000000) to bound a large BPE corpus",
+        help="Optionally cap the number of training sequences for bounded or smoke-test runs",
     )
     parser.add_argument(
         "--seed",
@@ -192,6 +193,16 @@ def parse_args():
     parser.add_argument(
         "--verbose", action="store_true", help="Print per-batch training energy"
     )
+    parser.add_argument(
+        "--inference",
+        choices=["fixed", "fixed_prediction"],
+        default="fixed",
+        help="PC inference rule: standard moving-prediction or fixed-prediction",
+    )
+    parser.add_argument(
+        "--max_norm", type=float, default=5.0,
+        help="Per-sample latent-gradient norm-clip threshold",
+    )
     return parser.parse_args(), parser
 
 
@@ -205,7 +216,19 @@ def main(args=None):
     # An explicit CLI value overrides; otherwise we fill from the tokenizer's
     # tuned constants. Done before batch_size so the tuned batch_size applies.
     use_bpe = args.tokenizer == "bpe"
-    defaults = BPE_DEFAULTS if use_bpe else CHAR_DEFAULTS
+    defaults = dict(BPE_DEFAULTS if use_bpe else CHAR_DEFAULTS)
+
+    if use_pc and args.inference == "fixed_prediction":
+        if use_bpe:
+            raise ValueError(
+                "PC-FP parameters have currently been validated only for "
+                "the character-level Transformer."
+            )
+        defaults.update(
+            infer_steps=20,
+            eta_infer=0.3864,
+        )
+
     for key, val in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, val)
@@ -245,6 +268,7 @@ def main(args=None):
             batch_size=batch_size,
             shuffle=True,
             seed=args.seed,
+            max_samples=args.max_train_samples,
         )
         test_loader = CharDataLoader(
             "test", seq_len=args.seq_len, batch_size=batch_size, shuffle=False
@@ -252,6 +276,21 @@ def main(args=None):
 
     vocab_size = train_loader.vocab_size
     char_to_ix = train_loader.token_to_idx if use_bpe else train_loader.char_to_idx
+
+    if use_pc and args.inference == "fixed_prediction":
+        inference_obj = InferenceSGDFixedPrediction(
+            eta_infer=args.eta_infer,
+            infer_steps=args.infer_steps,
+            max_norm=args.max_norm,
+            latent_decay=0.0,
+        )
+    else:
+        inference_obj = InferenceSGDNormClip(
+            eta_infer=args.eta_infer,
+            infer_steps=args.infer_steps,
+            max_norm=args.max_norm,
+            latent_decay=0.0,
+        )
 
     # --- Model ---
     structure = create_deep_transformer(
@@ -261,14 +300,19 @@ def main(args=None):
         mlp_dim=args.mlp_dim,
         seq_len=args.seq_len,
         vocab_size=vocab_size,
-        inference=InferenceSGDNormClip(
-            eta_infer=args.eta_infer,
-            infer_steps=args.infer_steps,
-            max_norm=5.0,
-            latent_decay=0.0,
-        ),
+        inference=inference_obj,
         weight_init={"type": "normal", "std": args.weight_init_std},
         dropout_rate=args.dropout_rate,
+    )
+
+    # Evaluation and generation are feed-forward. Use a zero-step solver
+    # independently of the inference rule used during training.
+    eval_inference = InferenceSGDNormClip(
+        eta_infer=args.eta_infer, infer_steps=0,
+        max_norm=args.max_norm, latent_decay=0.0,
+    )
+    eval_structure = structure._replace(
+        config={**structure.config, "inference": eval_inference}
     )
 
     # --- Train & Evaluate ---
@@ -291,6 +335,74 @@ def main(args=None):
     )
     optimizer = optax.adam(schedule)
 
+    # --- Checkpoints used by the same checkpoint audit ---
+    plot_dir = "runs/plots"
+    metrics_dir = "runs/metrics"
+    ckpt_dir = "runs/checkpoints"
+
+    os.makedirs(plot_dir, exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    if use_pc and args.inference == "fixed_prediction":
+        cond = (
+            f"pc_fp_T{args.infer_steps}_eta{args.eta_infer:g}"
+        )
+    elif use_pc:
+        cond = f"pc_fixed_T{args.infer_steps}"
+    else:
+        cond = "bp"
+    tag = f"{cond}_{args.tokenizer}_seed{args.seed}"
+
+    config_record = {
+        k: getattr(args, k)
+        for k in (
+            "embed_dim",
+            "num_heads",
+            "mlp_dim",
+            "depth",
+            "seq_len",
+            "num_epochs",
+            "lr",
+            "infer_steps",
+            "eta_infer",
+            "weight_init_std",
+            "dropout_rate",
+        )
+    }
+    config_record["per_device_batch_size"] = per_device_batch_size
+    config_record["global_batch_size"] = global_batch_size
+    config_record["n_devices"] = n_devices
+    config_record["inference"] = args.inference if use_pc else "bp"
+    config_record["max_norm"] = args.max_norm
+
+    checkpoint_config = {
+        **vars(args),
+        **config_record,
+    }
+
+    def save_checkpoint(checkpoint_params, suffix=None):
+        if suffix is None:
+            filename = f"ckpt_{tag}.pkl"
+        else:
+            filename = f"ckpt_{tag}_{suffix}.pkl"
+
+        checkpoint_path = os.path.join(ckpt_dir, filename)
+
+        checkpoint = {
+            "params": jax.device_get(checkpoint_params),
+            "config": checkpoint_config,
+        }
+
+        with open(checkpoint_path, "wb") as f:
+            pickle.dump(checkpoint, f)
+
+        print(f"Saved checkpoint to {checkpoint_path}")
+        return checkpoint_path
+
+    # Parameters before any training updates.
+    save_checkpoint(params, "init")
+
     print(f"Vocab Size: {vocab_size}")
     start = time.time()
 
@@ -312,22 +424,20 @@ def main(args=None):
     def epoch_callback(
         epoch_idx, cb_params, cb_structure, cb_config, cb_rng, *, energy=None, ce_loss=None
     ):
+        epoch_number = epoch_idx + 1
+
+        if epoch_number in {1, 3, 5}:
+            save_checkpoint(
+                cb_params,
+                f"epoch{epoch_number}",
+            )
+
         if energy is not None:
             train_energy_hist.append(float(energy))
         if ce_loss is not None:
             train_ppl_hist.append(float(jnp.exp(ce_loss)))
         
-        # force 0 inference steps at eval (no-op on this graph; avoids the
-        # adaptive solver running on an already settled state)
-        ic = cb_structure.config["inference"].config
-        eval_inf = type(cb_structure.config["inference"])(
-            eta_infer=ic["eta_infer"], infer_steps=0,
-            latent_decay=ic["latent_decay"], max_norm=ic["max_norm"], eps=ic["eps"],
-        )
-        eval_structure = cb_structure._replace(
-            config={**cb_structure.config, "inference": eval_inf}
-        )
-
+        # Use the shared zero-step eval structure (built once above).
         m = eval_fn(cb_params, eval_structure, test_loader, train_config, cb_rng)
         test_metrics_hist.append(m)
         test_ppl_hist.append(float(m["perplexity"]))
@@ -366,7 +476,7 @@ def main(args=None):
     metrics = (
         test_metrics_hist[-1] 
         if test_metrics_hist 
-        else eval_fn(trained_params, structure, test_loader, train_config, eval_key)
+        else eval_fn(trained_params, eval_structure, test_loader, train_config, eval_key)
     )
     print(f"Evaluation completed in {time.time() - eval_start:.1f}s")
 
@@ -376,36 +486,7 @@ def main(args=None):
 
     # Save metrics history & plot curves. The tag carries the seed so a
     # multi-seed sweep writes one set of files per run instead of overwriting.
-    plot_dir = "runs/plots"
-    metrics_dir = "runs/metrics"
-    os.makedirs(plot_dir, exist_ok=True)
-    os.makedirs(metrics_dir, exist_ok=True)
-    tag = f"{args.mode}_{args.tokenizer}_seed{args.seed}"
-
-    # Config record shared by the checkpoint and the metrics file.
-    config_record = {
-        k: getattr(args, k)
-        for k in (
-            "embed_dim", "num_heads", "mlp_dim", "depth", "seq_len",
-            "num_epochs", "lr", "infer_steps",
-            "eta_infer", "weight_init_std", "dropout_rate",
-        )
-    }
-    config_record["per_device_batch_size"] = per_device_batch_size
-    config_record["global_batch_size"] = global_batch_size
-    config_record["n_devices"] = n_devices
-
-    # --- Save checkpoint (per-seed, so runs don't overwrite each other) ---
-    ckpt_dir = "runs/checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt = {
-        "params": jax.device_get(trained_params),  
-        "config": {**vars(args), **config_record},
-    }
-    ckpt_file = os.path.join(ckpt_dir, f"ckpt_{tag}.pkl")
-    with open(ckpt_file, "wb") as f:
-        pickle.dump(ckpt, f)
-    print(f"Saved checkpoint to {ckpt_file}")
+    save_checkpoint(trained_params)
 
     epochs = list(range(1, len(test_ppl_hist) + 1))
     history_dict = {
@@ -459,7 +540,7 @@ def main(args=None):
     print("--- Generating ---")
     generated = generate_autoregressive(
         trained_params,
-        structure,
+        eval_structure,
         prompt,
         max_new_tokens=200,
         rng_key=gen_key,
