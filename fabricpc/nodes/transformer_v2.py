@@ -126,7 +126,11 @@ class EmbeddingNode(NodeBase):
         z_mu = params.weights["embeddings"][indices]
 
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
+        state = state._replace(
+            pre_activation=z_mu,
+            z_mu=z_mu,
+            error=error,
+        )
 
         state = node_info.node_class.energy_functional(state, node_info)
         return jnp.sum(state.energy), state
@@ -265,7 +269,11 @@ class MhaResidualNode(NodeBase):
         z_mu = skip + mha
         error = state.z_latent - z_mu
 
-        state = state._replace(z_mu=z_mu, error=error)
+        state = state._replace(
+            pre_activation=z_mu,
+            z_mu=z_mu,
+            error=error,
+        )
         state = node_info.node_class.energy_functional(state, node_info)
         return jnp.sum(state.energy), state
 
@@ -329,7 +337,11 @@ class LnMlp1Node(NodeBase):
         z_mu = type(act_obj).forward(h, act_obj.config)
 
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
+        state = state._replace(
+            pre_activation=h,
+            z_mu=z_mu,
+            error=error,
+        )
         state = node_info.node_class.energy_functional(state, node_info)
         return jnp.sum(state.energy), state
 
@@ -393,7 +405,11 @@ class Mlp2ResidualNode(NodeBase):
         z_mu = res_in + mlp2
 
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
+        state = state._replace(
+            pre_activation=z_mu,
+            z_mu=z_mu,
+            error=error,
+        )
         state = node_info.node_class.energy_functional(state, node_info)
         return jnp.sum(state.energy), state
 
@@ -450,7 +466,11 @@ class VocabProjectionNode(NodeBase):
         z_mu = type(act_obj).forward(logits, act_obj.config)
 
         error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
+        state = state._replace(
+            pre_activation=logits,
+            z_mu=z_mu,
+            error=error,
+        )
         state = node_info.node_class.energy_functional(state, node_info)
         return jnp.sum(state.energy), state
 

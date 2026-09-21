@@ -288,20 +288,17 @@ class FeedforwardStateInit(StateInitBase):
                 # node forward modifies z_mu, pre_activation, error, and energy
 
                 if node_name not in clamps:
-                    # z_latent <- z_mu, error <- 0 (since z_latent = z_mu)
-                    node_state = node_state._replace(
+                    # Preserve all forward-pass fields, including pre_activation, while
+                    # initializing the free latent to its feed-forward prediction.
+                    node_state = projected._replace(
                         z_latent=projected.z_mu,
-                        z_mu=projected.z_mu,
-                    )  # leave energy and error already initialized to zeros
-
-                else:
-                    # z_latent already set to clamp by first pass + set_latents_to_clamps;
-                    # retain newly computed z_mu/error/energy
-                    node_state = node_state._replace(
-                        z_mu=projected.z_mu,
-                        error=projected.error,
-                        energy=projected.energy,
+                        error=jnp.zeros_like(projected.error),
+                        energy=jnp.zeros_like(projected.energy),
                     )
+                else:
+                    # `projected` already retains the clamped latent and contains the newly
+                    # calculated z_mu, pre_activation, error, and energy.
+                    node_state = projected
 
                 # Update state
                 state = state._replace(nodes={**state.nodes, node_name: node_state})

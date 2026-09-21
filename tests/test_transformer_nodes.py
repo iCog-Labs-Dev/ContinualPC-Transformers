@@ -502,6 +502,70 @@ class TestTransformerBlock:
         assert output.shape == (batch_size, seq_len, vocab_size)
         assert jnp.abs(output).mean() > 0.0
 
+    def test_pre_activation_contract(self, rng_key):
+        structure = create_deep_transformer(
+            depth=1,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=8,
+            vocab_size=20,
+            inference=InferenceSGDNormClip(
+                eta_infer=0.1,
+                infer_steps=2,
+                max_norm=5.0,
+            ),
+        )
+        params = initialize_params(structure, rng_key)
+
+        inputs = jax.random.randint(
+            rng_key,
+            (2, 8),
+            minval=0,
+            maxval=20,
+        )
+        state = initialize_graph_state(
+            structure,
+            batch_size=2,
+            rng_key=rng_key,
+            clamps={"input_ids": inputs},
+            params=params,
+        )
+
+        # Identity-activation nodes.
+        for name in ("embed", "L0_mha", "L0_mlp2"):
+            node_state = state.nodes[name]
+            assert jnp.allclose(
+                node_state.pre_activation,
+                node_state.z_mu,
+                atol=1e-6,
+            ), name
+
+        # GELU node.
+        mlp1_state = state.nodes["L0_mlp1"]
+        mlp1_activation = structure.nodes["L0_mlp1"].node_info.activation
+        expected_mlp1 = type(mlp1_activation).forward(
+            mlp1_state.pre_activation,
+            mlp1_activation.config,
+        )
+        assert jnp.allclose(mlp1_state.z_mu, expected_mlp1, atol=1e-6)
+
+        # Softmax output node: pre_activation contains raw logits.
+        logits_state = state.nodes["logits"]
+        logits_activation = structure.nodes["logits"].node_info.activation
+        expected_probabilities = type(logits_activation).forward(
+            logits_state.pre_activation,
+            logits_activation.config,
+        )
+        assert jnp.allclose(
+            logits_state.z_mu,
+            expected_probabilities,
+            atol=1e-6,
+        )
+
+        for name in ("embed", "L0_mha", "L0_mlp1", "L0_mlp2", "logits"):
+            assert jnp.isfinite(state.nodes[name].pre_activation).all()
+
 
 class TestEvaluateTransformer:
 
