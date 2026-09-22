@@ -212,17 +212,7 @@ def train_backprop(
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)
-        if use_pmap:
-            device_keys = (
-                jax.random.split(epoch_rng_key, n_devices)
-                if n_devices > 1
-                else epoch_rng_key[None, :]
-            )
-            batch_keys = jax.vmap(
-                lambda key: jax.random.split(key, max_batches)
-            )(device_keys)
-        else:
-            batch_keys = jax.random.split(epoch_rng_key, max_batches)
+        batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
         batch_losses = []
         epoch_loss = 0.0
@@ -269,9 +259,6 @@ def train_backprop(
 
         if verbose:
             print(f"Epoch {epoch_idx + 1}/{total_epochs}, Loss: {avg_loss:.4f}")
-
-    if use_pmap:
-        params = jax.tree_util.tree_map(lambda value: value[0], params)
 
     return params, iter_results, epoch_results
 
@@ -428,7 +415,6 @@ def train_backprop_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
-    force_single_device: bool = False,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main autoregressive backprop training loop.
@@ -454,9 +440,8 @@ def train_backprop_autoregressive(
     """
     validate_feedforward_init(structure)
 
-    force_single = force_single_device or config.get("force_single_device", False)
-    n_devices = 1 if force_single else jax.local_device_count()
-    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+    n_devices = jax.local_device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
     opt_state = optimizer.init(params)
     if use_pmap:
@@ -727,7 +712,6 @@ def evaluate_backprop_autoregressive(
     rng_key: jax.Array,
     debug: bool = False,
     pmap_single_device: bool = False,
-    force_single_device: bool = False,
 ) -> Dict[str, float]:
 
     """
@@ -752,9 +736,8 @@ def evaluate_backprop_autoregressive(
 
     validate_feedforward_init(structure)
 
-    force_single = force_single_device or config.get("force_single_device", False)
-    n_devices = 1 if force_single else jax.local_device_count()
-    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+    n_devices = jax.local_device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
     use_causal_mask = config.get("use_causal_mask", True)
 

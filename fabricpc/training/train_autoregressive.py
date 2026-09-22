@@ -364,7 +364,6 @@ def train_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
-    force_single_device: bool = False,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main training loop for autoregressive predictive coding.
@@ -389,7 +388,6 @@ def train_autoregressive(
             accept **kwargs.
         iter_callback: Optional callback (epoch, batch_idx, loss) -> any
         pmap_single_device: Force pmap code path for testing
-        force_single_device: Force single-device JIT execution
 
     Returns:
         Tuple of (trained_params, energy_history, epoch_results)
@@ -404,9 +402,8 @@ def train_autoregressive(
     frac = num_epochs - math.floor(num_epochs)
 
     # Device detection
-    force_single = force_single_device or config.get("force_single_device", False)
-    n_devices = 1 if force_single else jax.local_device_count()
-    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+    n_devices = jax.local_device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
     if verbose:
         print(f"Training on {n_devices} device(s): {jax.devices()}")
@@ -826,7 +823,6 @@ def evaluate_autoregressive(
     rng_key: jax.Array,
     debug: bool = False,
     pmap_single_device: bool = False,
-    force_single_device: bool = False,
 ) -> Dict[str, float]:
     """
     Evaluate autoregressive model on test data.
@@ -847,7 +843,6 @@ def evaluate_autoregressive(
         rng_key: Random key
         debug: If True, print detailed diagnostics for first batch
         pmap_single_device: If True, forces pmap path on single device
-        force_single_device: If True, forces single-device JIT execution
 
     Returns:
         Dictionary of metrics
@@ -863,9 +858,8 @@ def evaluate_autoregressive(
     except TypeError:
         raise TypeError("test_loader must support len()")
 
-    force_single = force_single_device or config.get("force_single_device", False)
-    n_devices = 1 if force_single else jax.local_device_count()
-    use_pmap = not force_single and ((n_devices > 1) or pmap_single_device)
+    n_devices = jax.local_device_count()
+    use_pmap = (n_devices > 1) or pmap_single_device
 
     if use_pmap:
         epoch_key, rng_key = jax.random.split(rng_key)
