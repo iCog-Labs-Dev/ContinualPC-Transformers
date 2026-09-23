@@ -23,17 +23,15 @@ from fabricpc.graph_initialization.state_initializer import initialize_graph_sta
 
 
 def replicate_params(params: GraphParams, n_devices: int) -> GraphParams:
-    """
-    Replicate parameters across devices for pmap.
+    """Replicate single-model parameters across the pmap device axis."""
 
-    Args:
-        params: Single-device parameters
-        n_devices: Number of devices
+    def replicate_leaf(value):
+        # Remove any sharding retained from a previous pmap result before
+        # adding a fresh leading device axis.
+        value = jnp.asarray(jax.device_get(value))
+        return jnp.stack([value] * n_devices, axis=0)
 
-    Returns:
-        Replicated parameters with leading device axis
-    """
-    return jax.tree_util.tree_map(lambda x: jnp.stack([x] * n_devices), params)
+    return jax.tree_util.tree_map(replicate_leaf, params)
 
 
 def replicate_opt_state(opt_state: optax.OptState, n_devices: int) -> optax.OptState:
