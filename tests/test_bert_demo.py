@@ -10,6 +10,7 @@ import pytest
 from examples.bert_demo import (
     PC_UNSUPPORTED_MESSAGE,
     build_mlm_loader,
+    build_validation_mlm_loader,
     compute_gradient_accumulation_steps,
     derive_max_steps,
     deterministic_fraction_split,
@@ -67,6 +68,10 @@ def test_pc_pretrain_tiny_smoke(tmp_path):
             "1",
             "--checkpoint_interval",
             "1",
+            "--validation_split",
+            "validation",
+            "--max_validation_sequences",
+            "4",
             "--validation_interval",
             "0",
             "--log_interval",
@@ -134,6 +139,72 @@ def test_train_and_eval_window_shuffle_defaults_are_applied():
 
     assert train_loader.shuffle is True
     assert dev_loader.shuffle is False
+
+
+def test_validation_sequence_cap_does_not_change_train_loader():
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--data_source",
+            "tiny",
+            "--validation_split",
+            "dev",
+            "--seq_len",
+            "6",
+            "--batch_size",
+            "2",
+            "--max_validation_sequences",
+            "2",
+        ]
+    )
+    train_loader, _, _ = build_mlm_loader(args, split="train", seed=0)
+    validation_loader = build_validation_mlm_loader(args, seed=0)
+
+    assert args.max_sequences is None
+    assert train_loader.num_windows > validation_loader.num_windows
+    assert validation_loader.num_windows == 2
+    assert len(validation_loader) == 1
+
+
+@pytest.mark.parametrize("cap", ["0", "-1", "1"])
+def test_validation_sequence_cap_rejected_before_pretraining(
+    tmp_path, cap, monkeypatch
+):
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--mode",
+            "pc",
+            "--data_source",
+            "tiny",
+            "--validation_split",
+            "dev",
+            "--seq_len",
+            "6",
+            "--batch_size",
+            "2",
+            "--max_validation_sequences",
+            cap,
+            "--checkpoint",
+            str(tmp_path / "never-written.json"),
+        ]
+    )
+
+    def fail_if_loading(*_args, **_kwargs):
+        pytest.fail("training loader must not be built for an invalid validation cap")
+
+    monkeypatch.setattr("examples.bert_demo.build_mlm_loader", fail_if_loading)
+    with pytest.raises(ValueError, match="max_validation_sequences"):
+        run_pretrain(args)
+    assert not (tmp_path / "never-written.json").exists()
+
+
+def test_validation_sequence_cap_is_rejected_for_finetuning():
+    args = parse_args(["--stage", "finetune", "--max_validation_sequences", "8"])
+    with pytest.raises(ValueError, match="only valid for pretraining"):
+        run_finetune(args)
 
 
 def test_validation_mask_seed_parser_and_step_derivation(rng_key):

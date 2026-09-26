@@ -276,6 +276,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--train_epochs_equivalent", type=float, default=1.0)
     parser.add_argument("--max_sequences", type=int, default=None)
+    parser.add_argument(
+        "--max_validation_sequences",
+        type=int,
+        default=None,
+        help="Cap validation windows only; training remains unchanged.",
+    )
     parser.add_argument("--max_texts", type=int, default=None)
     parser.add_argument("--max_chars", type=int, default=100_000)
     parser.add_argument("--max_total_chars", type=int, default=100_000_000)
@@ -738,6 +744,11 @@ def build_validation_mlm_loader(
 ) -> MlmTextBatcher:
     if args.validation_split is None:
         raise ValueError("--validation_split is required")
+    _validate_validation_sequence_cap(args)
+    if args.max_validation_sequences is not None:
+        args = argparse.Namespace(
+            **{**vars(args), "max_sequences": args.max_validation_sequences}
+        )
     validation_split = args.validation_split
     if args.data_source == "hf" and validation_split == args.split:
         validation_split = "dev"
@@ -758,9 +769,22 @@ def build_validation_mlm_loader(
     return loader
 
 
+def _validate_validation_sequence_cap(args: argparse.Namespace) -> None:
+    if args.max_validation_sequences is None:
+        return
+    if not args.validation_split:
+        raise ValueError("--max_validation_sequences requires --validation_split")
+    if args.max_validation_sequences < _effective_batch_size(args):
+        raise ValueError(
+            "--max_validation_sequences must be at least the batch size "
+            "to produce a full validation batch"
+        )
+
+
 def run_pretrain(args: argparse.Namespace) -> None:
     if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
         raise ValueError("--pc_output_energy_scale must be positive for PC pretraining")
+    _validate_validation_sequence_cap(args)
     validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)
     train_loader, vocab, tokenizer_json = build_mlm_loader(
@@ -769,6 +793,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
     val_loader = None
     if args.validation_split:
         val_loader = build_validation_mlm_loader(args, seed=validation_mask_seeds[0])
+        if len(val_loader) == 0:
+            raise ValueError("validation split has no full batches")
 
     structure = create_encoder_mlm_model(
         depth=args.depth,
@@ -882,6 +908,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
 
 
 def run_finetune(args: argparse.Namespace) -> None:
+    if args.max_validation_sequences is not None:
+        raise ValueError("--max_validation_sequences is only valid for pretraining")
     _reject_unsupported_pc(args)
     if args.data_source not in {"tiny", "synthetic"}:
         raise ValueError("Fine-tuning currently supports --data_source tiny|synthetic")
