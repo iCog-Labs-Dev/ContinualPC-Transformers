@@ -53,15 +53,21 @@ def _config_training_identity(config: dict[str, Any]) -> dict[str, Any]:
         "resume_from",
         "log_interval",
         "validation_interval",
+        "init_diagnostics",
     }
     serializable = _serializable_training_config(config)
-    return _json_safe(
-        {
-            key: value
-            for key, value in serializable.items()
-            if key not in mutable_resume_keys
-        }
-    )
+    identity = {}
+    for key, value in serializable.items():
+        if key in mutable_resume_keys:
+            continue
+        if key == "optimizer_identity" and isinstance(value, dict):
+            value = {
+                sub_key: sub_value
+                for sub_key, sub_value in value.items()
+                if sub_key != "total_steps"
+            }
+        identity[key] = value
+    return _json_safe(identity)
 
 
 def _pc_training_identity(
@@ -388,8 +394,16 @@ def train_pcn_mlm(
             saved_config.get("config_training_identity")
             != checkpoint_config["config_training_identity"]
         ):
+            saved_identity = saved_config.get("config_training_identity") or {}
+            current_identity = checkpoint_config["config_training_identity"] or {}
+            mismatched = sorted(
+                key
+                for key in set(saved_identity) | set(current_identity)
+                if saved_identity.get(key) != current_identity.get(key)
+            )
             raise ValueError(
-                "Cannot resume PC MLM training with a different training config"
+                "Cannot resume PC MLM training with a different training config "
+                f"(mismatched keys: {mismatched})"
             )
         if (
             saved_config.get("pc_training_identity")
