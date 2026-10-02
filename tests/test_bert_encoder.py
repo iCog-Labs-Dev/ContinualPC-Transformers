@@ -3,12 +3,14 @@
 import os
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import jax.numpy as jnp
 import optax
+import pytest
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
@@ -21,7 +23,7 @@ from fabricpc.models.bert import (
 )
 
 
-def load_demo_build_optimizer():
+def load_demo_module():
     demo_path = (
         Path(__file__).resolve().parents[1] / "examples" / "bert_sentiment_demo.py"
     )
@@ -31,7 +33,7 @@ def load_demo_build_optimizer():
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    return module.build_optimizer
+    return module
 
 
 def build_small_encoder():
@@ -116,7 +118,7 @@ def test_future_token_can_affect_first_position_attention():
 
 
 def test_sentiment_demo_optimizer_supports_warmup_and_clipping():
-    build_optimizer = load_demo_build_optimizer()
+    build_optimizer = load_demo_module().build_optimizer
     optimizer = build_optimizer(
         learning_rate=1e-2,
         weight_decay=1e-4,
@@ -133,3 +135,72 @@ def test_sentiment_demo_optimizer_supports_warmup_and_clipping():
 
     assert updated_params["w"].shape == params["w"].shape
     assert jnp.all(jnp.isfinite(updated_params["w"]))
+
+
+def test_sentiment_demo_uses_explicit_splits_and_train_vocabulary(tmp_path, capsys):
+    demo = load_demo_module()
+    train_csv = tmp_path / "train.csv"
+    eval_csv = tmp_path / "eval.csv"
+    train_csv.write_text(
+        "text,label\npleasant film,1\nbright story,1\ndull film,0\nbad story,0\n"
+    )
+    eval_csv.write_text("text,label\nheldout pleasant,1\nheldout dull,0\n")
+
+    train_data = demo.load_examples(train_csv)
+    assert "heldout" not in demo.build_vocab(train_data)
+
+    args = demo.parse_args(
+        [
+            "--train_csv",
+            str(train_csv),
+            "--eval_csv",
+            str(eval_csv),
+            "--num_epochs",
+            "1",
+            "--batch_size",
+            "2",
+        ]
+    )
+    demo.main(args)
+    assert "epoch=1" in capsys.readouterr().out
+
+
+def test_sentiment_demo_rejects_invalid_or_shared_data(tmp_path):
+    demo = load_demo_module()
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text("text,label\nexample,other\n")
+    with pytest.raises(ValueError, match="0/1 label"):
+        demo.load_examples(train_csv)
+
+    args = demo.parse_args(
+        ["--train_csv", str(train_csv), "--eval_csv", str(train_csv)]
+    )
+    with pytest.raises(ValueError, match="different files"):
+        demo.main(args)
+
+
+def test_sentiment_evaluation_weights_uneven_batches(monkeypatch):
+    demo = load_demo_module()
+    monkeypatch.setattr(
+        demo,
+        "compute_forward_pass",
+        lambda params, structure, batch, rng_key: SimpleNamespace(
+            nodes={"classifier": SimpleNamespace(z_mu=batch["probs"])}
+        ),
+    )
+    loader = [
+        {
+            "y": jnp.array([0, 1]),
+            "probs": jnp.array([[0.9, 0.1], [0.2, 0.8]]),
+        },
+        {"y": jnp.array([0]), "probs": jnp.array([[0.25, 0.75]])},
+    ]
+
+    metrics = demo.evaluate(
+        None, SimpleNamespace(task_map={"y": "classifier"}), loader, None
+    )
+
+    assert metrics["accuracy"] == pytest.approx(2 / 3)
+    assert metrics["loss"] == pytest.approx(
+        (-jnp.log(0.9) - jnp.log(0.8) - jnp.log(0.25)) / 3
+    )

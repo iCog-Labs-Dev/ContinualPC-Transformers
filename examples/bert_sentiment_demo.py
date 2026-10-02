@@ -1,8 +1,8 @@
 """Standalone encoder-only transformer sentiment demo.
 
-The demo uses a tiny built-in dataset and a simple tokenizer so it can run
-without downloading anything. It is intentionally separate from the existing
-autoregressive transformer demos.
+The demo reads separate training and evaluation CSV files with ``text,label``
+columns. It uses a simple tokenizer and does not download data. It is
+intentionally separate from the existing autoregressive transformer demos.
 
 Scale note: this demo uses FabricPC graph-mode backprop through
 ``compute_forward_pass``, which calls ``initialize_graph_state`` for each
@@ -11,7 +11,8 @@ a production BERT-scale training loop. A future fast JAX execution path could
 bypass graph-state traversal for larger backprop baselines.
 
 Usage:
-    PYTHONPATH=. python examples/bert_sentiment_demo.py --num_epochs 5
+    PYTHONPATH=. python examples/bert_sentiment_demo.py \
+        --train_csv train.csv --eval_csv eval.csv --num_epochs 5
 """
 
 from jax_setup import set_jax_flags_before_importing_jax
@@ -19,8 +20,10 @@ from jax_setup import set_jax_flags_before_importing_jax
 set_jax_flags_before_importing_jax()
 
 import argparse
+import csv
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 import jax
@@ -35,22 +38,6 @@ from fabricpc.training.train_backprop import compute_forward_pass, train_step_ba
 PAD_TOKEN = "[PAD]"
 CLS_TOKEN = "[CLS]"
 UNK_TOKEN = "[UNK]"
-
-
-DATASET = [
-    ("a delightful and warm movie", 1),
-    ("excellent acting and lovely story", 1),
-    ("happy charming wonderful film", 1),
-    ("the plot was bright and enjoyable", 1),
-    ("a moving performance with heart", 1),
-    ("funny sweet and satisfying", 1),
-    ("a terrible and boring movie", 0),
-    ("awful acting and dull story", 0),
-    ("sad lifeless disappointing film", 0),
-    ("the plot was flat and annoying", 0),
-    ("a bad performance without heart", 0),
-    ("tedious cold and unsatisfying", 0),
-]
 
 
 @dataclass(frozen=True)
@@ -78,6 +65,24 @@ def tokenize(text: str) -> List[str]:
     return re.findall(r"[a-z']+", text.lower())
 
 
+def load_examples(path: Path) -> list[tuple[str, int]]:
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if not reader.fieldnames or not {"text", "label"}.issubset(reader.fieldnames):
+            raise ValueError(f"{path} must have text and label columns")
+
+        examples = []
+        for line_number, row in enumerate(reader, start=2):
+            text, label = row.get("text"), row.get("label")
+            if not text or not text.strip() or label not in ("0", "1"):
+                raise ValueError(f"{path}:{line_number} needs text and a 0/1 label")
+            examples.append((text, int(label)))
+
+    if not examples:
+        raise ValueError(f"{path} has no examples")
+    return examples
+
+
 def build_vocab(examples: Iterable[Tuple[str, int]]) -> dict:
     tokens = sorted({token for text, _ in examples for token in tokenize(text)})
     vocab = {PAD_TOKEN: 0, CLS_TOKEN: 1, UNK_TOKEN: 2}
@@ -96,21 +101,19 @@ def encode(text: str, vocab: dict, seq_len: int) -> List[int]:
 def evaluate(params, structure, loader, rng_key):
     correct = 0
     total = 0
-    losses = []
+    loss_sum = 0.0
     for batch in loader:
         state = compute_forward_pass(params, structure, batch, rng_key)
         probs = state.nodes[structure.task_map["y"]].z_mu
         preds = jnp.argmax(probs, axis=-1)
         correct += int(jnp.sum(preds == batch["y"]))
         total += int(batch["y"].shape[0])
-        losses.append(
-            float(
-                -jnp.mean(
-                    jnp.log(probs[jnp.arange(batch["y"].shape[0]), batch["y"]] + 1e-10)
-                )
+        loss_sum += float(
+            -jnp.sum(
+                jnp.log(probs[jnp.arange(batch["y"].shape[0]), batch["y"]] + 1e-10)
             )
         )
-    return {"accuracy": correct / total, "loss": sum(losses) / len(losses)}
+    return {"accuracy": correct / total, "loss": loss_sum / total}
 
 
 def build_optimizer(
@@ -147,7 +150,7 @@ def build_optimizer(
     return optax.chain(*transforms)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Encoder-only transformer sentiment demo"
     )
@@ -157,6 +160,8 @@ def parse_args():
         default="backprop",
         help="Training mode. PC support is intentionally deferred for this demo.",
     )
+    parser.add_argument("--train_csv", type=Path, required=True)
+    parser.add_argument("--eval_csv", type=Path, required=True)
     parser.add_argument("--seq_len", type=int, default=8)
     parser.add_argument("--embed_dim", type=int, default=32)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -179,18 +184,18 @@ def parse_args():
         help="Optional optimizer warmup steps before cosine decay.",
     )
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main(args=None):
     args = parse_args() if args is None else args
-    rng_key = jax.random.PRNGKey(args.seed)
-    vocab = build_vocab(DATASET)
+    if args.train_csv.resolve() == args.eval_csv.resolve():
+        raise ValueError("--train_csv and --eval_csv must be different files")
 
-    positives = [row for row in DATASET if row[1] == 1]
-    negatives = [row for row in DATASET if row[1] == 0]
-    train_data = positives[:5] + negatives[:5]
-    test_data = positives[5:] + negatives[5:]
+    rng_key = jax.random.PRNGKey(args.seed)
+    train_data = load_examples(args.train_csv)
+    test_data = load_examples(args.eval_csv)
+    vocab = build_vocab(train_data)
     train_loader = SentimentBatcher(train_data, vocab, args.seq_len, args.batch_size)
     test_loader = SentimentBatcher(test_data, vocab, args.seq_len, args.batch_size)
 
