@@ -132,3 +132,108 @@ def test_runner_accepts_sgd_and_single_device_config(tmp_path):
 
     assert result["summary"]["config"]["optimizer"] == "sgd"
     assert result["sequential"].num_updates == 2 * STEPS
+
+
+# --- gated sequential trainer --------------------------------------------------
+
+import jax.numpy as jnp
+import pytest
+
+from fabricpc.experiments.forgetting_benchmark.gated_trainer import (
+    GatedConfig,
+    GatedSequentialTrainer,
+    assert_records_comparable,
+)
+
+
+class OneTaskBenchmark(ShiftBenchmark):
+    tasks = ["A"]
+
+    def get_train_loader(self, index):
+        return ShiftLoader(1, steps=5)
+
+
+def _leaf_equal(a, b) -> bool:
+    return all(
+        np.array_equal(x, y)
+        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+    )
+
+
+def test_none_mode_matches_ported_plain_trainer_parameters(tmp_path):
+    params, structure = _model()
+    factory = lambda _key: (params, structure)
+    plain = SequentialTrainer(
+        model_factory=factory,
+        benchmark=OneTaskBenchmark(),
+        optimizer=optax.sgd(0.05),
+        config={"num_epochs": 1, "use_causal_mask": True, "force_single_device": True},
+        eval_config=EVAL_CONFIG,
+        verbose=False,
+    ).run(str(tmp_path / "plain"), seed=4)
+    gated = GatedSequentialTrainer(
+        model_factory=factory,
+        benchmark=OneTaskBenchmark(),
+        config=GatedConfig(lr=0.05, num_epochs=1, diag_every=2, calib_batches=2),
+        verbose=False,
+    ).run(str(tmp_path / "gated"), seed=4, mode="none")
+
+    assert gated.num_updates == plain.num_updates == 5
+    assert gated.num_tokens == plain.num_tokens
+    assert gated.theta0_hash == plain.theta0_hash
+    assert _leaf_equal(gated.final_params, plain.final_params)
+
+
+def _record(**overrides):
+    record = {
+        "contract_fingerprint": "f",
+        "theta0_hash": "t",
+        "num_tokens": 100,
+        "num_updates": 5,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_run_record_rejects_mismatched_fingerprint_or_token_count():
+    assert_records_comparable([_record(), _record()])
+    for key, value in (
+        ("contract_fingerprint", "other"),
+        ("num_tokens", 99),
+        ("theta0_hash", "other"),
+        ("num_updates", 6),
+    ):
+        with pytest.raises(ValueError):
+            assert_records_comparable([_record(), _record(**{key: value})])
+
+
+def test_surprise_two_task_smoke_learns_both_and_logs_variable_gates(tmp_path):
+    params, structure = _model()
+    trainer = GatedSequentialTrainer(
+        model_factory=lambda _key: (params, structure),
+        benchmark=ShiftBenchmark(),
+        config=GatedConfig(lr=0.2, num_epochs=2, diag_every=4, calib_batches=3),
+        verbose=False,
+    )
+    result = trainer.run(str(tmp_path), seed=3, mode="surprise")
+
+    theta_0 = load_checkpoint(tmp_path / "theta_0_checkpoint", structure)
+    bench = ShiftBenchmark()
+    for idx, name in enumerate(bench.tasks):
+        before = float(
+            evaluate_autoregressive(
+                theta_0,
+                structure,
+                bench.get_test_loader(idx),
+                EVAL_CONFIG,
+                jax.random.PRNGKey(0),
+            )["loss"]
+        )
+        assert result.performance_matrix[name][name]["loss"] < before
+
+    gates = jnp.asarray([[v for v in e["gate"].values()] for e in trainer.step_log])
+    assert float(gates.std(axis=1).max()) > 0.0
+    assert float(gates.std(axis=0).max()) > 0.0
+    assert all(v >= 0 for e in trainer.step_log for v in e["update_norm"].values())
+    assert result.run_record["num_updates"] == 2 * STEPS * 2
+    assert (tmp_path / "run_record.json").exists()
