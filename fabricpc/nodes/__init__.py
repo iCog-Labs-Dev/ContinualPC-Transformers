@@ -26,6 +26,11 @@ from fabricpc.nodes.transformer_v2 import (
     Mlp2ResidualNode,
     VocabProjectionNode,
 )
+from fabricpc.nodes.encoder_transformer import (
+    AddPositionEmbeddingNode,
+    FinalLayerNormNode,
+    MaskedVocabProjectionNode,
+)
 from fabricpc.nodes.storkey_hopfield import StorkeyHopfield
 from fabricpc.nodes.skip_connection import SkipConnection
 from fabricpc.nodes.linear_residual import LinearResidual
@@ -52,6 +57,9 @@ __all__ = [
     "LnMlp1Node",
     "Mlp2ResidualNode",
     "VocabProjectionNode",
+    "AddPositionEmbeddingNode",
+    "FinalLayerNormNode",
+    "MaskedVocabProjectionNode",
     "StorkeyHopfield",
     "SkipConnection",
     "LinearResidual",
