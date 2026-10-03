@@ -252,7 +252,11 @@ def get_graph_param_gradient_autoregressive(
 
     # Compute output cross-entropy loss for perplexity metric - not used for gradients
     output_cross_entropy = compute_loss(
-        final_state, y, structure.task_map["y"], loss_type="cross_entropy"
+        final_state,
+        y,
+        structure.task_map["y"],
+        loss_type="cross_entropy",
+        loss_mask=batch.get("loss_mask"),
     )
 
     return grads, avg_energy, output_cross_entropy, final_state
@@ -325,6 +329,7 @@ def train_step_autoregressive_pmap(
     Returns:
         Tuple of (updated_params, updated_opt_state, energy_per_device, ce_loss_per_device, final_state)
     """
+    _reject_masked_pmap_batch(batch)
     grads, avg_energy, output_cross_entropy, final_state = (
         get_graph_param_gradient_autoregressive(
             params, batch, structure, rng_key, use_causal_mask
@@ -376,6 +381,25 @@ def create_pmap_train_step_autoregressive(
         )
 
     return jax.pmap(step_fn, axis_name="devices")
+
+
+def _reject_masked_pmap_batch(batch: Dict[str, jnp.ndarray]) -> None:
+    """Refuse masked-LM batches on the pmap path (no token-weighted reduction)."""
+    if "loss_mask" in batch:
+        raise NotImplementedError(
+            "Batches with 'loss_mask' (masked-LM training) are not supported on "
+            "the multi-device pmap path yet; run on a single device, e.g. with "
+            "CUDA_VISIBLE_DEVICES=0."
+        )
+
+
+def _reject_masked_eval_batch(batch: Dict[str, jnp.ndarray], evaluator: str) -> None:
+    """Refuse masked-LM batches in evaluators that average over every position."""
+    if "loss_mask" in batch:
+        raise ValueError(
+            f"{evaluator} averages over every position; use evaluate_mlm for "
+            "batches with a 'loss_mask'"
+        )
 
 
 def _validate_pmap_batch(batch: Dict[str, jnp.ndarray], n_devices: int) -> None:
@@ -494,6 +518,7 @@ def train_autoregressive(
             batch = _convert_batch(batch_data)
 
             if use_pmap:
+                _reject_masked_pmap_batch(batch)
                 _validate_pmap_batch(batch, n_devices)
                 batch = shard_batch(batch, n_devices)
 
@@ -913,6 +938,7 @@ def evaluate_autoregressive(
         for batch_idx, batch_data in enumerate(test_loader):
             batch_key_for_step = batch_keys_per_device[:, batch_idx]
             batch = _convert_batch(batch_data)
+            _reject_masked_eval_batch(batch, "evaluate_autoregressive")
             batch_size = next(iter(batch.values())).shape[0]
 
             # Pad incomplete batches so no test data is dropped.
@@ -996,6 +1022,7 @@ def evaluate_autoregressive(
 
         for batch_idx, batch_data in enumerate(test_loader):
             batch = _convert_batch(batch_data)
+            _reject_masked_eval_batch(batch, "evaluate_autoregressive")
             batch_size = batch["x"].shape[0]
 
             # Run JIT-compiled evaluation step

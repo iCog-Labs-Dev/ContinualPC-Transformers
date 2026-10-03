@@ -28,6 +28,8 @@ from fabricpc.graph_initialization.state_initializer import (
     FeedforwardStateInit,
 )
 from fabricpc.training.train_autoregressive import (
+    _reject_masked_eval_batch,
+    _reject_masked_pmap_batch,
     _validate_pmap_batch,
     create_causal_mask,
     create_dropout_clamps,
@@ -306,17 +308,6 @@ def train_backprop(
             print(f"Epoch {epoch_idx + 1}/{total_epochs}, Loss: {avg_loss:.4f}")
 
     return params, iter_results, epoch_results
-
-
-def _reject_masked_pmap_batch(batch: Dict[str, jnp.ndarray]) -> None:
-    """Masked losses are normalised per device under pmap, which mis-weights
-    the global masked mean, so refuse them until a token-weighted reduction
-    exists."""
-    if "loss_mask" in batch:
-        raise NotImplementedError(
-            "Batches with 'loss_mask' (masked-LM training) are not supported on "
-            "the multi-device pmap path yet; run on a single device."
-        )
 
 
 def compute_loss_autoregressive(
@@ -889,11 +880,7 @@ def evaluate_backprop_autoregressive(
             batch = {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
         else:
             raise ValueError(f"Unsupported batch format: {type(batch_data)}")
-        if "loss_mask" in batch:
-            raise ValueError(
-                "evaluate_backprop_autoregressive averages over every position; "
-                "use evaluate_mlm for batches with a 'loss_mask'"
-            )
+        _reject_masked_eval_batch(batch, "evaluate_backprop_autoregressive")
 
         batch_size = batch["x"].shape[0]
         seq_len = batch["x"].shape[1]
