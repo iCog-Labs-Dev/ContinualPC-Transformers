@@ -353,3 +353,10 @@ def test_weighted_gates_alpha_zero_is_identity_and_bounded():
 
     np.testing.assert_array_equal(weighted_gates(g, h, 0.0)["a"], g["a"])
     assert float(weighted_gates(g, h, 0.5)["b"]) == 1.0
+
+
+def test_parameter_bearing_node_without_gate_is_rejected():
+    updates = jax.tree_util.tree_map(jnp.ones_like, _params())
+
+    with pytest.raises(ValueError):
+        scale_node_updates(updates, {"a": jnp.array(1.0)})
