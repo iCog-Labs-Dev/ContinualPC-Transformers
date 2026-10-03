@@ -109,12 +109,17 @@ def contract_fingerprint(
     )
 
 
-def assert_records_comparable(records: Iterable[dict[str, Any]]) -> None:
+COMPARABLE_KEYS = ("contract_fingerprint", "theta0_hash", "num_tokens", "num_updates")
+
+
+def assert_records_comparable(
+    records: Iterable[dict[str, Any]], keys: Iterable[str] = COMPARABLE_KEYS
+) -> None:
     """Raise if run records differ in fingerprint, theta_0, tokens or updates."""
     records = list(records)
     if not records:
         return
-    for key in ("contract_fingerprint", "theta0_hash", "num_tokens", "num_updates"):
+    for key in keys:
         values = {record.get(key) for record in records}
         if len(values) != 1:
             raise ValueError(f"runs are not comparable: mismatched {key}: {values}")
