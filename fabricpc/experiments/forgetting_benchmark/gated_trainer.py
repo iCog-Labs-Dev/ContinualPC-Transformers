@@ -18,6 +18,13 @@ import numpy as np
 import optax
 
 from fabricpc.core.types import GraphParams, GraphStructure
+from fabricpc.experiments.forgetting_benchmark.influence import (
+    first_order_influence,
+    influence_multipliers,
+    make_probe_loss_fn,
+    measure_update_influence,
+    rank_agreement,
+)
 from fabricpc.experiments.forgetting_benchmark.sequential_trainer import (
     SequentialResult,
     TaskResult,
@@ -35,6 +42,7 @@ from fabricpc.training.plasticity_gates import (
 from fabricpc.training.train import _convert_batch
 from fabricpc.training.train_autoregressive import (
     evaluate_autoregressive,
+    gated_update_autoregressive,
     get_graph_param_gradient_autoregressive,
     train_step_autoregressive_gated,
     validate_gated_config,
@@ -208,6 +216,12 @@ class GateEngine:
                 structure,
             )
         )
+        self._candidate = jax.jit(
+            lambda p, o, b, k, g: gated_update_autoregressive(
+                p, o, b, structure, optimizer, k, g, use_mask
+            )
+        )
+        self.probe_loss = make_probe_loss_fn(structure, use_mask, jax.random.PRNGKey(0))
         self.trainable = [
             name
             for name, node in structure.nodes.items()
@@ -241,7 +255,53 @@ class GateEngine:
         )
 
     def diagnose(self, params: GraphParams, opt_state: Any, ctx: RunContext) -> None:
-        """Read-only measurement on the probe; never alters params or opt_state."""
+        """Read-only influence measurement; never alters params or opt_state.
+
+        The candidate is the surprise-gated update on the fixed diagnostic
+        batch. Multipliers are cached for the influence condition only, but the
+        measurement runs in every condition so overhead is comparable.
+        """
+        entry: dict[str, Any] = {"step": ctx.step, "task": ctx.task_idx}
+        started = time.perf_counter()
+        if ctx.tau is None or ctx.diag_batch is None:
+            entry["skipped"] = "no calibration yet"
+        elif not ctx.probe_batches:
+            entry["skipped"] = "empty probe"
+            ctx.h = {}
+        else:
+            state = make_gate_state("surprise", ctx.tau)
+            updates, _, _, _, _, stats = self._candidate(
+                params, opt_state, ctx.diag_batch, ctx.diag_key, state
+            )
+            probe = ctx.probe_batches
+            base = float(np.mean([float(self.probe_loss(params, b)) for b in probe]))
+            influence = measure_update_influence(
+                params, updates, probe, self.probe_loss
+            )
+            first = first_order_influence(params, updates, probe, self.probe_loss)
+            multipliers = influence_multipliers(influence)
+            score = {n: float(v) for n, v in stats["score"].items()}
+            rho_exact, flagged = rank_agreement(score, influence)
+            rho_first, _ = rank_agreement(first, influence)
+            ctx.h = multipliers if ctx.mode == "influence" else {}
+            entry.update(
+                {
+                    "probe_loss": base,
+                    "probe_size": len(probe),
+                    "influence": influence,
+                    "first_order": first,
+                    "multiplier": multipliers,
+                    "surprise": score,
+                    "update_norm": {
+                        n: float(v) for n, v in stats["update_norm"].items()
+                    },
+                    "rank_surprise_vs_influence": rho_exact,
+                    "rank_first_order_vs_exact": rho_first,
+                    "high_surprise_nonpositive_influence": flagged,
+                }
+            )
+        entry["seconds"] = time.perf_counter() - started
+        ctx.diag_log.append(entry)
 
     def train_stage(
         self,
@@ -427,7 +487,28 @@ class GatedSequentialTrainer:
         return result
 
     def _prepare_probe(self, ctx: RunContext, task_idx: int) -> None:
-        """Select the diagnostic batch and probe set for the coming task."""
+        """Select the diagnostic batch and probe set for the coming task.
+
+        Probes come from training splits only; the past-task probe is empty at
+        task 0, which leaves every multiplier at one.
+        """
+        cfg = self.config
+        ctx.h = {}
+        ctx.diag_batch = take_batches(self.benchmark.get_train_loader(task_idx), 1)[0]
+        if cfg.probe_source == "current":
+            ctx.probe_batches = take_batches(
+                self.benchmark.get_train_loader(task_idx), cfg.probe_batches, skip=1
+            )
+        elif cfg.probe_source == "past":
+            ctx.probe_batches = [
+                batch
+                for past in range(task_idx)
+                for batch in take_batches(
+                    self.benchmark.get_train_loader(past), cfg.probe_batches
+                )
+            ]
+        else:
+            raise ValueError(f"unknown probe_source '{cfg.probe_source}'")
 
     def _run_record(
         self,

@@ -237,3 +237,52 @@ def test_surprise_two_task_smoke_learns_both_and_logs_variable_gates(tmp_path):
     assert all(v >= 0 for e in trainer.step_log for v in e["update_norm"].values())
     assert result.run_record["num_updates"] == 2 * STEPS * 2
     assert (tmp_path / "run_record.json").exists()
+
+
+def _influence_run(tmp_path, mode, probe_source="past", seed=3):
+    params, structure = _model()
+    trainer = GatedSequentialTrainer(
+        model_factory=lambda _key: (params, structure),
+        benchmark=ShiftBenchmark(),
+        config=GatedConfig(
+            lr=0.2,
+            num_epochs=2,
+            diag_every=4,
+            calib_batches=3,
+            probe_batches=2,
+            probe_source=probe_source,
+        ),
+        verbose=False,
+    )
+    result = trainer.run(str(tmp_path), seed=seed, mode=mode)
+    return trainer, result
+
+
+def test_influence_mode_is_neutral_at_task_zero_and_logs_diagnostics(tmp_path):
+    trainer, result = _influence_run(tmp_path, "influence")
+
+    first_task = [d for d in trainer.diag_log if d["task"] == 0]
+    second_task = [d for d in trainer.diag_log if d["task"] == 1]
+    assert first_task and all(d.get("skipped") == "empty probe" for d in first_task)
+    measured = [d for d in second_task if "influence" in d]
+    assert measured
+    assert {"probe_loss", "surprise", "multiplier", "first_order"} <= set(measured[0])
+    surprise, _ = _influence_run(tmp_path / "surprise", "surprise")
+    for got, want in zip(trainer.step_log, surprise.step_log):
+        if got["task"] == 0:
+            assert got["gate"] == want["gate"]
+    assert np.isfinite(result.performance_matrix["B"]["B"]["loss"])
+
+
+def test_diagnostics_do_not_change_none_mode_training(tmp_path):
+    params, structure = _model()
+
+    def run(diag_every, sub):
+        return GatedSequentialTrainer(
+            model_factory=lambda _key: (params, structure),
+            benchmark=ShiftBenchmark(),
+            config=GatedConfig(lr=0.1, num_epochs=1, diag_every=diag_every),
+            verbose=False,
+        ).run(str(tmp_path / sub), seed=2, mode="none")
+
+    assert _leaf_equal(run(3, "a").final_params, run(0, "b").final_params)
