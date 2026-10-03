@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import jax
-import numpy as np
 import optax
 
 import fabricpc.experiments.forgetting_benchmark.synthetic_tasks  # noqa: F401
