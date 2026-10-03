@@ -16,9 +16,6 @@ from fabricpc.utils.data.dataloader import _train_bpe_tokenizer
 
 MLM_SPECIAL_TOKENS = ["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"]
 
-# A batch that samples no masked positions is re-drawn (it would give zero loss
-# but still advance momentum-based optimizers). After this many draws (only
-# plausible for a tiny mask_prob) one eligible position is masked directly.
 _MAX_MASK_REDRAWS = 100
 
 
@@ -172,8 +169,6 @@ class MlmTextBatcher:
 
     def __iter__(self):
         starts = self.starts.copy()
-        # Seed from (seed, epoch) so loaders with nearby seeds never share an
-        # epoch's stream (seed + epoch would make seed=1/epoch 0 == seed=0/epoch 1).
         rng = np.random.default_rng([self.seed, self._epoch])
         if self.shuffle:
             rng.shuffle(starts)
@@ -203,8 +198,6 @@ class MlmTextBatcher:
         for row, start in enumerate(batch_starts):
             segment = self.token_ids[start : start + self.stream_window]
             original[row, offset : offset + len(segment)] = segment
-            # Attend by position, not token value: a pad id inside real text
-            # stays visible; only the padded tail is hidden.
             attention_mask[row, : offset + len(segment)] = True
         return original, attention_mask
 
@@ -223,7 +216,6 @@ class MlmTextBatcher:
             )
             if loss_mask.any():
                 return masked, targets, loss_mask
-        # Windows are pre-filtered to contain a maskable token, so one exists.
         eligible = np.argwhere(~np.isin(original, list(self.special_token_ids)))
         row, col = eligible[rng.integers(len(eligible))]
         loss_mask = np.zeros(original.shape, dtype=bool)

@@ -14,7 +14,7 @@ from fabricpc.utils.data import MlmTextBatcher
 
 SEQ_LEN = 8
 VOCAB_SIZE = 24
-SPECIALS = {0, 1, 2, 3}  # pad, cls, sep, mask
+SPECIALS = {0, 1, 2, 3}
 
 
 def build_model(rng_key):
@@ -31,7 +31,6 @@ def build_model(rng_key):
 
 
 def make_loader(seed=0, num_tokens=96, mask_prob=0.3):
-    # A repeating pattern is learnable within a few epochs.
     pattern = np.tile(np.arange(4, VOCAB_SIZE, dtype=np.int32), 8)[:num_tokens]
     return MlmTextBatcher(
         token_ids=pattern,

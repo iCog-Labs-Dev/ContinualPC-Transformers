@@ -659,7 +659,7 @@ def eval_step_backprop(
     else:
         true_labels = targets
 
-    # Handle sequence vs non-sequence; with a loss_mask count masked positions only
+    # Handle sequence vs non-sequence
     hits = pred_labels == true_labels
     if loss_mask is not None:
         weights = loss_mask.astype(jnp.float32)
@@ -960,8 +960,6 @@ def _masked_lm_batch_totals(
     return mean_loss * count, correct, count
 
 
-# Single-entry cache: per-epoch validation re-evaluates the same structure, so
-# reuse its compiled step instead of re-tracing on every call.
 _masked_lm_eval_cache: Dict[str, Any] = {"structure": None, "fn": None}
 
 

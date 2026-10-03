@@ -94,7 +94,6 @@ class TestAttentionMask:
             _forward(params, structure, x, _padded_mask(4), rng_key).nodes["mha"].z_mu
         )
 
-        # Residual only: zero attention output plus the (zero-initialised) b_o.
         b_o = params.nodes["mha"].biases["b_o"]
         assert jnp.allclose(z_mu[:, 4:], x[:, 4:] + b_o, atol=1e-6)
 
@@ -224,7 +223,6 @@ class TestStandardBackpropMask:
         expected_loss, _ = compute_loss_autoregressive(
             params, structure, {**batch, "loss_mask": mask}, rng_key, training=False
         )
-        # eval_step_backprop takes one-hot targets (it argmaxes them).
         one_hot_batch = {
             **batch,
             "y": jax.nn.one_hot(batch["y"], 11),

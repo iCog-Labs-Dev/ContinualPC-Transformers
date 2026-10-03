@@ -260,8 +260,6 @@ class MhaResidualNode(NodeBase):
             causal_mask = jnp.tril(jnp.ones((L, L)))
             scores = jnp.where(causal_mask == 0, -1e9, scores)
 
-        # Optional (batch, seq_len) padding mask: padded keys receive no
-        # attention and padded queries produce no attention output.
         mask_key = next((k for k in inputs if k.endswith(":attention_mask")), None)
         if mask_key is not None:
             attention_mask = inputs[mask_key].astype(bool)

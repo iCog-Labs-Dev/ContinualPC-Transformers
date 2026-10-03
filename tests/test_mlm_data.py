@@ -10,7 +10,7 @@ from fabricpc.utils.data import (
     tokenize_texts_bpe,
 )
 
-SPECIALS = {0, 1, 2, 3}  # pad, cls, sep, mask
+SPECIALS = {0, 1, 2, 3}
 
 
 def make_batcher(token_ids, **overrides):
@@ -109,7 +109,6 @@ class TestMlmTextBatcher:
         assert len(list(batcher)) == 1
 
     def test_every_batch_has_a_masked_position(self):
-        # mask_prob is tiny, so most first draws select nothing and get redrawn.
         batcher = make_batcher(np.arange(10, 50), batch_size=1, mask_prob=0.02)
 
         batches = list(batcher)
@@ -118,7 +117,6 @@ class TestMlmTextBatcher:
         assert all(batch["loss_mask"].sum() >= 1 for batch in batches)
 
     def test_tiny_mask_prob_still_masks_every_batch(self):
-        # 1e-9 never samples a mask, so the forced fallback must kick in.
         batcher = make_batcher(np.arange(10, 30), batch_size=1, mask_prob=1e-9)
 
         batches = list(batcher)
@@ -129,7 +127,6 @@ class TestMlmTextBatcher:
             assert batch["x"][position] == 3 and batch["y"][position] >= 10
 
     def test_windows_of_only_special_tokens_are_skipped(self):
-        # 10..14 fills one window; the trailing [SEP] alone would be unmaskable.
         batcher = make_batcher(np.array([10, 11, 12, 13, 14, 2]), batch_size=1)
 
         assert len(batcher) == 1
@@ -147,7 +144,6 @@ class TestMlmTextBatcher:
             make_batcher(np.arange(10, 20), **overrides)
 
     def test_attention_follows_position_not_token_value(self):
-        # Pad id 0 inside real text stays visible; only the padded tail is hidden.
         batcher = make_batcher(np.array([10, 0, 11, 12, 13, 14, 15]), stride=5)
 
         batch = next(iter(batcher))
@@ -159,7 +155,7 @@ class TestMlmTextBatcher:
         tokens = np.arange(10, 30)
         seed_one = make_batcher(tokens, seed=1, mask_prob=0.5)
         seed_zero = make_batcher(tokens, seed=0, mask_prob=0.5)
-        list(seed_zero)  # advance to epoch 1
+        list(seed_zero)
 
         first = next(iter(seed_one))
         second = next(iter(seed_zero))

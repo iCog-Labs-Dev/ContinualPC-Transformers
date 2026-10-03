@@ -71,7 +71,6 @@ class AddPositionEmbeddingNode(NodeBase):
 
     @staticmethod
     def get_slots() -> Dict[str, SlotSpec]:
-        # A pass-through add: muPC variance scaling must not rescale its input.
         return {"in": SlotSpec("in", is_multi_input=False, is_variance_scalable=False)}
 
     @staticmethod
@@ -313,7 +312,6 @@ def _build_encoder_backbone(
 
     attention_mask_node = None
     if use_attention_mask:
-        # Ones latent init: an unclamped mask means "attend to every token".
         attention_mask_node = IdentityNode(
             shape=(seq_len,), name="attention_mask", latent_init=OnesInitializer()
         )
@@ -321,8 +319,6 @@ def _build_encoder_backbone(
         tasks["attention_mask"] = attention_mask_node
 
     def add_dropout_mask(task_name: str, target: NodeBase) -> None:
-        # Same convention as create_deep_transformer: a ``dropout_*`` source
-        # node clamped by create_dropout_clamps, with ones latents as fallback.
         if dropout_rate <= 0.0:
             return
         mask_node = IdentityNode(

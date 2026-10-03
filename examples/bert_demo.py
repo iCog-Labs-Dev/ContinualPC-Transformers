@@ -151,7 +151,7 @@ def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
         init_value=0.0,
         peak_value=args.lr,
         warmup_steps=int(args.warmup_fraction * total_steps),
-        decay_steps=total_steps,  # optax counts warmup inside decay_steps
+        decay_steps=total_steps,
     )
     adamw = optax.adamw(schedule, weight_decay=args.weight_decay)
     if args.grad_clip <= 0:
@@ -221,7 +221,6 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         seq_len=args.seq_len,
         vocab_size=len(vocab),
         dropout_rate=args.dropout_rate,
-        # Unused by backprop training; required by the graph builder.
         inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
     )
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
@@ -230,8 +229,6 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
 
     num_epochs_to_run = math.ceil(args.num_epochs)
 
-    # The loop's own verbose log reports exp(loss) as "Perplexity", which is
-    # not meaningful for a masked loss, so the demo logs each epoch here.
     def validate(epoch_idx, epoch_params, structure, config, key, ce_loss, **_):
         metrics = evaluate_mlm(epoch_params, structure, val_loader, key)
         print(
