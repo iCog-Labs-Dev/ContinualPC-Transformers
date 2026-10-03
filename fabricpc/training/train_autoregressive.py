@@ -86,11 +86,20 @@ def create_dropout_clamps(
 
     return clamps
 
+def _masked_mean(values: jnp.ndarray, mask: Optional[jnp.ndarray]) -> jnp.ndarray:
+    """Mean over all entries, or over entries where ``mask`` is nonzero."""
+    if mask is None:
+        return jnp.mean(values)
+    mask = mask.astype(values.dtype)
+    return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+
 def compute_loss(
     final_state: GraphState,
     targets: jnp.ndarray,
     output_node: str,
     loss_type: str = "cross_entropy",
+    loss_mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """
     Compute differentiable loss
@@ -100,9 +109,13 @@ def compute_loss(
         targets: Target values (labels) for output node, expects one-hot for cross-entropy
         output_node: Name of the output node
         loss_type: Loss function type: "cross_entropy" or "mse"
+        loss_mask: Optional mask selecting which prediction positions enter the
+            average (e.g. masked-language-model positions). For cross-entropy it
+            must match the per-position loss shape exactly; for MSE it is
+            broadcast over trailing feature dimensions.
 
     Returns:
-        Scalar loss value (mean over batch)
+        Scalar loss value (mean over batch, or over masked positions)
     """
 
     # Get prediction from output node
@@ -116,10 +129,22 @@ def compute_loss(
         if targets.ndim == predictions.ndim - 1:
             targets = jax.nn.one_hot(targets, predictions.shape[-1])
         log_preds = jnp.log(predictions + 1e-10)
-        loss = -jnp.mean(jnp.sum(targets * log_preds, axis=-1))
+        per_item_loss = -jnp.sum(targets * log_preds, axis=-1)
+        if loss_mask is not None and loss_mask.shape != per_item_loss.shape:
+            raise ValueError(
+                "cross_entropy loss_mask shape must match per-item loss shape "
+                f"exactly; got {loss_mask.shape}, expected {per_item_loss.shape}"
+            )
+        loss = _masked_mean(per_item_loss, loss_mask)
 
     elif loss_type == "mse":
-        loss = jnp.mean((predictions - targets) ** 2)
+        per_item_loss = (predictions - targets) ** 2
+        if loss_mask is not None:
+            loss_mask = loss_mask.reshape(
+                loss_mask.shape + (1,) * (per_item_loss.ndim - loss_mask.ndim)
+            )
+            loss_mask = jnp.broadcast_to(loss_mask, per_item_loss.shape)
+        loss = _masked_mean(per_item_loss, loss_mask)
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")

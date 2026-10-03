@@ -53,11 +53,27 @@ def validate_feedforward_init(structure: GraphStructure):
         )
 
 
+def _input_clamps(
+    structure: GraphStructure, batch: Dict[str, jnp.ndarray]
+) -> Dict[str, jnp.ndarray]:
+    """Clamp every batch entry that names a task node, except the target ``y``.
+
+    Besides ``x`` this covers auxiliary source nodes such as ``attention_mask``
+    and ``loss_mask``; leaving those unclamped would give them random latents.
+    """
+    return {
+        structure.task_map[task_name]: value
+        for task_name, value in batch.items()
+        if task_name in structure.task_map and task_name != "y"
+    }
+
+
 def compute_forward_pass(
     params: GraphParams,
     structure: GraphStructure,
     batch: Dict[str, jnp.ndarray],
     rng_key: jax.Array,
+    training: bool = False,
 ) -> GraphState:
     """
     Compute forward pass for backpropagation training.
@@ -70,6 +86,7 @@ def compute_forward_pass(
         structure: Graph structure
         batch: Batch data with keys matching task_map (e.g., 'x', 'y')
         rng_key: JAX random key for state initialization
+        training: If True, sample dropout masks; otherwise clamp ones.
 
     Returns:
         graph state after feedforward pass
@@ -79,10 +96,13 @@ def compute_forward_pass(
 
     batch_size = batch["x"].shape[0]
 
-    # Clamp ONLY input node (not output!) - key difference from PC
-    clamps = {}
-    if "x" in structure.task_map:
-        clamps[structure.task_map["x"]] = batch["x"]
+    # Clamp inputs, not the output - key difference from PC
+    clamps = _input_clamps(structure, batch)
+    if any(task_name.startswith("dropout_") for task_name in structure.task_map):
+        rng_key, dropout_key = jax.random.split(rng_key)
+        clamps.update(
+            create_dropout_clamps(structure, batch_size, dropout_key, training)
+        )
 
     # Single forward pass via initialize_state with feedforward init
     state = initialize_graph_state(
@@ -263,6 +283,16 @@ def train_backprop(
     return params, iter_results, epoch_results
 
 
+def _reject_masked_pmap_batch(batch: Dict[str, jnp.ndarray]) -> None:
+    """Masked losses are normalised per device under pmap, which mis-weights
+    the global masked mean, so refuse them until a token-weighted reduction
+    exists."""
+    if "loss_mask" in batch:
+        raise NotImplementedError(
+            "Batches with 'loss_mask' (masked-LM training) are not supported on "
+            "the multi-device pmap path yet; run on a single device."
+        )
+
 
 def compute_loss_autoregressive(
     params: GraphParams,
@@ -294,8 +324,8 @@ def compute_loss_autoregressive(
     batch_size = batch["x"].shape[0]
     seq_len = batch["x"].shape[1]
 
-    # Clamp input only (not output)
-    clamps = {structure.task_map["x"]: batch["x"]}
+    # Clamp inputs (x and any auxiliary task nodes), not the output
+    clamps = _input_clamps(structure, batch)
 
     # Add an external causal mask only if the graph defines one (v1). The v2
     # decomposed MhaResidualNode masks internally via is_causal, so its task_map
@@ -325,7 +355,13 @@ def compute_loss_autoregressive(
     predictions = state.nodes[output_node].z_mu
     targets = batch["y"]
 
-    loss = compute_loss(state, targets, output_node, "cross_entropy")
+    loss = compute_loss(
+        state,
+        targets,
+        output_node,
+        "cross_entropy",
+        loss_mask=batch.get("loss_mask"),
+    )
 
     return loss, predictions
 
@@ -515,6 +551,7 @@ def train_backprop_autoregressive(
                 raise ValueError(f"Unsupported batch format: {type(batch_data)}")
 
             if use_pmap:
+                _reject_masked_pmap_batch(batch)
                 _validate_pmap_batch(batch, n_devices)
                 batch = shard_batch(batch, n_devices)
                 params, opt_state, loss, _ = step_fn(
