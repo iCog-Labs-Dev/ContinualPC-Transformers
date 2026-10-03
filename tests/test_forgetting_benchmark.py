@@ -38,7 +38,7 @@ def test_preprocess_ascii_text_normalizes_unicode_and_removes_artifacts():
         "\u201cCaf\u00e9\u201d\u2014\ufb01anc\u00e9\u2026\r\nMojibake: \u00e2\u20ac\u2122 \u6771\u4eac\x00"
     )
 
-    assert cleaned == "\"Cafe\"-fiance...\nMojibake: '"
+    assert cleaned == '"Cafe"-fiance...\nMojibake: \''
     assert all(ord(character) < 128 for character in cleaned)
     assert report["normalization"] == "ascii_v1"
     assert report["non_ascii_input_characters"] == 12
@@ -59,16 +59,24 @@ def test_sequential_benchmark_writes_versioned_cleaned_cache(tmp_path, monkeypat
 
     assert benchmark.vocab_size == ASCII_VOCAB_SIZE
     assert benchmark.preprocessing_manifest["profile"] == "ascii_v1"
-    artifact_dir = tmp_path / benchmark.preprocessing_manifest["tasks"]["fixture"][
-        "artifact_dir"
-    ]
-    assert (artifact_dir / "first_20_chars_train.txt").read_text(encoding="utf-8") == "Cafe"
-    assert (artifact_dir / "first_20_chars_test.txt").read_text(encoding="utf-8") == '"Test"'
+    artifact_dir = (
+        tmp_path / benchmark.preprocessing_manifest["tasks"]["fixture"]["artifact_dir"]
+    )
+    assert (artifact_dir / "first_20_chars_train.txt").read_text(
+        encoding="utf-8"
+    ) == "Cafe"
+    assert (artifact_dir / "first_20_chars_test.txt").read_text(
+        encoding="utf-8"
+    ) == '"Test"'
     first_report = benchmark.preprocessing_manifest["tasks"]["fixture"]["artifacts"]
 
-    cached = SequentialBenchmark(["fixture"], data_dir=str(tmp_path), max_chars_per_task=20)
+    cached = SequentialBenchmark(
+        ["fixture"], data_dir=str(tmp_path), max_chars_per_task=20
+    )
     assert cached.preprocessing_manifest["tasks"]["fixture"]["cache_hit"] is True
-    assert cached.preprocessing_manifest["tasks"]["fixture"]["artifacts"] == first_report
+    assert (
+        cached.preprocessing_manifest["tasks"]["fixture"]["artifacts"] == first_report
+    )
 
     (artifact_dir / "first_20_chars_train.txt").write_text("corrupted")
     repaired = SequentialBenchmark(
