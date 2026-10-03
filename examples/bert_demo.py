@@ -15,6 +15,7 @@ to pretrain on your own data; ``--tokenizer bpe`` needs the ``text`` extra
 Usage:
     PYTHONPATH=. python examples/bert_demo.py
     PYTHONPATH=. python examples/bert_demo.py --mode pc --pc_infer_steps 5
+    PYTHONPATH=. python examples/bert_demo.py --ab_trials 5
     PYTHONPATH=. python examples/bert_demo.py --train_file train.txt \\
         --val_file val.txt --tokenizer bpe --vocab_size 4000 --seq_len 64
 """
@@ -34,6 +35,7 @@ import numpy as np
 import optax
 
 from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.experiments.ab_experiment import ABExperiment, ABResults, ExperimentArm
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.training import (
@@ -201,6 +203,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--pc_output_energy_scale", type=float, default=1.0, help="PC only"
     )
+    parser.add_argument(
+        "--ab_trials",
+        type=int,
+        default=0,
+        help="Compare backprop vs PC over this many paired seeds (needs scipy)",
+    )
+    parser.add_argument(
+        "--ab_metric", choices=["masked_loss", "masked_accuracy"], default="masked_loss"
+    )
     args = parser.parse_args(argv)
     if (args.train_file is None) != (args.val_file is None):
         parser.error("--train_file and --val_file must be given together")
@@ -226,32 +237,39 @@ def build_model(args, vocab_size: int):
     )
 
 
-def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
-    """Pretrain and return the final validation metrics."""
-    args = parse_args(argv)
+def load_token_streams(args) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Tokenize the training and validation texts into token-id streams."""
     if args.train_file is None:
         train_texts, val_texts = TINY_TRAIN_TEXTS, TINY_VAL_TEXTS
     else:
         train_texts, val_texts = read_texts(args.train_file), read_texts(args.val_file)
-
     if args.tokenizer == "bpe":
-        train_ids, val_ids, vocab = bpe_tokenize(
-            train_texts, val_texts, args.vocab_size
-        )
-    else:
-        train_ids, val_ids, vocab = word_tokenize(train_texts, val_texts)
-    train_loader = make_loader(train_ids, vocab, args, seed=args.seed, shuffle=True)
-    val_loader = make_loader(val_ids, vocab, args, seed=args.seed + 1, shuffle=False)
-    print(
-        f"vocab={len(vocab)} train_tokens={len(train_ids)} "
-        f"val_tokens={len(val_ids)} batches_per_epoch={len(train_loader)}"
+        return bpe_tokenize(train_texts, val_texts, args.vocab_size)
+    return word_tokenize(train_texts, val_texts)
+
+
+def make_loaders(args, train_ids, val_ids, vocab, seed: int):
+    return (
+        make_loader(train_ids, vocab, args, seed=seed, shuffle=True),
+        make_loader(val_ids, vocab, args, seed=seed + 1, shuffle=False),
     )
 
+
+def print_data_summary(train_ids, val_ids, vocab, batches_per_epoch: int) -> None:
+    print(
+        f"vocab={len(vocab)} train_tokens={len(train_ids)} "
+        f"val_tokens={len(val_ids)} batches_per_epoch={batches_per_epoch}"
+    )
+
+
+def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
+    """Pretrain with ``--mode`` and return the final validation metrics."""
+    train_loader, val_loader = make_loaders(args, train_ids, val_ids, vocab, args.seed)
+    print_data_summary(train_ids, val_ids, vocab, len(train_loader))
     structure = build_model(args, vocab_size=len(vocab))
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
-
     num_epochs_to_run = math.ceil(args.num_epochs)
 
     def validate(epoch_idx, epoch_params, structure, config, key, ce_loss, **_):
@@ -276,6 +294,59 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         epoch_callback=validate,
     )
     return epoch_metrics[-1]
+
+
+def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
+    """Paired backprop-vs-PC pretraining over ``--ab_trials`` seeds.
+
+    Every trial pretrains both arms from a fresh initialisation on the same
+    loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``.
+    """
+    batches_per_epoch = len(make_loaders(args, train_ids, val_ids, vocab, 0)[0])
+    print_data_summary(train_ids, val_ids, vocab, batches_per_epoch)
+    optimizer = build_optimizer(
+        args, count_training_steps(args.num_epochs, batches_per_epoch)
+    )
+
+    def model_factory(key):
+        structure = build_model(args, vocab_size=len(vocab))
+        return initialize_params(structure, key), structure
+
+    def eval_fn(params, structure, loader, config, key):
+        return evaluate_mlm(params, structure, loader, key)
+
+    arm_a, arm_b = (
+        ExperimentArm(
+            name=mode,
+            model_factory=model_factory,
+            train_fn=TRAINERS[mode],
+            eval_fn=eval_fn,
+            optimizer=optimizer,
+            train_config={"num_epochs": args.num_epochs},
+        )
+        for mode in ("backprop", "pc")
+    )
+    results = ABExperiment(
+        arm_a=arm_a,
+        arm_b=arm_b,
+        metric=args.ab_metric,
+        data_loader_factory=lambda seed: make_loaders(
+            args, train_ids, val_ids, vocab, seed
+        ),
+        n_trials=args.ab_trials,
+        seed_offset=args.seed,
+    ).run()
+    results.print_summary()
+    return results
+
+
+def main(argv: Optional[Sequence[str]] = None):
+    """Pretrain (or compare modes with ``--ab_trials``) and return the results."""
+    args = parse_args(argv)
+    train_ids, val_ids, vocab = load_token_streams(args)
+    if args.ab_trials > 0:
+        return compare_modes(args, train_ids, val_ids, vocab)
+    return pretrain(args, train_ids, val_ids, vocab)
 
 
 if __name__ == "__main__":

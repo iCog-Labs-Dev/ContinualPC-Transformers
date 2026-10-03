@@ -135,3 +135,14 @@ def test_pc_flags_configure_inference_and_output_energy(demo):
     head_config = structure.nodes["mlm_head"].node_info.node_config
     assert head_config["output_energy_scale"] == pytest.approx(2.5)
     assert demo.TRAINERS[args.mode] is demo.train_autoregressive
+
+
+def test_ab_comparison_pretrains_both_modes_per_trial(demo):
+    pytest.importorskip("scipy")
+
+    results = demo.main(SMALL + ["--ab_trials", "2", "--num_epochs", "1"])
+
+    assert (results.arm_a_name, results.arm_b_name) == ("backprop", "pc")
+    assert results.metric == "masked_loss"
+    assert len(results.arm_a_trials) == len(results.arm_b_trials) == 2
+    assert all(trial.metric_value > 0 for trial in results.arm_b_trials)
