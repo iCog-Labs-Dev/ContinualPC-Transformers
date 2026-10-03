@@ -70,7 +70,11 @@ def _words(text: str) -> List[str]:
 def word_tokenize(
     train_texts: Sequence[str], val_texts: Sequence[str]
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
-    """Word-level vocabulary from the training texts; unknown words -> [UNK]."""
+    """Word-level vocabulary from the training texts; unknown words -> [UNK].
+
+    Words are lowercased runs of ASCII letters, digits and apostrophes; any
+    other character is dropped, so use ``--tokenizer bpe`` for non-ASCII text.
+    """
     vocab = {token: idx for idx, token in enumerate(MLM_SPECIAL_TOKENS)}
     for word in sorted({w for text in train_texts for w in _words(text)}):
         vocab.setdefault(word, len(vocab))
@@ -119,6 +123,26 @@ def make_loader(
     return loader
 
 
+def count_training_steps(num_epochs: float, batches_per_epoch: int) -> int:
+    """Optimizer steps train_backprop_autoregressive runs for ``num_epochs``.
+
+    The loop truncates a fractional final epoch to
+    ``round(fraction * batches_per_epoch)`` batches and fails if that is 0.
+    """
+    if num_epochs <= 0:
+        raise ValueError("--num_epochs must be positive")
+    whole_epochs = math.floor(num_epochs)
+    fraction = num_epochs - whole_epochs
+    final_batches = round(fraction * batches_per_epoch)
+    if fraction > 0 and final_batches == 0:
+        raise ValueError(
+            f"--num_epochs {num_epochs} leaves no batch in its final partial "
+            f"epoch ({batches_per_epoch} batches per epoch); use a whole number "
+            "or a larger fraction"
+        )
+    return whole_epochs * batches_per_epoch + final_batches
+
+
 def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
     """AdamW with linear warmup, cosine decay and global-norm clipping."""
     if not 0.0 <= args.warmup_fraction < 1.0:
@@ -139,7 +163,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BERT-style MLM pretraining")
     parser.add_argument("--train_file", type=Path, default=None)
     parser.add_argument("--val_file", type=Path, default=None)
-    parser.add_argument("--tokenizer", choices=["word", "bpe"], default="word")
+    parser.add_argument(
+        "--tokenizer",
+        choices=["word", "bpe"],
+        default="word",
+        help="word: ASCII words, no extra deps; bpe: needs the text extra",
+    )
     parser.add_argument("--vocab_size", type=int, default=4000, help="BPE only")
     parser.add_argument("--seq_len", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -197,7 +226,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
     )
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
-    total_steps = math.ceil(args.num_epochs * len(train_loader))
+    total_steps = count_training_steps(args.num_epochs, len(train_loader))
 
     def validate(epoch_idx, epoch_params, structure, config, key, **_):
         metrics = evaluate_mlm(epoch_params, structure, val_loader, key)

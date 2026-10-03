@@ -90,3 +90,16 @@ def test_optimizer_warms_up_then_decays(demo):
     assert steps[0] == pytest.approx(0.0, abs=1e-6)
     assert steps[1] < steps[2]
     assert steps[3] < steps[2]
+
+
+@pytest.mark.parametrize(
+    "num_epochs, expected", [(2, 10), (1.5, 7), (1.7, 9), (0.2, 1)]
+)
+def test_training_steps_match_the_loop_truncation(demo, num_epochs, expected):
+    assert demo.count_training_steps(num_epochs, batches_per_epoch=5) == expected
+
+
+@pytest.mark.parametrize("num_epochs", [1.1, 0, -1])
+def test_rejects_epochs_the_loop_cannot_run(demo, num_epochs):
+    with pytest.raises(ValueError, match="num_epochs"):
+        demo.count_training_steps(num_epochs, batches_per_epoch=3)
