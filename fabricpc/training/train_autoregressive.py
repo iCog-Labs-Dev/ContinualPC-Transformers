@@ -432,7 +432,9 @@ def train_autoregressive(
     Args:
         params: Initial parameters
         structure: Graph structure
-        train_loader: Data loader yielding batches with 'x' and 'y' keys
+        train_loader: Data loader yielding batches with 'x' and 'y' keys, plus
+            any auxiliary task inputs (e.g. masked-LM 'loss_mask' and
+            'attention_mask'; batches with 'loss_mask' are rejected on pmap)
         optimizer: Optax optimizer (e.g., optax.adam(1e-3))
         config: Training configuration:
             - num_epochs: Number of training epochs

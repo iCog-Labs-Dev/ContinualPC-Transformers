@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 DEMO_PATH = Path(__file__).resolve().parents[1] / "examples" / "bert_demo.py"
@@ -116,7 +117,9 @@ def test_pc_mode_pretraining_reports_validation_metrics(demo, capsys):
     metrics = demo.main(SMALL + ["--mode", "pc", "--num_epochs", "1"])
 
     assert metrics["num_masked_tokens"] > 0
-    assert "epoch 1/1 train_batch_mean_loss=" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "epoch 1/1 train_pc_inferred_loss=" in out
+    assert "train_masked_loss=" not in out
 
 
 def test_pc_flags_configure_inference_and_output_energy(demo):
@@ -145,4 +148,40 @@ def test_ab_comparison_pretrains_both_modes_per_trial(demo):
     assert (results.arm_a_name, results.arm_b_name) == ("backprop", "pc")
     assert results.metric == "masked_loss"
     assert len(results.arm_a_trials) == len(results.arm_b_trials) == 2
-    assert all(trial.metric_value > 0 for trial in results.arm_b_trials)
+    values_a = [trial.metric_value for trial in results.arm_a_trials]
+    values_b = [trial.metric_value for trial in results.arm_b_trials]
+    assert all(np.isfinite(v) and v > 0 for v in values_a + values_b)
+    assert values_a != values_b
+
+
+def test_ab_comparison_fails_before_training_without_scipy(demo, monkeypatch):
+    real_find_spec = demo.importlib.util.find_spec
+    monkeypatch.setattr(
+        demo.importlib.util,
+        "find_spec",
+        lambda name: None if name == "scipy" else real_find_spec(name),
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args(["--ab_trials", "2"])
+
+
+@pytest.mark.parametrize("infer_steps, warns", [(2, True), (10, False)])
+def test_warns_when_pc_inference_cannot_reach_early_layers(
+    demo, capsys, infer_steps, warns
+):
+    args = demo.parse_args(
+        SMALL + ["--mode", "pc", "--pc_infer_steps", str(infer_steps)]
+    )
+    train_ids, val_ids, vocab = demo.load_token_streams(args)
+    loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
+    structure = demo.build_model(args, vocab_size=len(vocab))
+    key = demo.jax.random.PRNGKey(0)
+    params = demo.initialize_params(structure, key)
+    state = loader.state_dict()
+
+    unreached = demo.warn_unreached_pc_nodes(structure, params, loader, key)
+
+    assert ("token_embeddings" in unreached) is warns
+    assert ("warning:" in capsys.readouterr().err) is warns
+    assert loader.state_dict() == state

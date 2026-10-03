@@ -5,7 +5,10 @@ Builds a bidirectional encoder (``create_encoder_mlm_model``), batches text
 with ``MlmTextBatcher`` (BERT 80/10/10 masking, padding masks) and trains it
 with the standard loops: ``train_backprop_autoregressive`` for ``--mode
 backprop`` or ``train_autoregressive`` (predictive coding) for ``--mode pc``.
-Validation reports feedforward masked-token loss and accuracy each epoch.
+Validation reports feedforward masked-token loss and accuracy each epoch,
+comparable across modes. The training loss is the backprop masked loss, or in
+PC mode ``train_pc_inferred_loss``: the masked loss after inference has moved
+the latents toward the targets, which reads lower than a feedforward loss.
 
 Without arguments it runs on a small built-in corpus with a word-level
 vocabulary (no extra dependencies). Pass text files (one document per line)
@@ -14,7 +17,7 @@ to pretrain on your own data; ``--tokenizer bpe`` needs the ``text`` extra
 
 Usage:
     PYTHONPATH=. python examples/bert_demo.py
-    PYTHONPATH=. python examples/bert_demo.py --mode pc --pc_infer_steps 5
+    PYTHONPATH=. python examples/bert_demo.py --mode pc --pc_infer_steps 10
     PYTHONPATH=. python examples/bert_demo.py --ab_trials 5
     PYTHONPATH=. python examples/bert_demo.py --train_file train.txt \\
         --val_file val.txt --tokenizer bpe --vocab_size 4000 --seq_len 64
@@ -25,12 +28,15 @@ from jax_setup import set_jax_flags_before_importing_jax
 set_jax_flags_before_importing_jax()
 
 import argparse
+import importlib.util
 import math
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 
@@ -43,6 +49,9 @@ from fabricpc.training import (
     evaluate_mlm,
     train_autoregressive,
     train_backprop_autoregressive,
+)
+from fabricpc.training.train_autoregressive import (
+    get_graph_param_gradient_autoregressive,
 )
 from fabricpc.utils.data import MLM_SPECIAL_TOKENS, MlmTextBatcher, tokenize_texts_bpe
 
@@ -197,7 +206,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--pc_infer_steps", type=int, default=5, help="PC only")
+    parser.add_argument("--pc_infer_steps", type=int, default=10, help="PC only")
     parser.add_argument("--pc_eta_infer", type=float, default=0.05, help="PC only")
     parser.add_argument("--pc_max_norm", type=float, default=5.0, help="PC only")
     parser.add_argument(
@@ -207,7 +216,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--ab_trials",
         type=int,
         default=0,
-        help="Compare backprop vs PC over this many paired seeds (needs scipy)",
+        help="Compare backprop vs PC over this many paired seeds instead of "
+        "training --mode (needs scipy, from the experiments extra)",
     )
     parser.add_argument(
         "--ab_metric", choices=["masked_loss", "masked_accuracy"], default="masked_loss"
@@ -215,6 +225,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if (args.train_file is None) != (args.val_file is None):
         parser.error("--train_file and --val_file must be given together")
+    if args.ab_trials > 0 and importlib.util.find_spec("scipy") is None:
+        parser.error("--ab_trials needs scipy: pip install -e '.[experiments]'")
     return args
 
 
@@ -262,6 +274,36 @@ def print_data_summary(train_ids, val_ids, vocab, batches_per_epoch: int) -> Non
     )
 
 
+def warn_unreached_pc_nodes(structure, params, loader, rng_key) -> List[str]:
+    """Warn about nodes whose parameters get no PC gradient on the first batch.
+
+    Starting from feedforward latents, inference moves the output error back
+    about one node per step, so too few ``--pc_infer_steps`` leave the earliest
+    layers, embeddings included, without any PC update. The loader's state is
+    restored so training sees the same batches.
+    """
+    state = loader.state_dict()
+    batch = {k: jnp.asarray(v) for k, v in next(iter(loader)).items()}
+    loader.load_state_dict(state)
+    grads, _, _, _ = get_graph_param_gradient_autoregressive(
+        params, batch, structure, rng_key
+    )
+    unreached = [
+        name
+        for name, node_grads in grads.nodes.items()
+        if jax.tree_util.tree_leaves(node_grads)
+        and not any(jnp.any(leaf) for leaf in jax.tree_util.tree_leaves(node_grads))
+    ]
+    if unreached:
+        steps = structure.config["inference"].config["infer_steps"]
+        print(
+            f"warning: with --pc_infer_steps {steps} these nodes get no PC "
+            f"gradient: {', '.join(unreached)}; increase --pc_infer_steps",
+            file=sys.stderr,
+        )
+    return unreached
+
+
 def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
     """Pretrain with ``--mode`` and return the final validation metrics."""
     train_loader, val_loader = make_loaders(args, train_ids, val_ids, vocab, args.seed)
@@ -269,14 +311,19 @@ def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
     structure = build_model(args, vocab_size=len(vocab))
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
+    if args.mode == "pc":
+        warn_unreached_pc_nodes(structure, params, train_loader, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
     num_epochs_to_run = math.ceil(args.num_epochs)
+    train_label = (
+        "train_batch_mean_loss" if args.mode == "backprop" else "train_pc_inferred_loss"
+    )
 
     def validate(epoch_idx, epoch_params, structure, config, key, ce_loss, **_):
         metrics = evaluate_mlm(epoch_params, structure, val_loader, key)
         print(
             f"epoch {epoch_idx + 1}/{num_epochs_to_run} "
-            f"train_batch_mean_loss={ce_loss:.4f} "
+            f"{train_label}={ce_loss:.4f} "
             f"val_masked_loss={metrics['masked_loss']:.4f} "
             f"val_masked_acc={metrics['masked_accuracy']:.2%} "
             f"val_tokens={metrics['num_masked_tokens']}"
@@ -300,7 +347,8 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
     """Paired backprop-vs-PC pretraining over ``--ab_trials`` seeds.
 
     Every trial pretrains both arms from a fresh initialisation on the same
-    loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``.
+    loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``. Both
+    arms share the same optimizer and settings; ``--mode`` is not used.
     """
     batches_per_epoch = len(make_loaders(args, train_ids, val_ids, vocab, 0)[0])
     print_data_summary(train_ids, val_ids, vocab, batches_per_epoch)
@@ -311,6 +359,11 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
     def model_factory(key):
         structure = build_model(args, vocab_size=len(vocab))
         return initialize_params(structure, key), structure
+
+    key = jax.random.PRNGKey(args.seed)
+    params, structure = model_factory(key)
+    train_loader, _ = make_loaders(args, train_ids, val_ids, vocab, args.seed)
+    warn_unreached_pc_nodes(structure, params, train_loader, key)
 
     def eval_fn(params, structure, loader, config, key):
         return evaluate_mlm(params, structure, loader, key)
