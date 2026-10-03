@@ -71,10 +71,16 @@ def surprise_gates(
 def scale_node_updates(
     updates: GraphParams, gates: Mapping[str, jax.Array]
 ) -> GraphParams:
-    """Multiply every weight and bias leaf of node i by gates[i]; others unchanged."""
+    """Multiply every weight and bias leaf of node i by gates[i].
+
+    Nodes without parameters may lack a gate; a parameter-bearing node without
+    one is an error.
+    """
     nodes: Dict[str, NodeParams] = {}
     for name, node_updates in updates.nodes.items():
         if name not in gates:
+            if jax.tree_util.tree_leaves(node_updates):
+                raise ValueError(f"no gate for parameter-bearing node '{name}'")
             nodes[name] = node_updates
             continue
         gate = gates[name]
