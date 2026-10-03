@@ -228,12 +228,18 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
     params = initialize_params(structure, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
 
-    def validate(epoch_idx, epoch_params, structure, config, key, **_):
+    num_epochs_to_run = math.ceil(args.num_epochs)
+
+    # The loop's own verbose log reports exp(loss) as "Perplexity", which is
+    # not meaningful for a masked loss, so the demo logs each epoch here.
+    def validate(epoch_idx, epoch_params, structure, config, key, ce_loss, **_):
         metrics = evaluate_mlm(epoch_params, structure, val_loader, key)
         print(
-            f"  val masked_loss={metrics['masked_loss']:.4f} "
-            f"masked_acc={metrics['masked_accuracy']:.2%} "
-            f"tokens={metrics['num_masked_tokens']}"
+            f"epoch {epoch_idx + 1}/{num_epochs_to_run} "
+            f"train_masked_loss={ce_loss:.4f} "
+            f"val_masked_loss={metrics['masked_loss']:.4f} "
+            f"val_masked_acc={metrics['masked_accuracy']:.2%} "
+            f"val_tokens={metrics['num_masked_tokens']}"
         )
         return metrics
 
@@ -244,6 +250,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         build_optimizer(args, total_steps),
         {"num_epochs": args.num_epochs},
         train_key,
+        verbose=False,
         epoch_callback=validate,
     )
     return epoch_metrics[-1]

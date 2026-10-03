@@ -18,8 +18,15 @@ def demo():
     return module
 
 
-def test_tiny_corpus_pretraining_reports_validation_metrics(demo):
+def test_tiny_corpus_pretraining_reports_validation_metrics(demo, capsys):
     metrics = demo.main(SMALL + ["--num_epochs", "2"])
+
+    lines = capsys.readouterr().out.splitlines()
+    epoch_lines = [line for line in lines if line.startswith("epoch ")]
+    assert len(epoch_lines) == 2
+    assert all("train_masked_loss=" in line for line in epoch_lines)
+    assert "epoch 2/2" in epoch_lines[-1]
+    assert not any("Perplexity" in line for line in lines)
 
     assert metrics["num_masked_tokens"] > 0
     assert 0.0 <= metrics["masked_accuracy"] <= 1.0
