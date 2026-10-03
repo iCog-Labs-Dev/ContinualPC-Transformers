@@ -179,10 +179,10 @@ class MaskedVocabProjectionNode(NodeBase):
 
     Takes the encoder output on ``in`` and a ``(batch, seq_len)`` MLM mask on
     ``loss_mask``. The prediction is ``softmax(logits)`` with the parameters of
-    ``VocabProjectionNode``. The per-sample energy is the masked cross-entropy,
-    normalised by the number of masked tokens in the batch and scaled by
-    ``output_energy_scale``, so in PC training unmasked positions exert no pull
-    on the latents. The activation and energy are fixed; passing
+    ``VocabProjectionNode``. The per-sample energy is the cross-entropy summed
+    over that sample's masked tokens and scaled by ``output_energy_scale``,
+    matching ``CrossEntropyEnergy`` restricted to masked positions, so in PC
+    training unmasked positions exert no pull on the latents. The activation and energy are fixed; passing
     ``activation`` or ``energy`` raises ``ValueError``.
 
     The energy depends on the ``loss_mask`` input, so ``energy_functional``
@@ -284,9 +284,8 @@ class MaskedVocabProjectionNode(NodeBase):
             loss_mask = jnp.ones(log_probs.shape[:2])
         mask = jax.lax.stop_gradient(loss_mask.astype(log_probs.dtype))
         per_token_ce = -jnp.sum(state.z_latent * log_probs, axis=-1)
-        masked_count = jnp.maximum(jnp.sum(mask), 1.0)
         scale = node_info.node_config.get("output_energy_scale", 1.0)
-        energy = scale * jnp.sum(per_token_ce * mask, axis=-1) / masked_count
+        energy = scale * jnp.sum(per_token_ce * mask, axis=-1)
         return state._replace(energy=energy)
 
 

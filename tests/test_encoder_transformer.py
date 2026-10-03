@@ -179,14 +179,14 @@ class TestEncoderForward:
 
 
 def reference_head_energy(params, state, batch, targets, scale=1.0):
-    """Masked CE normalised by the batch's masked count, from the head logits."""
+    """Masked CE summed per sample, from the head logits."""
     head = params.nodes["mlm_head"]
     hidden = state.nodes["final_layernorm"].z_mu
     logits = jnp.dot(hidden, head.weights["W_out"]) + head.biases["b_out"]
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     mask = batch["loss_mask"]
     per_token = -jnp.sum(targets * log_probs, axis=-1)
-    return scale * jnp.sum(per_token * mask, axis=-1) / jnp.maximum(mask.sum(), 1.0)
+    return scale * jnp.sum(per_token * mask, axis=-1)
 
 
 class TestMaskedVocabProjection:
@@ -331,6 +331,46 @@ class TestMaskedVocabProjection:
             original.nodes["mlm_head"].energy,
             changed.nodes["mlm_head"].energy,
             atol=1e-6,
+        )
+
+    def test_energy_is_cross_entropy_summed_over_masked_tokens(self, rng_key):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        batch = mlm_batch(loss_mask=jnp.array([[1, 0, 1, 1, 0, 0]], dtype=jnp.float32))
+        targets = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+
+        state = initialize_graph_state(
+            structure, 1, rng_key, head_clamps(structure, batch, targets), params=params
+        )
+
+        head = state.nodes["mlm_head"]
+        per_token = -jnp.sum(targets * jnp.log(head.z_mu), axis=-1)
+        expected = jnp.sum(per_token * batch["loss_mask"], axis=-1)
+        assert jnp.allclose(head.energy, expected, rtol=1e-5)
+
+    def test_energy_of_a_sample_ignores_other_samples_masks(self, rng_key):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        single = mlm_batch()
+        pair = {
+            key: jnp.concatenate([value, value], axis=0)
+            for key, value in single.items()
+        }
+        pair["loss_mask"] = pair["loss_mask"].at[1].set(1.0)
+
+        def head_energy(batch, batch_size):
+            targets = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+            state = initialize_graph_state(
+                structure,
+                batch_size,
+                rng_key,
+                head_clamps(structure, batch, targets),
+                params=params,
+            )
+            return state.nodes["mlm_head"].energy
+
+        assert jnp.allclose(
+            head_energy(pair, 2)[0], head_energy(single, 1)[0], rtol=1e-5
         )
 
     def test_energy_is_zero_and_error_raw_for_empty_mask(self, rng_key):
