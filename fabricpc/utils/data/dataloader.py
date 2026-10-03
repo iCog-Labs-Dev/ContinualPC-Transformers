@@ -17,6 +17,32 @@ _TOKENIZERS_INSTALL_HINT = (
 )
 
 
+def _train_bpe_tokenizer(
+    *,
+    vocab_size: int,
+    special_tokens,
+    files=None,
+    texts=None,
+):
+    """Train a whitespace-pretokenized BPE tokenizer on files or an iterable of
+    texts. Shared by BpeDataLoader and the MLM text pipeline."""
+    if not _TOKENIZERS_AVAILABLE:
+        raise ImportError(
+            "BPE tokenization requires the 'tokenizers' package. "
+            "Install it with: pip install -e '.[text]'"
+        )
+    if (files is None) == (texts is None):
+        raise ValueError("pass exactly one of files or texts")
+    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=list(special_tokens))
+    if files is not None:
+        tokenizer.train(files=[str(f) for f in files], trainer=trainer)
+    else:
+        tokenizer.train_from_iterator(texts, trainer=trainer)
+    return tokenizer
+
+
 class MnistLoader:
     """JAX-compatible data loader using TensorFlow Datasets.
 
@@ -494,17 +520,15 @@ class BpeDataLoader(_TokenSequenceLoader):
         if not tokenizer_path.exists():
             if verbose:
                 print(f"BpeDataLoader: training BPE tokenizer on {dataset} train split...")
-            tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
-            tokenizer.pre_tokenizer = Whitespace()
-            trainer = BpeTrainer(
-                vocab_size=vocab_size,
-                special_tokens=["[UNK]", "[BOS]", "[EOS]", "[PAD]"],
-            )
             tmp = bpe_dir / "_tmp_train.txt"
             tmp.write_text(
                 BpeDataLoader._load_split_text(dataset, "train"), encoding="utf-8"
             )
-            tokenizer.train(files=[str(tmp)], trainer=trainer)
+            tokenizer = _train_bpe_tokenizer(
+                vocab_size=vocab_size,
+                special_tokens=["[UNK]", "[BOS]", "[EOS]", "[PAD]"],
+                files=[tmp],
+            )
             tmp.unlink()
 
             tokenizer.save(str(tokenizer_path))

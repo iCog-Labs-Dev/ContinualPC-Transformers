@@ -57,6 +57,10 @@ tfds = [
     "importlib_resources",
     "tokenizers>=0.15.0",
 ]
+text = [
+    # BPE tokenization for text pipelines (e.g. masked-LM pretraining)
+    "tokenizers>=0.15.0",
+]
 experiments = [
     "scipy>=1.10.0",
 ]
@@ -82,7 +86,7 @@ cuda13 = [
 # Everything except the hardware backend. Append a backend extra for GPU
 # (e.g. ".[all,cuda12]"), or omit it for the CPU build from the base jax dependency.
 all = [
-    "fabricpc[dev,tfds,experiments,viz]",
+    "fabricpc[dev,tfds,text,experiments,viz]",
 ]
 
 [tool.setuptools]
