@@ -24,6 +24,12 @@ from fabricpc.core.types import GraphParams, GraphState, GraphStructure
 from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.training.plasticity_gates import (
+    GateFnState,
+    compute_gates,
+    local_surprise,
+    scale_node_updates,
+)
 from fabricpc.training.train import (
     _convert_batch,
     replicate_params,
@@ -291,6 +297,98 @@ def train_step_autoregressive(
         output_cross_entropy.astype(float),
         final_state,
     )
+
+
+def validate_gated_config(optimizer_cfg: Dict[str, Any]) -> None:
+    """Reject optimizer settings the gated step does not support.
+
+    The gate scales plain-SGD deltas, so momentum, adaptive optimizers, weight
+    decay, gradient accumulation and pmap would change what is being gated.
+    """
+    name = optimizer_cfg.get("name", "sgd")
+    if name != "sgd":
+        raise ValueError(f"gated training requires plain sgd, got '{name}'")
+    if optimizer_cfg.get("momentum", 0.0):
+        raise ValueError("gated training does not support momentum")
+    if optimizer_cfg.get("weight_decay", 0.0):
+        raise ValueError("gated training does not support weight decay")
+    if optimizer_cfg.get("gradient_accumulation_steps", 1) != 1:
+        raise ValueError("gated training does not support gradient accumulation")
+    if optimizer_cfg.get("pmap", False):
+        raise ValueError("gated training is single-device only")
+
+
+def gated_update_autoregressive(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+    gate_fn_state: GateFnState,
+    use_causal_mask: bool = True,
+) -> Tuple[GraphParams, optax.OptState, float, float, GraphState, Dict[str, Any]]:
+    """Gated optimizer deltas for one batch, without applying them.
+
+    Returns (scaled_updates, opt_state, avg_energy, ce_loss, final_state, stats)
+    where stats holds per-node `score`, `gate` and `update_norm` (of the scaled
+    delta).
+    """
+    grads, avg_energy, output_cross_entropy, final_state = (
+        get_graph_param_gradient_autoregressive(
+            params, batch, structure, rng_key, use_causal_mask
+        )
+    )
+    scores = local_surprise(final_state, structure)
+    gates = compute_gates(scores, gate_fn_state)
+
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    updates = scale_node_updates(updates, gates)
+    update_norm = {name: optax.tree.norm(updates.nodes[name]) for name in scores}
+    stats = {"score": scores, "gate": gates, "update_norm": update_norm}
+    return (
+        updates,
+        opt_state,
+        avg_energy.astype(float),
+        output_cross_entropy.astype(float),
+        final_state,
+        stats,
+    )
+
+
+def train_step_autoregressive_gated(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+    gate_fn_state: GateFnState,
+    use_causal_mask: bool = True,
+) -> Tuple[GraphParams, optax.OptState, float, float, GraphState, Dict[str, Any]]:
+    """
+    Single-device autoregressive step with per-node scaled SGD updates.
+
+    Gate arrays travel inside `gate_fn_state` as traced leaves, so changing
+    gate values does not recompile the step.
+
+    Returns:
+        (params, opt_state, avg_energy, ce_loss, final_state, stats)
+    """
+    updates, opt_state, avg_energy, ce_loss, final_state, stats = (
+        gated_update_autoregressive(
+            params,
+            opt_state,
+            batch,
+            structure,
+            optimizer,
+            rng_key,
+            gate_fn_state,
+            use_causal_mask,
+        )
+    )
+    params = cast(GraphParams, optax.apply_updates(params, updates))
+    return params, opt_state, avg_energy, ce_loss, final_state, stats
 
 
 def train_step_autoregressive_pmap(
