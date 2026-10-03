@@ -13,13 +13,24 @@ from fabricpc.experiments.forgetting_benchmark.forgetting_metrics import (
 )
 from fabricpc.experiments.statistics import cohens_d, paired_ttest
 
+# influence - surprise is deliberately absent: the influence gate also shrinks
+# the effective step, so only the lr-matched contrasts isolate the influence.
 CONTRASTS = (
     ("surprise", "none"),
-    ("influence", "surprise"),
-    ("surprise", "replay_gates"),
     ("surprise", "lr_matched"),
     ("surprise", "replay_gates_cross"),
+    ("surprise", "replay_gates"),
+    ("influence", "lr_matched_influence"),
+    ("influence", "lr_matched"),
     ("surprise", "lr_matched_learning"),
+)
+PRIMARY_CONTRAST = ("surprise", "none")
+PRIMARY_METRIC = "average_forgetting"
+CONTRAST_NOTE = (
+    "Primary: surprise - none on average_forgetting. All other contrasts and "
+    "metrics are descriptive and uncorrected for multiple comparisons. "
+    "influence - surprise is confounded with a smaller effective step; the "
+    "influence effect is read from influence - lr_matched_influence."
 )
 METRICS = (
     "average_forgetting",
@@ -28,6 +39,7 @@ METRICS = (
     "final_retention",
     "avg_final_ppl",
     "new_task_log_ppl",
+    "immediate_train_loss",
     "path_length",
 )
 MIN_SEEDS_FOR_INTERVAL = 5
@@ -53,6 +65,11 @@ def run_metrics(
         "final_retention": forgetting.final_retention,
         "avg_final_ppl": forgetting.avg_final,
         "new_task_log_ppl": float(np.mean(diagonal)),
+        "immediate_train_loss": (
+            float(np.mean(run_record["immediate_train_loss"]))
+            if run_record.get("immediate_train_loss")
+            else None
+        ),
         "final_ppl_per_task": {
             name: float(forgetting.matrix[i, -1]) for i, name in enumerate(task_names)
         },
@@ -65,34 +82,41 @@ def run_metrics(
 
 
 def paired_contrast(a: Sequence[float], b: Sequence[float]) -> dict[str, Any]:
-    """Signed per-seed differences a - b, with test statistics when n >= 2.
+    """Signed per-seed differences a - b.
 
-    A t interval is reported only for n >= MIN_SEEDS_FOR_INTERVAL; with fewer
-    seeds only the signed differences are meaningful.
+    t, p, Cohen's d and a t interval appear only for n >= MIN_SEEDS_FOR_INTERVAL;
+    with fewer seeds only the signed differences are given. Identical
+    differences (zero variance) are reported as such, without test statistics.
     """
     a_arr, b_arr = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
     diffs = a_arr - b_arr
+    n = int(diffs.size)
+    mean = float(diffs.mean()) if n else None
     out: dict[str, Any] = {
-        "n": int(diffs.size),
+        "n": n,
         "signed_differences": diffs.tolist(),
-        "mean_difference": float(diffs.mean()) if diffs.size else float("nan"),
+        "mean_difference": mean,
+        "t_statistic": None,
+        "p_value": None,
+        "cohens_d": None,
+        "ci95": None,
+        "zero_variance": bool(n >= 2 and np.ptp(diffs) == 0),
     }
-    if diffs.size >= 2:
-        test = paired_ttest(a_arr, b_arr)
-        out.update(
-            {
-                "t_statistic": test.t_statistic,
-                "p_value": test.p_value,
-                "cohens_d": cohens_d(a_arr, b_arr).d,
-            }
-        )
-        if diffs.size >= MIN_SEEDS_FOR_INTERVAL:
-            half = float(
-                stats.t.ppf(0.975, diffs.size - 1)
-                * diffs.std(ddof=1)
-                / math.sqrt(diffs.size)
-            )
-            out["ci95"] = [out["mean_difference"] - half, out["mean_difference"] + half]
+    if n < MIN_SEEDS_FOR_INTERVAL:
+        return out
+    if out["zero_variance"]:
+        out["ci95"] = [mean, mean]
+        return out
+    test = paired_ttest(a_arr, b_arr)
+    half = float(stats.t.ppf(0.975, n - 1) * diffs.std(ddof=1) / math.sqrt(n))
+    out.update(
+        {
+            "t_statistic": test.t_statistic,
+            "p_value": test.p_value,
+            "cohens_d": cohens_d(a_arr, b_arr).d,
+            "ci95": [mean - half, mean + half],
+        }
+    )
     return out
 
 
@@ -109,6 +133,7 @@ def summarize_contrasts(
         seeds = sorted(set(per_run[first]) & set(per_run[second]))
         summary[f"{first} - {second}"] = {
             "seeds": seeds,
+            "primary": (first, second) == PRIMARY_CONTRAST,
             **{
                 metric: paired_contrast(
                     [per_run[first][s][metric] for s in seeds],
