@@ -922,3 +922,69 @@ def evaluate_backprop_autoregressive(
         "accuracy": accuracy,
         "num_batches": num_batches,
     }
+
+
+def _masked_lm_batch_totals(
+    params: GraphParams,
+    structure: GraphStructure,
+    batch: Dict[str, jnp.ndarray],
+    rng_key: jax.Array,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return (summed masked CE, correct masked predictions, masked count)."""
+    state = compute_forward_pass(params, structure, batch, rng_key)
+    output_node = structure.task_map["y"]
+    mask = batch["loss_mask"].astype(jnp.float32)
+    count = jnp.sum(mask)
+    mean_loss = compute_loss(
+        state, batch["y"], output_node, "cross_entropy", loss_mask=mask
+    )
+    predictions = jnp.argmax(state.nodes[output_node].z_mu, axis=-1)
+    correct = jnp.sum((predictions == batch["y"]) * mask)
+    return mean_loss * count, correct, count
+
+
+def evaluate_mlm(
+    params: GraphParams,
+    structure: GraphStructure,
+    loader: Any,
+    rng_key: jax.Array,
+) -> Dict[str, float]:
+    """Masked-LM loss and accuracy over a loader, weighted by masked tokens.
+
+    Runs a feedforward pass (dropout off) on every batch and averages only
+    over ``loss_mask`` positions across the whole loader. If the loader has
+    ``state_dict``/``load_state_dict`` (e.g. ``MlmTextBatcher``), its state is
+    restored afterwards so repeated validation sees the same masks.
+
+    Returns:
+        ``masked_loss``, ``masked_accuracy`` and ``num_masked_tokens``.
+
+    Raises:
+        ValueError: If a batch lacks ``loss_mask`` or no token is masked.
+    """
+    batch_totals = jax.jit(lambda p, b, k: _masked_lm_batch_totals(p, structure, b, k))
+    saved_state = loader.state_dict() if hasattr(loader, "state_dict") else None
+    loss_sum, correct, count = 0.0, 0.0, 0.0
+    try:
+        for batch_data in loader:
+            if not isinstance(batch_data, dict) or "loss_mask" not in batch_data:
+                raise ValueError("evaluate_mlm requires dict batches with 'loss_mask'")
+            batch = {k: jnp.asarray(v) for k, v in batch_data.items()}
+            rng_key, step_key = jax.random.split(rng_key)
+            batch_loss, batch_correct, batch_count = batch_totals(
+                params, batch, step_key
+            )
+            loss_sum += float(batch_loss)
+            correct += float(batch_correct)
+            count += float(batch_count)
+    finally:
+        if saved_state is not None:
+            loader.load_state_dict(saved_state)
+
+    if count == 0:
+        raise ValueError("evaluate_mlm found no masked tokens in the loader")
+    return {
+        "masked_loss": loss_sum / count,
+        "masked_accuracy": correct / count,
+        "num_masked_tokens": int(count),
+    }
