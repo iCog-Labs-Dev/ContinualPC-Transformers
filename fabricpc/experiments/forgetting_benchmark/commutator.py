@@ -8,6 +8,7 @@ distance produced by re-drawing the batch stream (seed noise).
 
 from __future__ import annotations
 
+import itertools
 import zlib
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -128,6 +129,8 @@ def run_order(
     engine: Optional[GateEngine] = None,
     meta: Optional[dict[str, Any]] = None,
     recorder_out: Optional[dict[str, GateSchedule]] = None,
+    data_identity: Any = None,
+    settings: Any = None,
 ) -> tuple[GraphParams, float]:
     """Train the tasks in `order` from theta_0; return (theta, path_length).
 
@@ -177,7 +180,7 @@ def run_order(
                 "order": list(order),
                 "mode": mode,
                 "contract_fingerprint": contract_fingerprint(
-                    config, streams.seed, sorted(order), None
+                    config, streams.seed, sorted(order), data_identity, settings
                 ),
                 "theta0_hash": params_hash(theta_0),
                 "num_tokens": ctx.num_tokens,
@@ -188,6 +191,43 @@ def run_order(
             }
         )
     return params, ctx.path_length
+
+
+def shared_warmup(
+    theta_init: GraphParams,
+    tasks: Sequence[str],
+    streams: Streams,
+    steps: int,
+    batch_fn: BatchFn,
+    engine: GateEngine,
+    config: GatedConfig,
+) -> GraphParams:
+    """Ungated steps alternating over the tasks; the result is the shared theta_0.
+
+    Uses the same per-task batches and keys as the ordered runs, so no stream
+    outside `streams` is consumed.
+    """
+    if steps <= 0:
+        return theta_init
+    per_task = -(-steps // len(tasks))
+    if per_task > streams.steps_per_task:
+        raise ValueError("warmup is longer than the per-task stream")
+
+    def interleaved():
+        for index in range(per_task):
+            for task in tasks:
+                yield batch_fn(task, streams.indices[task][index]), streams.keys[task][
+                    index
+                ]
+
+    ctx = RunContext(
+        mode="none",
+        config=config,
+        calib_batches=[],
+        calib_key=jax.random.PRNGKey(0),
+        tau={n: 1.0 for n in engine.trainable},
+    )
+    return engine.train_stage(theta_init, itertools.islice(interleaved(), steps), ctx)
 
 
 def _l2_distance(a: GraphParams, b: GraphParams) -> float:
@@ -235,7 +275,7 @@ def commutator_report(
             "loss_ab": float(loss_ab),
             "loss_ba": float(loss_ba),
             "loss_difference": float(loss_ab) - float(loss_ba),
-            "logit_disagreement": float(np.mean(np.abs(log_ab - log_ba))),
+            "logprob_disagreement": float(np.mean(np.abs(log_ab - log_ba))),
             "tv_disagreement": float(0.5 * np.mean(np.sum(np.abs(p_ab - p_ba), -1))),
             "argmax_disagreement": float(
                 np.mean(np.argmax(p_ab, -1) != np.argmax(p_ba, -1))
