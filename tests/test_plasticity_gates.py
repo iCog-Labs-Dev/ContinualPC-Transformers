@@ -186,3 +186,170 @@ def test_gate_schedule_roundtrip(tmp_path):
     assert loaded.gates_at(3) == {"a": 0.5, "b": 0.125}
     with pytest.raises(KeyError):
         loaded.gates_at(1)
+
+
+# --- gated autoregressive step -------------------------------------------------
+
+from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.graph_initialization import initialize_params
+from fabricpc.nodes.transformer_v2 import create_deep_transformer
+from fabricpc.training.plasticity_gates import (
+    compute_gates,
+    make_gate_state,
+    weighted_gates,
+)
+from fabricpc.training.train_autoregressive import (
+    train_step_autoregressive,
+    train_step_autoregressive_gated,
+    validate_gated_config,
+)
+
+VOCAB, SEQ, BATCH = 16, 8, 4
+
+
+@pytest.fixture(scope="module")
+def tiny():
+    structure = create_deep_transformer(
+        depth=1,
+        embed_dim=16,
+        num_heads=2,
+        mlp_dim=32,
+        seq_len=SEQ,
+        vocab_size=VOCAB,
+        inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=2, max_norm=5.0),
+    )
+    params = initialize_params(structure, jax.random.PRNGKey(0))
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.integers(0, VOCAB, size=(BATCH, SEQ)), dtype=jnp.int32)
+    batch = {"x": x, "y": (x + 1) % VOCAB}
+    trainable = [n for n, nd in structure.nodes.items() if nd.node_info.in_degree > 0]
+    return structure, params, batch, trainable
+
+
+def _leaves(node_params):
+    return jax.tree_util.tree_leaves(node_params)
+
+
+def _gate_state(trainable, mode="replay", override=None, tau=1.0):
+    return make_gate_state(mode, {n: tau for n in trainable}, override=override or {})
+
+
+def test_gated_step_with_all_one_gates_matches_plain_step_exactly(tiny):
+    structure, params, batch, trainable = tiny
+    optimizer = optax.sgd(0.1)
+    opt_state = optimizer.init(params)
+    key = jax.random.PRNGKey(5)
+
+    plain = jax.jit(
+        lambda p, o, b, k: train_step_autoregressive(p, o, b, structure, optimizer, k)
+    )(params, opt_state, batch, key)
+    gated = jax.jit(
+        lambda p, o, b, k, g: train_step_autoregressive_gated(
+            p, o, b, structure, optimizer, k, g
+        )
+    )(params, opt_state, batch, key, _gate_state(trainable))
+
+    for got, want in zip(
+        jax.tree_util.tree_leaves(gated[0]), jax.tree_util.tree_leaves(plain[0])
+    ):
+        np.testing.assert_array_equal(got, want)
+    assert float(gated[2]) == float(plain[2])
+    assert float(gated[3]) == float(plain[3])
+
+
+def test_zero_gate_after_nonzero_grad_step_freezes_only_that_node(tiny):
+    structure, params, batch, trainable = tiny
+    optimizer = optax.sgd(0.1)
+    opt_state = optimizer.init(params)
+    key = jax.random.PRNGKey(5)
+    plain_params = train_step_autoregressive(
+        params, opt_state, batch, structure, optimizer, key
+    )[0]
+    moved = [
+        n
+        for n in trainable
+        if any(
+            not np.array_equal(a, b)
+            for a, b in zip(_leaves(plain_params.nodes[n]), _leaves(params.nodes[n]))
+        )
+    ]
+    assert len(moved) >= 2
+    frozen = moved[0]
+
+    state = _gate_state(trainable, override={frozen: 0.0})
+    new_params = train_step_autoregressive_gated(
+        params, opt_state, batch, structure, optimizer, key, state
+    )[0]
+
+    for a, b in zip(_leaves(new_params.nodes[frozen]), _leaves(params.nodes[frozen])):
+        np.testing.assert_array_equal(a, b)
+    for name in moved[1:]:
+        for a, b in zip(
+            _leaves(new_params.nodes[name]), _leaves(plain_params.nodes[name])
+        ):
+            np.testing.assert_array_equal(a, b)
+
+
+def test_perturbing_node_i_error_does_not_scale_other_nodes_update(tiny):
+    structure, params, batch, trainable = tiny
+    state = make_gate_state("surprise", {n: 0.5 for n in trainable})
+    base = {n: jnp.asarray(0.4) for n in trainable}
+    bumped = dict(base)
+    bumped[trainable[0]] = jnp.asarray(2.0)
+    updates = jax.tree_util.tree_map(jnp.ones_like, params)
+
+    scaled_base = scale_node_updates(updates, compute_gates(base, state))
+    scaled_bumped = scale_node_updates(updates, compute_gates(bumped, state))
+
+    for name in trainable[1:]:
+        for a, b in zip(
+            _leaves(scaled_base.nodes[name]), _leaves(scaled_bumped.nodes[name])
+        ):
+            np.testing.assert_array_equal(a, b)
+    first = trainable[0]
+    assert not np.array_equal(
+        _leaves(scaled_base.nodes[first])[0], _leaves(scaled_bumped.nodes[first])[0]
+    )
+
+
+def test_gated_step_does_not_recompile_when_gate_values_change(tiny):
+    structure, params, batch, trainable = tiny
+    optimizer = optax.sgd(0.1)
+    opt_state = optimizer.init(params)
+    traces = []
+
+    @jax.jit
+    def step(p, o, b, k, g):
+        traces.append(1)
+        return train_step_autoregressive_gated(p, o, b, structure, optimizer, k, g)
+
+    key = jax.random.PRNGKey(1)
+    for value in (0.1, 0.5, 0.9):
+        state = _gate_state(trainable, override={n: value for n in trainable})
+        step(params, opt_state, batch, key, state)
+    for tau in (0.2, 3.0):
+        step(params, opt_state, batch, key, _gate_state(trainable, "replay", tau=tau))
+
+    assert len(traces) == 1
+
+
+def test_validate_gated_config_rejects_unsupported_combinations():
+    validate_gated_config({"name": "sgd"})
+    validate_gated_config({"name": "sgd", "momentum": 0.0, "weight_decay": 0.0})
+    for bad in (
+        {"name": "adam"},
+        {"name": "sgd", "momentum": 0.9},
+        {"name": "sgd", "weight_decay": 1e-4},
+        {"name": "sgd", "gradient_accumulation_steps": 4},
+        {"name": "sgd", "pmap": True},
+    ):
+        with pytest.raises(ValueError):
+            validate_gated_config(bad)
+
+
+def test_weighted_gates_alpha_zero_is_identity_and_bounded():
+    g = {"a": jnp.asarray(0.3), "b": jnp.asarray(0.9)}
+    h = {"a": jnp.asarray(2.0), "b": jnp.asarray(2.0)}
+
+    np.testing.assert_array_equal(weighted_gates(g, h, 0.0)["a"], g["a"])
+    assert float(weighted_gates(g, h, 0.5)["b"]) == 1.0
