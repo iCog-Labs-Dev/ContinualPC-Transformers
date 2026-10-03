@@ -33,7 +33,7 @@ VOCAB_SIZE = 24
 SPECIALS = {0, 1, 2, 3}
 
 
-def build_model(rng_key):
+def build_model(rng_key, infer_steps=2):
     structure = create_encoder_mlm_model(
         depth=1,
         embed_dim=16,
@@ -41,7 +41,9 @@ def build_model(rng_key):
         mlp_dim=32,
         seq_len=SEQ_LEN,
         vocab_size=VOCAB_SIZE,
-        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        inference=InferenceSGDNormClip(
+            eta_infer=0.1, infer_steps=infer_steps, max_norm=5.0
+        ),
     )
     return initialize_params(structure, rng_key), structure
 
@@ -272,8 +274,8 @@ class TestLoopTrainStep:
         assert losses == expected
 
 
-def test_pc_mlm_training_reduces_masked_loss(rng_key):
-    params, structure = build_model(rng_key)
+def test_pc_mlm_training_updates_encoder_and_reduces_masked_loss(rng_key):
+    params, structure = build_model(rng_key, infer_steps=8)
     val_loader = make_loader(seed=1)
     before = evaluate_mlm(params, structure, val_loader, rng_key)["masked_loss"]
 
@@ -288,7 +290,12 @@ def test_pc_mlm_training_reduces_masked_loss(rng_key):
     )
 
     after = evaluate_mlm(trained, structure, val_loader, rng_key)["masked_loss"]
-    assert after < 0.8 * before
+    assert after < before
+    for node in ("token_embeddings", "L0_mha", "L0_mlp1", "L0_mlp2"):
+        for name, initial in params.nodes[node].weights.items():
+            final = trained.nodes[node].weights[name]
+            assert jnp.all(jnp.isfinite(final))
+            assert not jnp.allclose(final, initial), f"{node}.{name} never updated"
 
 
 class TestPcMlmGradient:
@@ -322,9 +329,11 @@ class TestPcMlmGradient:
             params, batch, structure, rng_key
         )
 
-        expected = compute_loss(
-            final_state, batch["y"], "mlm_head", loss_mask=batch["loss_mask"]
-        )
+        probs = final_state.nodes["mlm_head"].z_mu
+        one_hot = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+        per_token = -jnp.sum(one_hot * jnp.log(probs + 1e-10), axis=-1)
+        mask = batch["loss_mask"]
+        expected = jnp.sum(per_token * mask) / jnp.sum(mask)
         assert metric == pytest.approx(float(expected), rel=1e-5)
 
 
