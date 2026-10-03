@@ -14,7 +14,6 @@ from urllib.request import urlopen
 
 import numpy as np
 
-
 PREPROCESSING_PROFILE = "ascii_v1"
 PREPROCESSING_IMPLEMENTATION_VERSION = "1"
 ASCII_CHARACTERS = "\n" + "".join(chr(codepoint) for codepoint in range(32, 127))
@@ -122,13 +121,13 @@ def preprocess_ascii_text(text: str) -> tuple[str, dict[str, int | str]]:
         elif unicodedata.category(character).startswith("C"):
             control_characters += 1
         else:
-            transliterated = unicodedata.normalize("NFKD", character).encode(
-                "ascii", "ignore"
-            ).decode("ascii")
+            transliterated = (
+                unicodedata.normalize("NFKD", character)
+                .encode("ascii", "ignore")
+                .decode("ascii")
+            )
             transliterated = "".join(
-                candidate
-                for candidate in transliterated
-                if 32 <= ord(candidate) <= 126
+                candidate for candidate in transliterated if 32 <= ord(candidate) <= 126
             )
             if transliterated:
                 output.append(transliterated)
@@ -270,8 +269,7 @@ class CharacterTokenizer:
             self.PAD_TOKEN: 0,
             self.UNK_TOKEN: 1,
             **{
-                character: index + 2
-                for index, character in enumerate(ASCII_CHARACTERS)
+                character: index + 2 for index, character in enumerate(ASCII_CHARACTERS)
             },
         }
         self._idx_to_token = {
@@ -460,15 +458,19 @@ class SequentialBenchmark:
                 == unicodedata.unidata_version
                 and _artifact_matches_manifest(
                     train_path,
-                    train_artifact.get("output_sha256")
-                    if isinstance(train_artifact, dict)
-                    else None,
+                    (
+                        train_artifact.get("output_sha256")
+                        if isinstance(train_artifact, dict)
+                        else None
+                    ),
                 )
                 and _artifact_matches_manifest(
                     test_path,
-                    test_artifact.get("output_sha256")
-                    if isinstance(test_artifact, dict)
-                    else None,
+                    (
+                        test_artifact.get("output_sha256")
+                        if isinstance(test_artifact, dict)
+                        else None
+                    ),
                 )
             )
             if not cache_is_valid:
