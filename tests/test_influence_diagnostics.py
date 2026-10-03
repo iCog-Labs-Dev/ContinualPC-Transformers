@@ -15,6 +15,7 @@ from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.types import GraphParams, NodeParams
 from fabricpc.experiments.forgetting_benchmark.influence import (
     first_order_influence,
+    floored_fraction,
     influence_multipliers,
     make_probe_loss_fn,
     measure_update_influence,
@@ -233,3 +234,26 @@ def test_zero_update_control_on_real_model_is_zero(tiny_pc):
     influence = measure_update_influence(params, zero, [batch], loss_fn)
 
     assert all(abs(v) < 1e-7 for v in influence.values())
+
+
+def test_floor_neutralises_below_floor_nodes_and_all_below_gives_ones():
+    h = influence_multipliers({"a": 1e-9, "b": 4.0, "c": 2.0, "d": -3.0}, floor=1e-6)
+
+    assert h["a"] == 1.0
+    assert h["b"] == pytest.approx(4.0 / 3.0)
+    assert h["d"] == 0.0
+    assert influence_multipliers({"a": 1e-9, "b": -1e-9}, floor=1e-6) == {
+        "a": 1.0,
+        "b": 1.0,
+    }
+    assert floored_fraction({"a": 1e-9, "b": 4.0}, 1e-6) == 0.5
+
+
+def test_first_order_reports_unavailable_for_nonfinite_gradient():
+    def loss(params, _batch):
+        return jnp.sum(jnp.sqrt(params.nodes["a"].weights["w"] * 0.0))
+
+    params = _params(0.4)
+    updates = jax.tree_util.tree_map(jnp.ones_like, params)
+
+    assert first_order_influence(params, updates, [None], loss) is None
