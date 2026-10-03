@@ -20,7 +20,9 @@ import optax
 from fabricpc.core.types import GraphParams, GraphStructure
 from fabricpc.experiments.forgetting_benchmark.influence import (
     first_order_influence,
+    floored_fraction,
     influence_multipliers,
+    make_probe_grad_fn,
     make_probe_loss_fn,
     measure_update_influence,
     rank_agreement,
@@ -28,6 +30,7 @@ from fabricpc.experiments.forgetting_benchmark.influence import (
 from fabricpc.experiments.forgetting_benchmark.sequential_trainer import (
     SequentialResult,
     TaskResult,
+    dumps_strict,
     params_hash,
     save_checkpoint,
     save_results_matrix,
@@ -73,6 +76,9 @@ class GatedConfig:
     alpha: float = 0.5
     probe_batches: int = 2
     probe_source: str = "past"
+    influence_rel_floor: float = 1e-6
+    post_warmup_scale: float = 1.0
+    immediate_batches: int = 4
 
     def optimizer_cfg(self) -> dict[str, Any]:
         return {
@@ -101,11 +107,25 @@ def _digest(payload: Any) -> str:
 
 
 def contract_fingerprint(
-    config: GatedConfig, seed: int, tasks: list[str], data: Any
+    config: GatedConfig,
+    seed: int,
+    tasks: list[str],
+    data: Any,
+    settings: Any = None,
 ) -> str:
-    """Hash of everything conditions must share to be compared."""
+    """Hash of everything conditions must share to be compared.
+
+    `settings` carries data and model settings (sequence length, batch size,
+    sample limits, inference settings).
+    """
     return _digest(
-        {"config": config.contract(), "seed": seed, "tasks": tasks, "data": data}
+        {
+            "config": config.contract(),
+            "seed": seed,
+            "tasks": tasks,
+            "data": data,
+            "settings": settings,
+        }
     )
 
 
@@ -123,6 +143,17 @@ def assert_records_comparable(
         values = {record.get(key) for record in records}
         if len(values) != 1:
             raise ValueError(f"runs are not comparable: mismatched {key}: {values}")
+
+
+def data_manifest(benchmark: Any) -> Any:
+    """Source hashes and profile of each task's data, or None if unavailable."""
+    manifest = getattr(benchmark, "preprocessing_manifest", None)
+    if not manifest:
+        return None
+    return {
+        task: {"source": info.get("source"), "profile": info.get("profile")}
+        for task, info in manifest.get("tasks", {}).items()
+    }
 
 
 def _git_revision() -> Optional[str]:
@@ -227,6 +258,8 @@ class GateEngine:
             )
         )
         self.probe_loss = make_probe_loss_fn(structure, use_mask, jax.random.PRNGKey(0))
+        self._probe_grad = make_probe_grad_fn(self.probe_loss)
+        self.first_order_available = True
         self.trainable = [
             name
             for name, node in structure.nodes.items()
@@ -251,6 +284,9 @@ class GateEngine:
             return make_gate_state("none", {n: 1.0 for n in self.trainable})
         mode = _GATE_MODE[ctx.mode]
         override = None
+        if ctx.mode == "none" and ctx.config.post_warmup_scale != 1.0:
+            mode = "replay"
+            override = {n: ctx.config.post_warmup_scale for n in self.trainable}
         if ctx.mode == "replay_gates":
             if ctx.replay_schedule is None or ctx.step not in ctx.replay_schedule:
                 raise ValueError(f"no recorded gates for step {ctx.step}")
@@ -283,11 +319,20 @@ class GateEngine:
             influence = measure_update_influence(
                 params, updates, probe, self.probe_loss
             )
-            first = first_order_influence(params, updates, probe, self.probe_loss)
-            multipliers = influence_multipliers(influence)
+            first = None
+            if self.first_order_available:
+                first = first_order_influence(
+                    params, updates, probe, self.probe_loss, self._probe_grad
+                )
+                if first is None:
+                    self.first_order_available = False
+            floor = self.config.influence_rel_floor * abs(base)
+            multipliers = influence_multipliers(influence, floor)
             score = {n: float(v) for n, v in stats["score"].items()}
             rho_exact, flagged = rank_agreement(score, influence)
-            rho_first, _ = rank_agreement(first, influence)
+            rho_first = (
+                rank_agreement(first, influence)[0] if first is not None else None
+            )
             ctx.h = multipliers if ctx.mode == "influence" else {}
             entry.update(
                 {
@@ -295,6 +340,13 @@ class GateEngine:
                     "probe_size": len(probe),
                     "influence": influence,
                     "first_order": first,
+                    "first_order_status": (
+                        "ok"
+                        if first is not None
+                        else "unavailable: non-finite probe gradient"
+                    ),
+                    "influence_floor": floor,
+                    "floored_fraction": floored_fraction(influence, floor),
                     "multiplier": multipliers,
                     "surprise": score,
                     "update_norm": {
@@ -364,23 +416,19 @@ class GatedSequentialTrainer:
         benchmark: Any,
         config: GatedConfig,
         verbose: bool = True,
+        run_settings: Optional[dict[str, Any]] = None,
     ) -> None:
         self.model_factory = model_factory
         self.benchmark = benchmark
         self.config = config
         self.verbose = verbose
+        self.run_settings = run_settings or {}
         self.gate_schedule: Optional[GateSchedule] = None
         self.step_log: list[dict[str, Any]] = []
         self.diag_log: list[dict[str, Any]] = []
 
     def _data_manifest(self) -> Any:
-        manifest = getattr(self.benchmark, "preprocessing_manifest", None)
-        if not manifest:
-            return None
-        return {
-            task: {"source": info.get("source"), "profile": info.get("profile")}
-            for task, info in manifest.get("tasks", {}).items()
-        }
+        return data_manifest(self.benchmark)
 
     def run(
         self,
@@ -423,6 +471,7 @@ class GatedSequentialTrainer:
         task_results: list[TaskResult] = []
         performance_matrix: dict[str, dict[str, dict[str, float]]] = {}
         checkpoint_paths: list[Path] = []
+        immediate: list[float] = []
         started = time.time()
 
         for task_idx, task_name in enumerate(tasks):
@@ -433,6 +482,20 @@ class GatedSequentialTrainer:
             self._prepare_probe(ctx, task_idx)
             params = engine.train_stage(
                 params, stage_steps(loader, stage_key, cfg.num_epochs), ctx
+            )
+
+            immediate.append(
+                float(
+                    np.mean(
+                        [
+                            float(engine.probe_loss(params, b))
+                            for b in take_batches(
+                                self.benchmark.get_train_loader(task_idx),
+                                cfg.immediate_batches,
+                            )
+                        ]
+                    )
+                )
             )
 
             stage_metrics: dict[str, dict[str, float]] = {}
@@ -474,7 +537,7 @@ class GatedSequentialTrainer:
         self.step_log = ctx.step_log
         self.diag_log = ctx.diag_log
         record = self._run_record(
-            output_path, seed, mode, tasks, theta0_hash, ctx, total_time
+            output_path, seed, mode, tasks, theta0_hash, ctx, total_time, immediate
         )
         result = SequentialResult(
             task_results=task_results,
@@ -515,6 +578,11 @@ class GatedSequentialTrainer:
         else:
             raise ValueError(f"unknown probe_source '{cfg.probe_source}'")
 
+    def fingerprint(self, seed: int, tasks: list[str]) -> str:
+        return contract_fingerprint(
+            self.config, seed, tasks, self._data_manifest(), self.run_settings
+        )
+
     def _run_record(
         self,
         output_path: Path,
@@ -524,6 +592,7 @@ class GatedSequentialTrainer:
         theta0_hash: str,
         ctx: RunContext,
         total_time: float,
+        immediate: list[float],
     ) -> dict[str, Any]:
         data = self._data_manifest()
         return {
@@ -532,9 +601,7 @@ class GatedSequentialTrainer:
             "seed": seed,
             "config": asdict(self.config),
             "tasks": tasks,
-            "contract_fingerprint": contract_fingerprint(
-                self.config, seed, tasks, data
-            ),
+            "contract_fingerprint": self.fingerprint(seed, tasks),
             "data_hashes": data,
             "theta0_hash": theta0_hash,
             "device": [str(device) for device in jax.devices()],
@@ -544,6 +611,7 @@ class GatedSequentialTrainer:
             "num_updates": ctx.num_updates,
             "num_tokens": ctx.num_tokens,
             "path_length": ctx.path_length,
+            "immediate_train_loss": immediate,
             "commands": [sys.argv],
             "status": "completed",
         }
@@ -568,12 +636,12 @@ class GatedSequentialTrainer:
             output_path,
         )
         (output_path / "run_record.json").write_text(
-            json.dumps(record, indent=2, default=str), encoding="utf-8"
+            dumps_strict(record, indent=2), encoding="utf-8"
         )
         with open(output_path / "step_log.jsonl", "w", encoding="utf-8") as handle:
             for entry in ctx.step_log:
-                handle.write(json.dumps(entry) + "\n")
+                handle.write(dumps_strict(entry) + "\n")
         with open(output_path / "diagnostics.jsonl", "w", encoding="utf-8") as handle:
             for entry in ctx.diag_log:
-                handle.write(json.dumps(entry) + "\n")
+                handle.write(dumps_strict(entry) + "\n")
         ctx.recorder.save(output_path / "gate_schedule.json")

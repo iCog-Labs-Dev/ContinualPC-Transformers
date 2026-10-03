@@ -39,7 +39,7 @@ def save_checkpoint(
     np.savez_compressed(checkpoint_dir / "params.npz", **arrays)
     if metadata is not None:
         (checkpoint_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2), encoding="utf-8"
+            dumps_strict(metadata, indent=2), encoding="utf-8"
         )
     return checkpoint_dir
 
@@ -63,6 +63,23 @@ def load_checkpoint(checkpoint_dir: Path, structure: GraphStructure) -> GraphPar
     return GraphParams(nodes=nodes)
 
 
+def _sanitize(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def dumps_strict(obj: Any, **kwargs: Any) -> str:
+    """JSON text with non-finite floats mapped to null (never NaN/Infinity)."""
+    return json.dumps(_sanitize(obj), allow_nan=False, default=str, **kwargs)
+
+
 def params_hash(params: GraphParams) -> str:
     """Return a SHA-256 digest over every parameter leaf, name and value."""
     digest = hashlib.sha256()
@@ -81,7 +98,7 @@ def save_results_matrix(results: dict[str, Any], output_dir: Path) -> None:
     """Write the triangular per-stage evaluation matrix as JSON."""
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "forgetting_results.json").write_text(
-        json.dumps(results, indent=2), encoding="utf-8"
+        dumps_strict(results, indent=2), encoding="utf-8"
     )
 
 

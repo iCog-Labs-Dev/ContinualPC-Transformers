@@ -1,5 +1,6 @@
 """Tests for the plain-PC and gated sequential character benchmarks."""
 
+import json
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -286,3 +287,54 @@ def test_diagnostics_do_not_change_none_mode_training(tmp_path):
         ).run(str(tmp_path / sub), seed=2, mode="none")
 
     assert _leaf_equal(run(3, "a").final_params, run(0, "b").final_params)
+
+
+def test_strict_json_maps_nonfinite_to_null():
+    from fabricpc.experiments.forgetting_benchmark.sequential_trainer import (
+        dumps_strict,
+    )
+
+    text = dumps_strict(
+        {"a": float("nan"), "b": [float("inf"), 1.5], "c": np.float32(2)}
+    )
+
+    assert json.loads(text) == {"a": None, "b": [None, 1.5], "c": 2.0}
+
+
+def test_constant_post_warmup_scale_follows_the_surprise_schedule_shape(tmp_path):
+    params, structure = _model()
+    trainer = GatedSequentialTrainer(
+        model_factory=lambda _key: (params, structure),
+        benchmark=ShiftBenchmark(),
+        config=GatedConfig(
+            lr=0.1,
+            num_epochs=1,
+            diag_every=0,
+            calib_batches=2,
+            warmup_steps=5,
+            post_warmup_scale=0.5,
+        ),
+        verbose=False,
+        run_settings={"seq_len": SEQ},
+    )
+    result = trainer.run(str(tmp_path), seed=1, mode="none")
+
+    gates = [set(e["gate"].values()) for e in trainer.step_log]
+    assert all(g == {1.0} for g in gates[:5])
+    assert all(g == {0.5} for g in gates[5:])
+    assert len(result.run_record["immediate_train_loss"]) == 2
+
+
+def test_fingerprint_depends_on_run_settings(tmp_path):
+    params, structure = _model()
+
+    def fingerprint(settings):
+        return GatedSequentialTrainer(
+            lambda _key: (params, structure),
+            ShiftBenchmark(),
+            GatedConfig(),
+            run_settings=settings,
+        ).fingerprint(0, ["A", "B"])
+
+    assert fingerprint({"seq_len": 8}) == fingerprint({"seq_len": 8})
+    assert fingerprint({"seq_len": 8}) != fingerprint({"seq_len": 16})
