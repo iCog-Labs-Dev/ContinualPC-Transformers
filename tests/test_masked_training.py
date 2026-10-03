@@ -22,7 +22,10 @@ from fabricpc.training.train_autoregressive import compute_loss
 from fabricpc.training.train_backprop import (
     compute_forward_pass,
     compute_loss_autoregressive,
+    eval_step_backprop,
+    evaluate_backprop_autoregressive,
     train_backprop_autoregressive,
+    train_step_backprop,
 )
 
 SEQ_LEN = 6
@@ -210,6 +213,52 @@ class TestComputeLossAutoregressiveMask:
         assert unmasked == pytest.approx(float(jnp.mean(per_token)), rel=1e-5)
 
 
+class TestStandardBackpropMask:
+    """train_step_backprop / eval_step_backprop honour batch['loss_mask']."""
+
+    def test_eval_step_scores_only_masked_positions(self, tiny_lm, rng_key):
+        params, structure = tiny_lm
+        batch = _token_batch(rng_key)
+        mask = jnp.zeros((4, SEQ_LEN)).at[:, :2].set(1.0)
+
+        expected_loss, _ = compute_loss_autoregressive(
+            params, structure, {**batch, "loss_mask": mask}, rng_key, training=False
+        )
+        # eval_step_backprop takes one-hot targets (it argmaxes them).
+        one_hot_batch = {
+            **batch,
+            "y": jax.nn.one_hot(batch["y"], 11),
+            "loss_mask": mask,
+        }
+        loss, correct, total = eval_step_backprop(
+            params, one_hot_batch, structure, rng_key
+        )
+
+        assert total == 8
+        assert 0 <= correct <= 8
+        assert loss == pytest.approx(float(expected_loss), rel=1e-5)
+
+    def test_train_step_ignores_unmasked_targets(self, tiny_lm, rng_key):
+        params, structure = tiny_lm
+        batch = _token_batch(rng_key)
+        mask = jnp.zeros((4, SEQ_LEN)).at[:, 0].set(1.0)
+        changed_targets = batch["y"].at[:, 1:].set((batch["y"][:, 1:] + 1) % 11)
+        optimizer = optax.sgd(1e-2)
+
+        def step(targets):
+            masked = {**batch, "y": targets, "loss_mask": mask}
+            new_params, _, _ = train_step_backprop(
+                params, optimizer.init(params), masked, structure, optimizer, rng_key
+            )
+            return new_params
+
+        a, b = step(batch["y"]), step(changed_targets)
+        assert all(
+            jnp.allclose(x, y)
+            for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+        )
+
+
 class _ListLoader:
     def __init__(self, batches):
         self.batches = batches
@@ -219,6 +268,23 @@ class _ListLoader:
 
     def __iter__(self):
         return iter(self.batches)
+
+
+class TestAutoregressiveEvaluatorRejectsMaskedBatches:
+    def test_points_to_evaluate_mlm(self, tiny_lm, rng_key):
+        params, structure = tiny_lm
+        batch = {**_token_batch(rng_key), "loss_mask": jnp.ones((4, SEQ_LEN))}
+
+        for pmap_single_device in (False, True):
+            with pytest.raises(ValueError, match="evaluate_mlm"):
+                evaluate_backprop_autoregressive(
+                    params,
+                    structure,
+                    _ListLoader([batch]),
+                    {},
+                    rng_key,
+                    pmap_single_device=pmap_single_device,
+                )
 
 
 class TestMaskedPmapGuard:

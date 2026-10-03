@@ -86,6 +86,7 @@ def create_dropout_clamps(
 
     return clamps
 
+
 def _masked_mean(values: jnp.ndarray, mask: Optional[jnp.ndarray]) -> jnp.ndarray:
     """Mean over all entries, or over entries where ``mask`` is nonzero."""
     if mask is None:

@@ -117,11 +117,54 @@ class TestMlmTextBatcher:
         assert len(batches) == 8
         assert all(batch["loss_mask"].sum() >= 1 for batch in batches)
 
-    def test_batch_of_only_special_tokens_fails_clearly(self):
-        batcher = make_batcher(np.array([1, 2, 1, 2, 1, 2, 1, 2, 1, 2]))
+    def test_tiny_mask_prob_still_masks_every_batch(self):
+        # 1e-9 never samples a mask, so the forced fallback must kick in.
+        batcher = make_batcher(np.arange(10, 30), batch_size=1, mask_prob=1e-9)
 
-        with pytest.raises(ValueError, match="no maskable tokens"):
-            next(iter(batcher))
+        batches = list(batcher)
+
+        assert all(batch["loss_mask"].sum() == 1 for batch in batches)
+        for batch in batches:
+            position = batch["loss_mask"].astype(bool)
+            assert batch["x"][position] == 3 and batch["y"][position] >= 10
+
+    def test_windows_of_only_special_tokens_are_skipped(self):
+        # 10..14 fills one window; the trailing [SEP] alone would be unmaskable.
+        batcher = make_batcher(np.array([10, 11, 12, 13, 14, 2]), batch_size=1)
+
+        assert len(batcher) == 1
+        assert np.array_equal(next(iter(batcher))["y"][0], [10, 11, 12, 13, 14])
+
+    def test_stream_of_only_special_tokens_has_no_batches(self):
+        assert len(make_batcher(np.array([1, 2, 1, 2, 1, 2, 1, 2, 1, 2]))) == 0
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [{"pad_token_id": 9}, {"mask_token_id": 9}, {"cls_token_id": 9}],
+    )
+    def test_rejects_special_ids_missing_from_special_set(self, overrides):
+        with pytest.raises(ValueError, match="must be in special_token_ids"):
+            make_batcher(np.arange(10, 20), **overrides)
+
+    def test_attention_follows_position_not_token_value(self):
+        # Pad id 0 inside real text stays visible; only the padded tail is hidden.
+        batcher = make_batcher(np.array([10, 0, 11, 12, 13, 14, 15]), stride=5)
+
+        batch = next(iter(batcher))
+
+        assert batch["attention_mask"][0].tolist() == [1, 1, 1, 1, 1]
+        assert batch["attention_mask"][1].tolist() == [1, 1, 0, 0, 0]
+
+    def test_nearby_seeds_do_not_share_epoch_streams(self):
+        tokens = np.arange(10, 30)
+        seed_one = make_batcher(tokens, seed=1, mask_prob=0.5)
+        seed_zero = make_batcher(tokens, seed=0, mask_prob=0.5)
+        list(seed_zero)  # advance to epoch 1
+
+        first = next(iter(seed_one))
+        second = next(iter(seed_zero))
+
+        assert not np.array_equal(first["loss_mask"], second["loss_mask"])
 
     @pytest.mark.parametrize("mask_prob", [0.0, 1.5])
     def test_rejects_mask_prob_outside_unit_interval(self, mask_prob):

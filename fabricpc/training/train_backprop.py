@@ -142,7 +142,13 @@ def train_step_backprop(
 
     def loss_fn(p):
         state = compute_forward_pass(p, structure, batch, rng_key)
-        return compute_loss(state, batch["y"], structure.task_map["y"], loss_type)
+        return compute_loss(
+            state,
+            batch["y"],
+            structure.task_map["y"],
+            loss_type,
+            loss_mask=batch.get("loss_mask"),
+        )
 
     loss, grads = jax.value_and_grad(loss_fn)(params)
     updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -303,22 +309,25 @@ def compute_loss_autoregressive(
     training: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Compute loss for autoregressive (next-token) prediction with backprop.
+    Compute sequence cross-entropy loss with backprop.
 
-    This runs a single forward pass with causal masking and computes
-    cross-entropy loss over all sequence positions.
+    This runs a single forward pass (with causal masking when the graph
+    defines a ``causal_mask`` task) and computes cross-entropy over all
+    sequence positions, or only over ``batch["loss_mask"]`` positions when
+    present (masked-LM training).
 
     Args:
         params: Model parameters
         structure: Graph structure
-        batch: Batch with "x" (input) and "y" (target) sequences
+        batch: Batch with "x" (input) and "y" (target) sequences, plus any
+            auxiliary task inputs (e.g. "attention_mask", "loss_mask")
         rng_key: JAX random key
         use_causal_mask: Whether to apply causal masking
         training: If True, sample dropout masks; otherwise clamp ones.
 
     Returns:
         Tuple of (loss, predictions) where:
-            - loss: Scalar loss (mean over batch)
+            - loss: Scalar loss (mean over positions, or over masked positions)
             - predictions: Output logits of shape (batch, seq_len, vocab_size)
     """
     batch_size = batch["x"].shape[0]
@@ -640,7 +649,8 @@ def eval_step_backprop(
     predictions = state.nodes[output_node].z_mu
     targets = batch["y"]
 
-    loss = compute_loss(state, targets, output_node, loss_type)
+    loss_mask = batch.get("loss_mask")
+    loss = compute_loss(state, targets, output_node, loss_type, loss_mask=loss_mask)
 
     # Compute accuracy (for classification)
     pred_labels = jnp.argmax(predictions, axis=-1)
@@ -649,10 +659,12 @@ def eval_step_backprop(
     else:
         true_labels = targets
 
-    # Handle sequence vs non-sequence
-    correct = jnp.sum(pred_labels == true_labels)
-
-    return loss, correct, jnp.prod(jnp.array(pred_labels.shape))
+    # Handle sequence vs non-sequence; with a loss_mask count masked positions only
+    hits = pred_labels == true_labels
+    if loss_mask is not None:
+        weights = loss_mask.astype(jnp.float32)
+        return loss, jnp.sum(hits * weights), jnp.sum(weights)
+    return loss, jnp.sum(hits), jnp.prod(jnp.array(pred_labels.shape))
 
 
 def evaluate_backprop(
@@ -821,6 +833,11 @@ def evaluate_backprop_autoregressive(
             batch = {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
         else:
             raise ValueError(f"Unsupported batch format: {type(batch_data)}")
+        if "loss_mask" in batch:
+            raise ValueError(
+                "evaluate_backprop_autoregressive averages over every position; "
+                "use evaluate_mlm for batches with a 'loss_mask'"
+            )
 
         batch_size = batch["x"].shape[0]
         seq_len = batch["x"].shape[1]
@@ -943,6 +960,20 @@ def _masked_lm_batch_totals(
     return mean_loss * count, correct, count
 
 
+# Single-entry cache: per-epoch validation re-evaluates the same structure, so
+# reuse its compiled step instead of re-tracing on every call.
+_masked_lm_eval_cache: Dict[str, Any] = {"structure": None, "fn": None}
+
+
+def _jitted_masked_lm_batch_totals(structure: GraphStructure) -> Callable:
+    if _masked_lm_eval_cache["structure"] is not structure:
+        _masked_lm_eval_cache["fn"] = jax.jit(
+            lambda p, b, k: _masked_lm_batch_totals(p, structure, b, k)
+        )
+        _masked_lm_eval_cache["structure"] = structure
+    return _masked_lm_eval_cache["fn"]
+
+
 def evaluate_mlm(
     params: GraphParams,
     structure: GraphStructure,
@@ -962,7 +993,7 @@ def evaluate_mlm(
     Raises:
         ValueError: If a batch lacks ``loss_mask`` or no token is masked.
     """
-    batch_totals = jax.jit(lambda p, b, k: _masked_lm_batch_totals(p, structure, b, k))
+    batch_totals = _jitted_masked_lm_batch_totals(structure)
     saved_state = loader.state_dict() if hasattr(loader, "state_dict") else None
     loss_sum, correct, count = 0.0, 0.0, 0.0
     try:
