@@ -110,3 +110,28 @@ def test_training_steps_match_the_loop_truncation(demo, num_epochs, expected):
 def test_rejects_epochs_the_loop_cannot_run(demo, num_epochs):
     with pytest.raises(ValueError, match="num_epochs"):
         demo.count_training_steps(num_epochs, batches_per_epoch=3)
+
+
+def test_pc_mode_pretraining_reports_validation_metrics(demo, capsys):
+    metrics = demo.main(SMALL + ["--mode", "pc", "--num_epochs", "1"])
+
+    assert metrics["num_masked_tokens"] > 0
+    assert "epoch 1/1 train_batch_mean_loss=" in capsys.readouterr().out
+
+
+def test_pc_flags_configure_inference_and_output_energy(demo):
+    args = demo.parse_args(
+        SMALL
+        + ["--mode", "pc", "--pc_infer_steps", "7", "--pc_eta_infer", "0.02"]
+        + ["--pc_max_norm", "3.0", "--pc_output_energy_scale", "2.5"]
+    )
+
+    structure = demo.build_model(args, vocab_size=30)
+
+    inference = structure.config["inference"].config
+    assert inference["infer_steps"] == 7
+    assert inference["eta_infer"] == pytest.approx(0.02)
+    assert inference["max_norm"] == pytest.approx(3.0)
+    head_config = structure.nodes["mlm_head"].node_info.node_config
+    assert head_config["output_energy_scale"] == pytest.approx(2.5)
+    assert demo.TRAINERS[args.mode] is demo.train_autoregressive

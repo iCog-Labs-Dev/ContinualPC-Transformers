@@ -1,10 +1,11 @@
 """
-BERT-style encoder: masked-language-model pretraining with backprop.
+BERT-style encoder: masked-language-model pretraining with backprop or PC.
 
 Builds a bidirectional encoder (``create_encoder_mlm_model``), batches text
 with ``MlmTextBatcher`` (BERT 80/10/10 masking, padding masks) and trains it
-with the standard ``train_backprop_autoregressive`` loop. Validation reports
-masked-token loss and accuracy each epoch.
+with the standard loops: ``train_backprop_autoregressive`` for ``--mode
+backprop`` or ``train_autoregressive`` (predictive coding) for ``--mode pc``.
+Validation reports feedforward masked-token loss and accuracy each epoch.
 
 Without arguments it runs on a small built-in corpus with a word-level
 vocabulary (no extra dependencies). Pass text files (one document per line)
@@ -13,6 +14,7 @@ to pretrain on your own data; ``--tokenizer bpe`` needs the ``text`` extra
 
 Usage:
     PYTHONPATH=. python examples/bert_demo.py
+    PYTHONPATH=. python examples/bert_demo.py --mode pc --pc_infer_steps 5
     PYTHONPATH=. python examples/bert_demo.py --train_file train.txt \\
         --val_file val.txt --tokenizer bpe --vocab_size 4000 --seq_len 64
 """
@@ -37,6 +39,7 @@ from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.training import (
     count_training_batches,
     evaluate_mlm,
+    train_autoregressive,
     train_backprop_autoregressive,
 )
 from fabricpc.utils.data import MLM_SPECIAL_TOKENS, MlmTextBatcher, tokenize_texts_bpe
@@ -161,8 +164,12 @@ def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
     return optax.chain(optax.clip_by_global_norm(args.grad_clip), adamw)
 
 
+TRAINERS = {"backprop": train_backprop_autoregressive, "pc": train_autoregressive}
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BERT-style MLM pretraining")
+    parser.add_argument("--mode", choices=sorted(TRAINERS), default="backprop")
     parser.add_argument("--train_file", type=Path, default=None)
     parser.add_argument("--val_file", type=Path, default=None)
     parser.add_argument(
@@ -188,10 +195,35 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pc_infer_steps", type=int, default=5, help="PC only")
+    parser.add_argument("--pc_eta_infer", type=float, default=0.05, help="PC only")
+    parser.add_argument("--pc_max_norm", type=float, default=5.0, help="PC only")
+    parser.add_argument(
+        "--pc_output_energy_scale", type=float, default=1.0, help="PC only"
+    )
     args = parser.parse_args(argv)
     if (args.train_file is None) != (args.val_file is None):
         parser.error("--train_file and --val_file must be given together")
     return args
+
+
+def build_model(args, vocab_size: int):
+    """Encoder MLM graph; the PC inference settings only matter for ``--mode pc``."""
+    return create_encoder_mlm_model(
+        depth=args.depth,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        mlp_dim=args.mlp_dim,
+        seq_len=args.seq_len,
+        vocab_size=vocab_size,
+        dropout_rate=args.dropout_rate,
+        pc_output_energy_scale=args.pc_output_energy_scale,
+        inference=InferenceSGDNormClip(
+            eta_infer=args.pc_eta_infer,
+            infer_steps=args.pc_infer_steps,
+            max_norm=args.pc_max_norm,
+        ),
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
@@ -215,16 +247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         f"val_tokens={len(val_ids)} batches_per_epoch={len(train_loader)}"
     )
 
-    structure = create_encoder_mlm_model(
-        depth=args.depth,
-        embed_dim=args.embed_dim,
-        num_heads=args.num_heads,
-        mlp_dim=args.mlp_dim,
-        seq_len=args.seq_len,
-        vocab_size=len(vocab),
-        dropout_rate=args.dropout_rate,
-        inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
-    )
+    structure = build_model(args, vocab_size=len(vocab))
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
@@ -242,7 +265,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         )
         return metrics
 
-    _, _, epoch_metrics = train_backprop_autoregressive(
+    _, _, epoch_metrics = TRAINERS[args.mode](
         params,
         structure,
         train_loader,
