@@ -254,6 +254,29 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     return grads, loss_numerator, masked_count
 
 
+def pc_node_gradient_norms(
+    params: GraphParams,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    rng_key: jax.Array,
+) -> dict[str, float]:
+    """Return the global L2 norm of each parameterised node's PC gradient.
+
+    Starting from feedforward latents, inference moves the output error back
+    about one node per step, so with too few inference steps the earliest
+    nodes, embeddings included, get an exactly zero gradient.
+    """
+    grads, _metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
+        params, batch, structure, rng_key
+    )
+    norms = {}
+    for name, node_grads in grads.nodes.items():
+        leaves = jax.tree_util.tree_leaves(node_grads)
+        if leaves:
+            norms[name] = float(optax.tree.norm(leaves))
+    return norms
+
+
 def train_step_pcn_mlm(
     params: GraphParams,
     opt_state: optax.OptState,
