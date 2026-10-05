@@ -17,7 +17,11 @@ from fabricpc.nodes.encoder_transformer import (
     MaskedVocabProjectionNode,
     create_encoder_mlm_model,
 )
-from fabricpc.training.train_mlm import train_mlm, train_step_pcn_mlm
+from fabricpc.training.train_mlm import (
+    pc_node_gradient_norms,
+    train_mlm,
+    train_step_pcn_mlm,
+)
 from fabricpc.utils.data import MlmTextBatcher
 
 
@@ -460,3 +464,41 @@ def test_train_mlm_pc_checkpoint_requires_optimizer_identity(tmp_path, rng_key):
             mode="pc",
             verbose=False,
         )
+
+
+def _small_mlm_with_inference(eta_infer: float, infer_steps: int):
+    return create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        inference=InferenceSGDNormClip(
+            eta_infer=eta_infer, infer_steps=infer_steps, max_norm=5.0
+        ),
+        use_attention_mask=True,
+    )
+
+
+def test_pc_node_gradient_norms_zero_for_unreached_embeddings(rng_key):
+    structure = _small_mlm_with_inference(eta_infer=0.01, infer_steps=1)
+    params = initialize_params(structure, rng_key)
+
+    norms = pc_node_gradient_norms(params, tiny_batch(), structure, rng_key)
+
+    assert set(norms) == {
+        name for name in params.nodes if jax.tree_util.tree_leaves(params.nodes[name])
+    }
+    assert norms["token_embeddings"] == 0.0
+    assert norms["mlm_head"] > 0.0
+
+
+def test_pc_node_gradient_norms_reach_embeddings_with_enough_inference(rng_key):
+    structure = _small_mlm_with_inference(eta_infer=0.3, infer_steps=20)
+    params = initialize_params(structure, rng_key)
+
+    norms = pc_node_gradient_norms(params, tiny_batch(), structure, rng_key)
+
+    assert all(np.isfinite(list(norms.values())))
+    assert all(norm > 0.0 for norm in norms.values())
