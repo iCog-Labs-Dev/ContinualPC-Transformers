@@ -14,6 +14,7 @@ set_jax_flags_before_importing_jax()
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -32,12 +33,13 @@ from fabricpc.nodes.encoder_transformer import (
     create_encoder_sentiment_classifier,
 )
 from fabricpc.training.optimizers import build_warmup_cosine_adamw
+from fabricpc.training.train import _convert_batch
 from fabricpc.training.train_backprop import (
     compute_forward_pass,
     evaluate_mlm,
     train_step_backprop,
 )
-from fabricpc.training.train_mlm import train_mlm
+from fabricpc.training.train_mlm import pc_node_gradient_norms, train_mlm
 from fabricpc.utils.data import (
     MLM_SPECIAL_TOKENS,
     MlmTextBatcher,
@@ -737,6 +739,31 @@ def summarize_init_diagnostics(params: GraphParams) -> dict[str, float]:
     return diagnostics
 
 
+def report_pc_gradient_reach(structure, params, loader, rng_key) -> dict[str, float]:
+    """Print each node's PC gradient norm on the first batch and warn on zeros.
+
+    The loader's state is restored so training sees the same batches.
+    """
+    state = loader.state_dict()
+    batch = _convert_batch(next(iter(loader)))
+    loader.load_state_dict(state)
+    norms = pc_node_gradient_norms(params, batch, structure, rng_key)
+    print(
+        "pc_grad_norms "
+        + " ".join(f"{name}={norm:.3e}" for name, norm in norms.items())
+    )
+    unreached = [name for name, norm in norms.items() if norm == 0.0]
+    if unreached:
+        steps = structure.config["inference"].config["infer_steps"]
+        print(
+            f"warning: with --pc_infer_steps {steps} these nodes get no PC "
+            f"gradient: {', '.join(unreached)}; increase --pc_infer_steps "
+            "or --pc_eta_infer",
+            file=sys.stderr,
+        )
+    return norms
+
+
 def build_validation_mlm_loader(
     args: argparse.Namespace,
     *,
@@ -816,6 +843,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
         pc_output_energy_scale=args.pc_output_energy_scale,
     )
     params = initialize_params(structure, rng_key)
+    if args.mode == "pc":
+        report_pc_gradient_reach(structure, params, train_loader, rng_key)
     init_diagnostics = {
         **summarize_init_diagnostics(params),
         "configured_embedding_init_std": args.embedding_init_std,
