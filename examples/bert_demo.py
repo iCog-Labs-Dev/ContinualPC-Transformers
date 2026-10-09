@@ -39,7 +39,11 @@ from fabricpc.training.train_backprop import (
     evaluate_mlm,
     train_step_backprop,
 )
-from fabricpc.training.train_mlm import pc_node_gradient_norms, train_mlm
+from fabricpc.training.train_mlm import (
+    create_pc_bp_gradient_comparison,
+    pc_node_gradient_norms,
+    train_mlm,
+)
 from fabricpc.utils.data import (
     MLM_SPECIAL_TOKENS,
     MlmTextBatcher,
@@ -320,6 +324,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pc_eta_infer", type=float, default=0.01)
     parser.add_argument("--pc_max_norm", type=float, default=5.0)
     parser.add_argument("--pc_output_energy_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--pc_bp_probe",
+        type=int,
+        default=0,
+        help="Compare PC and backprop gradients on this many training batches, "
+        "print per-node results and exit without training (PC mode only)",
+    )
+    parser.add_argument(
+        "--probe_checkpoint",
+        default=None,
+        help="Transfer checkpoint whose params --pc_bp_probe compares instead "
+        "of a fresh initialisation",
+    )
     parser.add_argument("--embedding_init_std", type=float, default=1.0)
     parser.add_argument("--position_init_std", type=float, default=0.02)
     parser.add_argument("--transformer_init_std", type=float, default=0.02)
@@ -764,6 +781,48 @@ def report_pc_gradient_reach(structure, params, loader, rng_key) -> dict[str, fl
     return norms
 
 
+def run_pc_bp_probe(structure, params, loader, rng_key, num_batches: int) -> dict:
+    """Print per-node PC vs backprop gradient norms and cosines over batches.
+
+    ``rel_ratio`` is each node's PC/BP norm ratio divided by the ``mlm_head``
+    ratio, which removes the global loss-scale constant between the two rules.
+    """
+    compare = create_pc_bp_gradient_comparison(structure)
+    per_batch = []
+    for batch_idx, batch_data in enumerate(loader):
+        if batch_idx >= num_batches:
+            break
+        rng_key, batch_key = jax.random.split(rng_key)
+        result = compare(params, _convert_batch(batch_data), batch_key)
+        per_batch.append(jax.tree_util.tree_map(float, result))
+    if not per_batch:
+        raise ValueError("--pc_bp_probe found no training batches")
+    summary = {}
+    for name in [name for name in structure.nodes if name in per_batch[0]]:
+        values = {
+            key: np.array([batch[name][key] for batch in per_batch])
+            for key in ("pc_norm", "bp_norm", "cosine")
+        }
+        summary[name] = {
+            "pc_norm": float(values["pc_norm"].mean()),
+            "bp_norm": float(values["bp_norm"].mean()),
+            "ratio": float(np.mean(values["pc_norm"] / values["bp_norm"])),
+            "cosine_mean": float(values["cosine"].mean()),
+            "cosine_min": float(values["cosine"].min()),
+        }
+    head_ratio = summary["mlm_head"]["ratio"]
+    for name, row in summary.items():
+        row["rel_ratio"] = row["ratio"] / head_ratio
+        print(
+            f"pc_bp node={name} pc_norm={row['pc_norm']:.3e} "
+            f"bp_norm={row['bp_norm']:.3e} rel_ratio={row['rel_ratio']:.3e} "
+            f"cosine_mean={row['cosine_mean']:.4f} "
+            f"cosine_min={row['cosine_min']:.4f}"
+        )
+    print(f"pc_bp batches={len(per_batch)}")
+    return summary
+
+
 def build_validation_mlm_loader(
     args: argparse.Namespace,
     *,
@@ -809,6 +868,12 @@ def _validate_validation_sequence_cap(args: argparse.Namespace) -> None:
 
 
 def run_pretrain(args: argparse.Namespace) -> None:
+    if args.pc_bp_probe < 0:
+        raise ValueError("--pc_bp_probe must be non-negative")
+    if args.pc_bp_probe and (args.mode != "pc" or args.dropout_rate != 0.0):
+        raise ValueError("--pc_bp_probe needs --mode pc and --dropout_rate 0")
+    if args.probe_checkpoint and not args.pc_bp_probe:
+        raise ValueError("--probe_checkpoint is only used with --pc_bp_probe")
     if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
         raise ValueError("--pc_output_energy_scale must be positive for PC pretraining")
     _validate_validation_sequence_cap(args)
@@ -843,6 +908,14 @@ def run_pretrain(args: argparse.Namespace) -> None:
         pc_output_energy_scale=args.pc_output_energy_scale,
     )
     params = initialize_params(structure, rng_key)
+    if args.pc_bp_probe:
+        if args.probe_checkpoint:
+            checkpoint = load_checkpoint(args.probe_checkpoint)
+            if checkpoint is None:
+                raise ValueError(f"Checkpoint not found: {args.probe_checkpoint}")
+            params = checkpoint["params"]
+        run_pc_bp_probe(structure, params, train_loader, rng_key, args.pc_bp_probe)
+        return
     if args.mode == "pc":
         report_pc_gradient_reach(structure, params, train_loader, rng_key)
     init_diagnostics = {
