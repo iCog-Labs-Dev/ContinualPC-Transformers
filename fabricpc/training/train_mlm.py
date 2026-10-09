@@ -19,6 +19,7 @@ from fabricpc.training.train_autoregressive import compute_loss, create_dropout_
 from fabricpc.training.train_backprop import (
     _apply_optimizer_update_when_masked,
     _loader_metadata,
+    _loss_and_grad_backprop_mlm_no_update,
     _serializable_training_config,
     evaluate_mlm,
     load_mlm_training_checkpoint,
@@ -275,6 +276,42 @@ def pc_node_gradient_norms(
         if leaves:
             norms[name] = float(optax.tree.norm(leaves))
     return norms
+
+
+def create_pc_bp_gradient_comparison(structure: GraphStructure):
+    """Create a JIT-compiled per-node PC vs backprop gradient comparison.
+
+    The returned function maps ``(params, batch, rng_key)`` to
+    ``{node: {"pc_norm", "bp_norm", "cosine"}}`` for every parameterised node,
+    comparing PC local gradients with backprop gradients of the masked loss on
+    the same batch. Norm ratios carry a global loss-scale constant; compare
+    them against the ``mlm_head`` ratio rather than against one.
+    """
+
+    def compare(params, batch, rng_key):
+        pc_grads, _metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
+            params, batch, structure, rng_key
+        )
+        _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
+            params, batch, structure, rng_key
+        )
+        result = {}
+        for name, pc_node in pc_grads.nodes.items():
+            pc_leaves = jax.tree_util.tree_leaves(pc_node)
+            if not pc_leaves:
+                continue
+            bp_leaves = jax.tree_util.tree_leaves(bp_grads.nodes[name])
+            dot = sum(jnp.vdot(p, b) for p, b in zip(pc_leaves, bp_leaves))
+            pc_norm = optax.tree.norm(pc_leaves)
+            bp_norm = optax.tree.norm(bp_leaves)
+            result[name] = {
+                "pc_norm": pc_norm,
+                "bp_norm": bp_norm,
+                "cosine": dot / jnp.maximum(pc_norm * bp_norm, 1e-30),
+            }
+        return result
+
+    return jax.jit(compare)
 
 
 def train_step_pcn_mlm(
