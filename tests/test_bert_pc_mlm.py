@@ -18,6 +18,7 @@ from fabricpc.nodes.encoder_transformer import (
     create_encoder_mlm_model,
 )
 from fabricpc.training.train_mlm import (
+    create_pc_bp_gradient_comparison,
     pc_node_gradient_norms,
     train_mlm,
     train_step_pcn_mlm,
@@ -502,3 +503,15 @@ def test_pc_node_gradient_norms_reach_embeddings_with_enough_inference(rng_key):
 
     assert all(np.isfinite(list(norms.values())))
     assert all(norm > 0.0 for norm in norms.values())
+
+
+def test_pc_bp_gradient_comparison_matches_backprop_at_output_head(rng_key):
+    structure = _small_mlm_with_inference(eta_infer=0.01, infer_steps=1)
+    params = initialize_params(structure, rng_key)
+
+    result = create_pc_bp_gradient_comparison(structure)(params, tiny_batch(), rng_key)
+
+    head = result["mlm_head"]
+    assert float(head["cosine"]) == pytest.approx(1.0, abs=1e-4)
+    assert float(head["pc_norm"]) == pytest.approx(float(head["bp_norm"]), rel=1e-2)
+    assert all(-1.0001 <= float(row["cosine"]) <= 1.0001 for row in result.values())
