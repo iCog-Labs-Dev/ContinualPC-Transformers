@@ -356,6 +356,120 @@ class InferenceSGDNormClip(InferenceBase):
         )
 
 
+class InferenceSGDNormClipDecay(InferenceSGDNormClip):
+    """
+    Norm-clipped SGD inference whose per-sample rate decays when energy rises.
+
+    Before each latent update the total energy of every sample is compared with
+    its value one step earlier; samples whose energy rose have their inference
+    rate multiplied by ``rise_decay``. Rates start at ``eta_infer``.
+
+    Args:
+        eta_infer: Initial inference rate (default: 0.1)
+        infer_steps: Number of inference iterations (default: 20)
+        max_norm: Maximum gradient norm per node (default: 1.0)
+        rise_decay: Rate multiplier applied after an energy rise (default: 0.9)
+        eps: Small constant for numerical stability (default: 1e-8)
+    """
+
+    def __init__(
+        self,
+        eta_infer=0.1,
+        infer_steps=20,
+        latent_decay=0.0,
+        max_norm=1.0,
+        rise_decay=0.9,
+        eps=1e-8,
+    ):
+        if not 0.0 < rise_decay <= 1.0:
+            raise ValueError("rise_decay must be in (0, 1]")
+        InferenceBase.__init__(
+            self,
+            eta_infer=eta_infer,
+            latent_decay=latent_decay,
+            infer_steps=infer_steps,
+            max_norm=max_norm,
+            rise_decay=rise_decay,
+            eps=eps,
+        )
+
+    @staticmethod
+    def compute_new_latent(node_name, node_state, config):
+        eta_infer = jnp.asarray(config["eta_infer"])
+        if eta_infer.ndim == 1:
+            eta_infer = eta_infer.reshape((-1,) + (1,) * (node_state.z_latent.ndim - 1))
+        return InferenceSGDNormClip.compute_new_latent(
+            node_name, node_state, {**config, "eta_infer": eta_infer}
+        )
+
+    @staticmethod
+    def total_energy(
+        state: GraphState, structure: GraphStructure, batch_size: int
+    ) -> jax.Array:
+        """Per-sample energy summed over every node with inputs."""
+        total = jnp.zeros((batch_size,), dtype=jnp.result_type(float))
+        for node_name, node in structure.nodes.items():
+            if node.node_info.in_degree == 0:
+                continue
+            energy = state.nodes[node_name].energy
+            total = total + energy.reshape(batch_size, -1).sum(axis=1)
+        return total.astype(jnp.result_type(float))
+
+    @staticmethod
+    def run_inference_with_stats(
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ):
+        """Run guarded inference; return the final state and rise statistics."""
+        inference_obj = structure.config["inference"]
+        cls = type(inference_obj)
+        config = dict(inference_obj.config)
+        batch_size = next(iter(clamps.values())).shape[0]
+        float_dtype = jnp.result_type(float)
+        eta0 = jnp.full((batch_size,), config["eta_infer"], dtype=float_dtype)
+
+        def body_fn(t, carry):
+            state, eta, prev_energy, rises = carry
+            state = cls.zero_grads(params, state, clamps, structure)
+            state = cls.forward_value_and_grad(params, state, clamps, structure)
+            energy = cls.total_energy(state, structure, batch_size)
+            rose = energy > prev_energy
+            eta = jnp.where(rose, eta * config["rise_decay"], eta)
+            state = cls.update_latents(
+                params, state, clamps, structure, {**config, "eta_infer": eta}
+            )
+            return state, eta, energy, rises + jnp.sum(rose, dtype=jnp.int32)
+
+        carry = (
+            initial_state,
+            eta0,
+            jnp.full((batch_size,), jnp.inf, dtype=float_dtype),
+            jnp.array(0, dtype=jnp.int32),
+        )
+        final_state, eta, _, rises = jax.lax.fori_loop(
+            0, config["infer_steps"], body_fn, carry
+        )
+        return final_state, {
+            "energy_rises": rises,
+            "final_eta": eta,
+            "final_eta_mean": jnp.mean(eta),
+        }
+
+    @staticmethod
+    def run_inference(
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        final_state, _ = InferenceSGDNormClipDecay.run_inference_with_stats(
+            params, initial_state, clamps, structure
+        )
+        return final_state
+
+
 # =============================================================================
 # Convenience Function
 # =============================================================================
