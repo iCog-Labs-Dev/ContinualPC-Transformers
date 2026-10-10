@@ -496,3 +496,61 @@ def test_bpe_pretrain_checkpoint_can_transfer_to_finetune(tmp_path):
     )
 
     run_finetune(finetune_args)
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--mode", "backprop"], "--mode pc"),
+        (["--mode", "pc", "--tokens_per_update", "64"], "--tokens_per_update"),
+        (["--mode", "pc", "--micro_batch_size", "1"], "--micro_batch_size"),
+    ],
+)
+def test_pc_incremental_flag_validation(extra, message):
+    args = parse_args(["--stage", "pretrain", "--pc_incremental", *extra])
+
+    assert args.pc_incremental
+    with pytest.raises(ValueError, match=message):
+        run_pretrain(args)
+
+
+def test_pc_incremental_pretrain_tiny_smoke(capsys):
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--mode",
+            "pc",
+            "--pc_incremental",
+            "--pc_infer_steps",
+            "2",
+            "--pc_infer_guard",
+            "decay",
+            "--seq_len",
+            "6",
+            "--embed_dim",
+            "16",
+            "--num_heads",
+            "4",
+            "--mlp_dim",
+            "32",
+            "--depth",
+            "1",
+            "--vocab_size",
+            "16",
+            "--max_steps",
+            "2",
+            "--log_interval",
+            "1",
+            "--validation_interval",
+            "0",
+            "--checkpoint",
+            "",
+        ]
+    )
+
+    run_pretrain(args)
+
+    out = capsys.readouterr().out
+    assert "step=2 masked_loss=" in out
+    assert "energy_rises=" in out
