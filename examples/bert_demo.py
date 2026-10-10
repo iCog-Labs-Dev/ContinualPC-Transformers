@@ -333,6 +333,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pc_guard_decay", type=float, default=0.9)
     parser.add_argument(
+        "--pc_incremental",
+        action="store_true",
+        help="Incremental PC (Salvatori et al. 2024): one optimizer update per "
+        "inference step, --pc_infer_steps updates per batch. The LR schedule "
+        "advances once per batch and weight decay is divided by "
+        "--pc_infer_steps so decay per batch matches standard PC; --lr is used "
+        "as given. Adam's step count and moment horizons advance per update, "
+        "not per batch. Energy rises counted by --pc_infer_guard can come from "
+        "the weight updates as well as the latent steps (PC pretraining only)",
+    )
+    parser.add_argument(
         "--pc_bp_probe",
         type=int,
         default=0,
@@ -374,12 +385,14 @@ def build_optimizer(
     grad_clip: float,
     warmup_steps: int,
     total_steps: int,
+    schedule_step_divisor: int = 1,
 ) -> optax.GradientTransformation:
     optimizer = build_warmup_cosine_adamw(
         learning_rate=learning_rate,
         total_steps=max(1, total_steps),
         warmup_steps=min(warmup_steps, max(1, total_steps)),
         weight_decay=weight_decay,
+        schedule_step_divisor=schedule_step_divisor,
     )
     if grad_clip <= 0:
         return optimizer
@@ -895,6 +908,19 @@ def _validate_validation_sequence_cap(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_pc_incremental_args(args: argparse.Namespace) -> None:
+    if not args.pc_incremental:
+        return
+    if args.mode != "pc":
+        raise ValueError("--pc_incremental requires --mode pc")
+    if args.tokens_per_update is not None:
+        raise ValueError("--pc_incremental does not support --tokens_per_update")
+    if args.micro_batch_size is not None:
+        raise ValueError("--pc_incremental does not support --micro_batch_size")
+    if args.pc_infer_steps < 1:
+        raise ValueError("--pc_incremental requires --pc_infer_steps >= 1")
+
+
 def run_pretrain(args: argparse.Namespace) -> None:
     if args.pc_bp_probe < 0:
         raise ValueError("--pc_bp_probe must be non-negative")
@@ -904,6 +930,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         raise ValueError("--probe_checkpoint is only used with --pc_bp_probe")
     if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
         raise ValueError("--pc_output_energy_scale must be positive for PC pretraining")
+    _validate_pc_incremental_args(args)
     _validate_validation_sequence_cap(args)
     validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)
@@ -950,12 +977,14 @@ def run_pretrain(args: argparse.Namespace) -> None:
     }
     max_steps = derive_max_steps(args, train_loader)
     gradient_accumulation_steps = compute_gradient_accumulation_steps(args)
+    updates_per_batch = args.pc_infer_steps if args.pc_incremental else 1
     optimizer = build_optimizer(
         learning_rate=args.lr,
-        weight_decay=args.weight_decay,
+        weight_decay=args.weight_decay / updates_per_batch,
         grad_clip=args.grad_clip,
         warmup_steps=args.warmup_steps,
         total_steps=max_steps,
+        schedule_step_divisor=updates_per_batch,
     )
     params, state = train_mlm(
         params,
@@ -987,6 +1016,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             "tokens_per_update": args.tokens_per_update,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "metrics_jsonl": args.metrics_jsonl,
+            **({"pc_incremental": True} if args.pc_incremental else {}),
             "init_diagnostics": init_diagnostics,
             "model": _model_config(args, train_loader.vocab_size),
             "validation_fn": None,
@@ -1034,6 +1064,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
 
 
 def run_finetune(args: argparse.Namespace) -> None:
+    if args.pc_incremental:
+        raise ValueError("--pc_incremental is only valid for pretraining")
     if args.max_validation_sequences is not None:
         raise ValueError("--max_validation_sequences is only valid for pretraining")
     _reject_unsupported_pc(args)
