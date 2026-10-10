@@ -142,3 +142,34 @@ def test_build_warmup_cosine_adamw_validates_schedule_args():
             total_steps=10,
             warmup_steps=11,
         )
+
+
+def test_build_warmup_cosine_adamw_schedule_step_divisor():
+    learning_rate = 1e-2
+    optimizer = build_warmup_cosine_adamw(
+        learning_rate=learning_rate,
+        total_steps=10,
+        warmup_steps=2,
+        b1=0.0,
+        b2=0.0,
+        eps=0.0,
+        schedule_step_divisor=3,
+    )
+    params = {"w": jnp.zeros((2,))}
+    grads = {"w": jnp.ones((2,))}
+    opt_state = optimizer.init(params)
+
+    step_sizes = []
+    for _ in range(6):
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        step_sizes.append(float(-updates["w"][0]))
+
+    expected = [0.0] * 3 + [learning_rate / 2] * 3
+    assert step_sizes == pytest.approx(expected, rel=1e-6, abs=1e-12)
+
+
+def test_build_warmup_cosine_adamw_rejects_bad_schedule_step_divisor():
+    with pytest.raises(ValueError, match="schedule_step_divisor"):
+        build_warmup_cosine_adamw(
+            learning_rate=1e-2, total_steps=10, schedule_step_divisor=0
+        )

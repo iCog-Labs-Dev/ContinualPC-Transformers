@@ -26,8 +26,14 @@ def build_warmup_cosine_adamw(
     b1: float = 0.9,
     b2: float = 0.999,
     eps: float = 1e-8,
+    schedule_step_divisor: int = 1,
 ) -> optax.GradientTransformation:
-    """Build AdamW with optional linear warmup and cosine decay."""
+    """Build AdamW with optional linear warmup and cosine decay.
+
+    The schedule is evaluated at ``count // schedule_step_divisor``, so with a
+    divisor of ``k`` it advances once every ``k`` optimizer updates and
+    ``total_steps`` and ``warmup_steps`` count groups of ``k`` updates.
+    """
     if learning_rate <= 0:
         raise ValueError("learning_rate must be positive")
     if min_learning_rate < 0:
@@ -40,6 +46,8 @@ def build_warmup_cosine_adamw(
         raise ValueError("warmup_steps must be non-negative")
     if warmup_steps > total_steps:
         raise ValueError("warmup_steps must be <= total_steps")
+    if schedule_step_divisor < 1:
+        raise ValueError("schedule_step_divisor must be >= 1")
 
     decay_steps = max(1, total_steps - warmup_steps)
     alpha = min_learning_rate / learning_rate
@@ -61,8 +69,13 @@ def build_warmup_cosine_adamw(
             boundaries=[warmup_steps],
         )
 
+    def learning_rate_schedule(count):
+        return schedule(count // schedule_step_divisor)
+
     return optax.adamw(
-        learning_rate=schedule,
+        learning_rate=(
+            schedule if schedule_step_divisor == 1 else learning_rate_schedule
+        ),
         b1=b1,
         b2=b2,
         eps=eps,
