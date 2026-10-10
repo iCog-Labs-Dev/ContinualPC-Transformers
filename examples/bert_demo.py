@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.core.inference import InferenceSGDNormClip, InferenceSGDNormClipDecay
 from fabricpc.core.types import GraphParams, NodeParams
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import (
@@ -324,6 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pc_eta_infer", type=float, default=0.01)
     parser.add_argument("--pc_max_norm", type=float, default=5.0)
     parser.add_argument("--pc_output_energy_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--pc_infer_guard",
+        choices=["none", "decay"],
+        default="none",
+        help="decay: multiply a sample's inference rate by --pc_guard_decay "
+        "whenever its energy rises (PC only)",
+    )
+    parser.add_argument("--pc_guard_decay", type=float, default=0.9)
     parser.add_argument(
         "--pc_bp_probe",
         type=int,
@@ -823,6 +831,26 @@ def run_pc_bp_probe(structure, params, loader, rng_key, num_batches: int) -> dic
     return summary
 
 
+def build_pretrain_inference(args: argparse.Namespace) -> InferenceSGDNormClip:
+    """Build the pretraining inference object, guarded when requested."""
+    if args.mode != "pc":
+        return InferenceSGDNormClip(
+            eta_infer=0.05, infer_steps=5, max_norm=args.pc_max_norm
+        )
+    if args.pc_infer_guard == "decay":
+        return InferenceSGDNormClipDecay(
+            eta_infer=args.pc_eta_infer,
+            infer_steps=args.pc_infer_steps,
+            max_norm=args.pc_max_norm,
+            rise_decay=args.pc_guard_decay,
+        )
+    return InferenceSGDNormClip(
+        eta_infer=args.pc_eta_infer,
+        infer_steps=args.pc_infer_steps,
+        max_norm=args.pc_max_norm,
+    )
+
+
 def build_validation_mlm_loader(
     args: argparse.Namespace,
     *,
@@ -895,11 +923,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         mlp_dim=args.mlp_dim,
         seq_len=args.seq_len,
         vocab_size=train_loader.vocab_size,
-        inference=InferenceSGDNormClip(
-            eta_infer=args.pc_eta_infer if args.mode == "pc" else 0.05,
-            infer_steps=args.pc_infer_steps if args.mode == "pc" else 5,
-            max_norm=args.pc_max_norm,
-        ),
+        inference=build_pretrain_inference(args),
         use_attention_mask=True,
         dropout_rate=args.dropout_rate,
         embedding_init_std=args.embedding_init_std,
