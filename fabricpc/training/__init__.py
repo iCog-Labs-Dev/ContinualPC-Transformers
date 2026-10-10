@@ -39,6 +39,7 @@ from fabricpc.training.train_mlm import (
     train_mlm,
     train_pcn_mlm,
     train_step_pcn_mlm,
+    train_step_pcn_mlm_incremental,
 )
 
 # Backward-compatibility aliases (deprecated, will be removed)
@@ -86,4 +87,5 @@ __all__ = [
     "train_mlm",
     "train_pcn_mlm",
     "train_step_pcn_mlm",
+    "train_step_pcn_mlm_incremental",
 ]

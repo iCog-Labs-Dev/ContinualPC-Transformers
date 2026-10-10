@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fabricpc.core.inference import run_inference
+from fabricpc.core.inference import InferenceSGDNormClipDecay, run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.types import GraphParams, GraphState, GraphStructure
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
@@ -74,9 +74,12 @@ def _config_training_identity(config: dict[str, Any]) -> dict[str, Any]:
 def _pc_training_identity(
     structure: GraphStructure,
     train_loader: Any,
+    pc_incremental: bool = False,
 ) -> dict[str, Any]:
     inference = structure.config["inference"]
+    identity: dict[str, Any] = {"pc_incremental": True} if pc_incremental else {}
     return {
+        **identity,
         "inference": {
             "class": type(inference).__name__,
             "config": _json_safe(dict(inference.config)),
@@ -168,13 +171,24 @@ def _masked_accuracy(
     return jnp.sum(correct) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
-def get_graph_param_gradient_pcn_mlm(
+def _prepare_pcn_mlm_batch(
     params: GraphParams,
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
     rng_key: jax.Array,
-) -> Tuple[GraphParams, dict[str, jax.Array], GraphState, GraphState, GraphState]:
-    """Compute one BERT MLM PC local-gradient step without applying updates."""
+) -> tuple[
+    dict[str, jnp.ndarray],
+    dict[str, jax.Array],
+    GraphState,
+    GraphState,
+    dict[str, jnp.ndarray],
+]:
+    """Build the clamps, free-state metrics and target-clamped initial state.
+
+    Returns ``(shared_clamps, free_metrics, free_state, initial_state,
+    clamps)``. ``free_metrics`` holds ``masked_loss``, ``masked_accuracy`` and
+    ``num_masked_tokens`` of the feedforward state without target clamps.
+    """
     _validate_pcn_mlm_batch(batch, structure)
     dropout_key, free_state_key, pc_state_key = jax.random.split(rng_key, 3)
     batch_size = batch["x"].shape[0]
@@ -199,13 +213,17 @@ def get_graph_param_gradient_pcn_mlm(
         clamps=shared_clamps,
         params=params,
     )
-    masked_loss = compute_loss(
-        free_state,
-        batch["y"],
-        output_node,
-        loss_type="cross_entropy",
-        loss_mask=batch["loss_mask"],
-    )
+    free_metrics = {
+        "masked_loss": compute_loss(
+            free_state,
+            batch["y"],
+            output_node,
+            loss_type="cross_entropy",
+            loss_mask=batch["loss_mask"],
+        ),
+        "masked_accuracy": _masked_accuracy(free_state, batch, output_node),
+        "num_masked_tokens": jnp.sum(batch["loss_mask"].astype(jnp.float32)),
+    }
 
     vocab_size = structure.nodes[output_node].node_info.shape[-1]
     targets = jax.nn.one_hot(batch["y"], vocab_size, dtype=jnp.float32)
@@ -217,6 +235,21 @@ def get_graph_param_gradient_pcn_mlm(
         clamps=clamps,
         params=params,
     )
+    return shared_clamps, free_metrics, free_state, initial_state, clamps
+
+
+def get_graph_param_gradient_pcn_mlm(
+    params: GraphParams,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    rng_key: jax.Array,
+) -> Tuple[GraphParams, dict[str, jax.Array], GraphState, GraphState, GraphState]:
+    """Compute one BERT MLM PC local-gradient step without applying updates."""
+    _shared_clamps, free_metrics, free_state, initial_state, clamps = (
+        _prepare_pcn_mlm_batch(params, batch, structure, rng_key)
+    )
+    batch_size = batch["x"].shape[0]
+    output_node = structure.task_map["y"]
     inference_cls = type(structure.config["inference"])
     if hasattr(inference_cls, "run_inference_with_stats"):
         final_state, inference_stats = inference_cls.run_inference_with_stats(
@@ -234,9 +267,7 @@ def get_graph_param_gradient_pcn_mlm(
             total_energy = total_energy + jnp.sum(final_state.nodes[node_name].energy)
     total_energy = total_energy / batch_size
     metrics = {
-        "masked_loss": masked_loss,
-        "masked_accuracy": _masked_accuracy(free_state, batch, output_node),
-        "num_masked_tokens": jnp.sum(batch["loss_mask"].astype(jnp.float32)),
+        **free_metrics,
         "pc_output_energy": output_energy,
         "pc_total_energy": total_energy,
         "pc_energy_rises": energy_rises,
@@ -379,6 +410,119 @@ def create_jit_update_step_pcn_mlm(optimizer: optax.GradientTransformation):
     )
 
 
+def _train_step_pcn_mlm_incremental_with_state(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+) -> tuple[GraphParams, optax.OptState, dict[str, jax.Array], GraphState]:
+    """Run one incremental PC MLM batch and also return the final state."""
+    _shared_clamps, free_metrics, _free_state, initial_state, clamps = (
+        _prepare_pcn_mlm_batch(params, batch, structure, rng_key)
+    )
+    inference_obj = structure.config["inference"]
+    inference_cls = type(inference_obj)
+    config = inference_obj.config
+    guarded = issubclass(inference_cls, InferenceSGDNormClipDecay)
+    masked_count = free_metrics["num_masked_tokens"]
+    batch_size = batch["x"].shape[0]
+    float_dtype = jnp.result_type(float)
+    if guarded:
+        eta0, prev_energy0 = InferenceSGDNormClipDecay.initial_guard_carry(
+            batch_size, dict(config)
+        )
+    else:
+        eta0 = jnp.zeros((batch_size,), dtype=float_dtype)
+        prev_energy0 = jnp.zeros((batch_size,), dtype=float_dtype)
+
+    def body_fn(t, carry):
+        params, opt_state, state, eta, prev_energy, rises, grad_norm_sum = carry
+        grads = compute_local_weight_gradients(params, state, structure)
+        grad_norm_sum = grad_norm_sum + optax.tree.norm(grads).astype(float_dtype)
+        if guarded:
+            state, eta, prev_energy, step_rises = inference_cls.guarded_step(
+                params, state, eta, prev_energy, clamps, structure
+            )
+            rises = rises + step_rises
+        else:
+            state = inference_cls.inference_step(
+                params, state, clamps, structure, config
+            )
+        params, opt_state = _apply_optimizer_update_when_masked(
+            params=params,
+            opt_state=opt_state,
+            grads=grads,
+            optimizer=optimizer,
+            masked_count=masked_count,
+        )
+        return params, opt_state, state, eta, prev_energy, rises, grad_norm_sum
+
+    infer_steps = config["infer_steps"]
+    carry = (
+        params,
+        opt_state,
+        initial_state,
+        eta0,
+        prev_energy0,
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(0.0, dtype=float_dtype),
+    )
+    params, opt_state, final_state, _eta, _energy, rises, grad_norm_sum = (
+        jax.lax.fori_loop(0, infer_steps, body_fn, carry)
+    )
+    metrics = {
+        **free_metrics,
+        "pc_energy_rises": rises,
+        "grad_norm_mean": grad_norm_sum / max(int(infer_steps), 1),
+    }
+    return params, opt_state, metrics, final_state
+
+
+def train_step_pcn_mlm_incremental(
+    params: GraphParams,
+    opt_state: optax.OptState,
+    batch: Dict[str, jnp.ndarray],
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    rng_key: jax.Array,
+) -> tuple[GraphParams, optax.OptState, dict[str, jax.Array]]:
+    """Incremental predictive-coding (iPC) MLM training step.
+
+    Follows Algorithm 1 of Salvatori et al. 2024, "A Stable, Fast, and Fully
+    Automatic Learning Algorithm for Predictive Coding Networks" (ICLR,
+    arXiv 2212.00720): starting from the target-clamped feedforward state, each
+    of the ``infer_steps`` iterations takes latent and local weight gradients
+    at the same state, updates the latents (with the energy-rise guard when the
+    inference is ``InferenceSGDNormClipDecay``) and applies one optimizer
+    update. Batches without masked tokens leave params and optimizer state
+    unchanged.
+
+    Metrics hold ``masked_loss``, ``masked_accuracy`` and
+    ``num_masked_tokens`` of the feedforward state before any update,
+    ``pc_energy_rises`` (int32, zero without the guard) and ``grad_norm_mean``,
+    the mean over iterations of the unclipped local weight-gradient norm.
+    """
+    params, opt_state, metrics, _final_state = (
+        _train_step_pcn_mlm_incremental_with_state(
+            params, opt_state, batch, structure, optimizer, rng_key
+        )
+    )
+    return params, opt_state, metrics
+
+
+def create_jit_train_step_pcn_mlm_incremental(
+    structure: GraphStructure, optimizer: optax.GradientTransformation
+):
+    """Create a JIT-compiled incremental PC MLM training step."""
+    return jax.jit(
+        lambda p, o, b, k: train_step_pcn_mlm_incremental(
+            p, o, b, structure, optimizer, k
+        )
+    )
+
+
 def train_pcn_mlm(
     params: GraphParams,
     structure: GraphStructure,
@@ -389,7 +533,12 @@ def train_pcn_mlm(
     val_loader: Any = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any]]:
-    """Train a BERT-style MLM graph with single-device PC updates."""
+    """Train a BERT-style MLM graph with single-device PC updates.
+
+    With ``config["pc_incremental"]`` true each batch runs incremental PC
+    (``train_step_pcn_mlm_incremental``), applying one optimizer update per
+    inference iteration; gradient accumulation is then rejected.
+    """
     if config.get("use_pmap"):
         raise ValueError("pmap PC MLM training is not implemented yet")
     if config.get("pmap_single_device"):
@@ -420,6 +569,12 @@ def train_pcn_mlm(
         gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1))
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
+    pc_incremental = bool(config.get("pc_incremental", False))
+    if pc_incremental and gradient_accumulation_steps > 1:
+        raise ValueError(
+            "incremental PC MLM training does not support gradient accumulation; "
+            f"got gradient_accumulation_steps={gradient_accumulation_steps}"
+        )
 
     max_steps = int(config.get("max_steps", len(train_loader)))
     checkpoint_path = config.get("checkpoint_path")
@@ -435,7 +590,9 @@ def train_pcn_mlm(
             "mode": "pc",
             "objective": "pc_mlm_masked_ce_v1",
             "config_training_identity": _config_training_identity(config),
-            "pc_training_identity": _pc_training_identity(structure, train_loader),
+            "pc_training_identity": _pc_training_identity(
+                structure, train_loader, pc_incremental
+            ),
         }
     )
     if max_steps < 1:
@@ -445,8 +602,13 @@ def train_pcn_mlm(
     log_interval = int(config.get("log_interval", 1))
     validation_interval = int(config.get("validation_interval", 0))
     opt_state = optimizer.init(params)
-    grad_fn = create_jit_gradient_step_pcn_mlm(structure)
-    update_fn = create_jit_update_step_pcn_mlm(optimizer)
+    if pc_incremental:
+        incremental_step_fn = create_jit_train_step_pcn_mlm_incremental(
+            structure, optimizer
+        )
+    else:
+        grad_fn = create_jit_gradient_step_pcn_mlm(structure)
+        update_fn = create_jit_update_step_pcn_mlm(optimizer)
     losses: list[float] = []
     validation: list[dict[str, float]] = []
     if config.get("resume_from"):
@@ -513,38 +675,51 @@ def train_pcn_mlm(
             batch = _convert_batch(batch_data)
             _validate_pcn_mlm_batch(batch, structure)
             rng_key, step_key = jax.random.split(rng_key)
-            grads, loss_numerator, masked_count, energy_rises = grad_fn(
-                params, batch, step_key
-            )
-            scaled_grads = jax.tree_util.tree_map(
-                lambda grad: grad / gradient_accumulation_steps,
-                grads,
-            )
-            pending_grads = (
-                scaled_grads
-                if pending_grads is None
-                else jax.tree_util.tree_map(
-                    lambda left, right: left + right,
-                    pending_grads,
-                    scaled_grads,
+            if pc_incremental:
+                params, opt_state, step_metrics = incremental_step_fn(
+                    params, opt_state, batch, step_key
                 )
-            )
-            pending_loss_numerator = pending_loss_numerator + loss_numerator
-            pending_masked_count = pending_masked_count + masked_count
-            pending_energy_rises = pending_energy_rises + energy_rises
-            pending_micro_batches += 1
-            micro_steps += 1
-            progressed = True
+                micro_steps += 1
+                progressed = True
+                pending_loss_numerator = (
+                    step_metrics["masked_loss"] * step_metrics["num_masked_tokens"]
+                )
+                pending_masked_count = step_metrics["num_masked_tokens"]
+                pending_energy_rises = step_metrics["pc_energy_rises"]
+                incremental_grad_norm = step_metrics["grad_norm_mean"]
+            else:
+                grads, loss_numerator, masked_count, energy_rises = grad_fn(
+                    params, batch, step_key
+                )
+                scaled_grads = jax.tree_util.tree_map(
+                    lambda grad: grad / gradient_accumulation_steps,
+                    grads,
+                )
+                pending_grads = (
+                    scaled_grads
+                    if pending_grads is None
+                    else jax.tree_util.tree_map(
+                        lambda left, right: left + right,
+                        pending_grads,
+                        scaled_grads,
+                    )
+                )
+                pending_loss_numerator = pending_loss_numerator + loss_numerator
+                pending_masked_count = pending_masked_count + masked_count
+                pending_energy_rises = pending_energy_rises + energy_rises
+                pending_micro_batches += 1
+                micro_steps += 1
+                progressed = True
 
-            if pending_micro_batches < gradient_accumulation_steps:
-                continue
+                if pending_micro_batches < gradient_accumulation_steps:
+                    continue
 
-            params, opt_state = update_fn(
-                params,
-                opt_state,
-                pending_grads,
-                pending_masked_count,
-            )
+                params, opt_state = update_fn(
+                    params,
+                    opt_state,
+                    pending_grads,
+                    pending_masked_count,
+                )
             step += 1
             try:
                 num_train_batches = len(train_loader)
@@ -566,7 +741,11 @@ def train_pcn_mlm(
             losses.append(loss)
             should_log = verbose and log_interval > 0 and step % log_interval == 0
             if should_log:
-                grad_norm = float(optax.tree.norm(pending_grads))
+                grad_norm = float(
+                    incremental_grad_norm
+                    if pc_incremental
+                    else optax.tree.norm(pending_grads)
+                )
                 logged_rises = int(pending_energy_rises)
             pending_grads = None
             pending_micro_batches = 0
@@ -628,6 +807,7 @@ def train_pcn_mlm(
         "tokens_per_update": tokens_per_update,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "max_tokens_per_micro_batch": max_tokens_per_micro_batch or None,
+        "pc_incremental": pc_incremental,
     }
 
 
