@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 
-from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.core.inference import InferenceSGDNormClip, InferenceSGDNormClipDecay
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.nodes.encoder_transformer import (
@@ -18,6 +18,7 @@ from fabricpc.nodes.encoder_transformer import (
     create_encoder_mlm_model,
 )
 from fabricpc.training.train_mlm import (
+    get_graph_param_gradient_pcn_mlm,
     create_pc_bp_gradient_comparison,
     pc_node_gradient_norms,
     train_mlm,
@@ -515,3 +516,121 @@ def test_pc_bp_gradient_comparison_matches_backprop_at_output_head(rng_key):
     assert float(head["cosine"]) == pytest.approx(1.0, abs=1e-4)
     assert float(head["pc_norm"]) == pytest.approx(float(head["bp_norm"]), rel=1e-2)
     assert all(-1.0001 <= float(row["cosine"]) <= 1.0001 for row in result.values())
+
+
+def _small_mlm_with_guard(eta_infer: float, infer_steps: int, rise_decay: float):
+    return create_encoder_mlm_model(
+        depth=1,
+        embed_dim=16,
+        num_heads=4,
+        mlp_dim=32,
+        seq_len=6,
+        vocab_size=20,
+        inference=InferenceSGDNormClipDecay(
+            eta_infer=eta_infer,
+            infer_steps=infer_steps,
+            max_norm=5.0,
+            rise_decay=rise_decay,
+        ),
+        use_attention_mask=True,
+    )
+
+
+def test_guard_without_decay_matches_plain_inference(rng_key):
+    plain = _small_mlm_with_inference(eta_infer=0.2, infer_steps=10)
+    guarded = _small_mlm_with_guard(eta_infer=0.2, infer_steps=10, rise_decay=1.0)
+    params = initialize_params(plain, rng_key)
+
+    plain_grads, *_ = get_graph_param_gradient_pcn_mlm(
+        params, tiny_batch(), plain, rng_key
+    )
+    guarded_grads, *_ = get_graph_param_gradient_pcn_mlm(
+        params, tiny_batch(), guarded, rng_key
+    )
+
+    assert tree_allclose(plain_grads, guarded_grads)
+
+
+def _guard_inputs(structure, params, batch, rng_key):
+    output_node = structure.task_map["y"]
+    clamps = {
+        structure.task_map["x"]: batch["x"],
+        structure.task_map["loss_mask"]: batch["loss_mask"],
+        structure.task_map["attention_mask"]: batch["attention_mask"],
+        output_node: jax.nn.one_hot(batch["y"], 20),
+    }
+    state = initialize_graph_state(
+        structure, batch["x"].shape[0], rng_key, clamps=clamps, params=params
+    )
+    return state, clamps
+
+
+def _two_sample_batch():
+    single = tiny_batch()
+    other = {
+        "x": jnp.array([[5, 6, 7, 8, 9, 10]], dtype=jnp.int32),
+        "y": jnp.array([[5, 6, 7, 8, 9, 10]], dtype=jnp.int32),
+        "attention_mask": jnp.ones((1, 6), dtype=jnp.float32),
+        "loss_mask": jnp.array([[0, 1, 0, 1, 0, 1]], dtype=jnp.float32),
+    }
+    return {key: jnp.concatenate([single[key], other[key]]) for key in single}
+
+
+def test_guard_rate_follows_per_sample_rise_count(rng_key):
+    structure = _small_mlm_with_guard(eta_infer=5.0, infer_steps=20, rise_decay=0.5)
+    params = initialize_params(structure, rng_key)
+    state, clamps = _guard_inputs(structure, params, _two_sample_batch(), rng_key)
+
+    _final, stats = InferenceSGDNormClipDecay.run_inference_with_stats(
+        params, state, clamps, structure
+    )
+
+    rises = int(stats["energy_rises"])
+    final_eta = np.asarray(stats["final_eta"])
+    per_sample_rises = np.round(np.log(final_eta / 5.0) / np.log(0.5))
+    assert rises > 0
+    assert final_eta.shape == (2,)
+    assert int(per_sample_rises.sum()) == rises
+
+
+def test_guard_runs_under_x64(rng_key):
+    with jax.enable_x64(True):
+        structure = _small_mlm_with_guard(eta_infer=0.2, infer_steps=5, rise_decay=0.9)
+        params = initialize_params(structure, rng_key)
+        state, clamps = _guard_inputs(structure, params, tiny_batch(), rng_key)
+
+        final_state, stats = InferenceSGDNormClipDecay.run_inference_with_stats(
+            params, state, clamps, structure
+        )
+
+    assert stats["energy_rises"].dtype == jnp.int32
+    assert all(
+        np.all(np.isfinite(np.asarray(node.z_latent)))
+        for node in final_state.nodes.values()
+    )
+
+
+def test_guard_rejects_invalid_decay():
+    with pytest.raises(ValueError, match="rise_decay"):
+        InferenceSGDNormClipDecay(rise_decay=0.0)
+
+
+def test_train_mlm_pc_logs_energy_rises_and_validation(rng_key, capsys):
+    structure = _small_mlm_with_guard(eta_infer=5.0, infer_steps=5, rise_decay=0.5)
+    params = initialize_params(structure, rng_key)
+
+    train_mlm(
+        params,
+        structure,
+        [tiny_batch()],
+        optax.adam(1e-2),
+        {"max_steps": 1, "log_interval": 1, "validation_interval": 1},
+        rng_key,
+        mode="pc",
+        val_loader=[tiny_batch()],
+        verbose=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "energy_rises=" in out
+    assert "step=1 validation_masked_loss=" in out
