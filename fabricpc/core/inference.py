@@ -416,6 +416,44 @@ class InferenceSGDNormClipDecay(InferenceSGDNormClip):
         return total.astype(jnp.result_type(float))
 
     @staticmethod
+    def initial_guard_carry(batch_size: int, config: Dict[str, Any]):
+        """Return the starting per-sample rates and previous energies."""
+        float_dtype = jnp.result_type(float)
+        eta0 = jnp.full((batch_size,), config["eta_infer"], dtype=float_dtype)
+        prev_energy = jnp.full((batch_size,), jnp.inf, dtype=float_dtype)
+        return eta0, prev_energy
+
+    @staticmethod
+    def guarded_step(
+        params: GraphParams,
+        state: GraphState,
+        eta: jax.Array,
+        prev_energy: jax.Array,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ):
+        """Run one guarded inference step.
+
+        Returns ``(state, eta, energy, rises)`` where ``eta`` holds the
+        per-sample rates used for this update, ``energy`` the per-sample total
+        energy before it and ``rises`` the int32 count of samples whose energy
+        rose against ``prev_energy``.
+        """
+        inference_obj = structure.config["inference"]
+        cls = type(inference_obj)
+        config = dict(inference_obj.config)
+        batch_size = eta.shape[0]
+        state = cls.zero_grads(params, state, clamps, structure)
+        state = cls.forward_value_and_grad(params, state, clamps, structure)
+        energy = cls.total_energy(state, structure, batch_size)
+        rose = energy > prev_energy
+        eta = jnp.where(rose, eta * config["rise_decay"], eta)
+        state = cls.update_latents(
+            params, state, clamps, structure, {**config, "eta_infer": eta}
+        )
+        return state, eta, energy, jnp.sum(rose, dtype=jnp.int32)
+
+    @staticmethod
     def run_inference_with_stats(
         params: GraphParams,
         initial_state: GraphState,
@@ -427,25 +465,19 @@ class InferenceSGDNormClipDecay(InferenceSGDNormClip):
         cls = type(inference_obj)
         config = dict(inference_obj.config)
         batch_size = next(iter(clamps.values())).shape[0]
-        float_dtype = jnp.result_type(float)
-        eta0 = jnp.full((batch_size,), config["eta_infer"], dtype=float_dtype)
+        eta0, prev_energy0 = cls.initial_guard_carry(batch_size, config)
 
         def body_fn(t, carry):
             state, eta, prev_energy, rises = carry
-            state = cls.zero_grads(params, state, clamps, structure)
-            state = cls.forward_value_and_grad(params, state, clamps, structure)
-            energy = cls.total_energy(state, structure, batch_size)
-            rose = energy > prev_energy
-            eta = jnp.where(rose, eta * config["rise_decay"], eta)
-            state = cls.update_latents(
-                params, state, clamps, structure, {**config, "eta_infer": eta}
+            state, eta, energy, step_rises = cls.guarded_step(
+                params, state, eta, prev_energy, clamps, structure
             )
-            return state, eta, energy, rises + jnp.sum(rose, dtype=jnp.int32)
+            return state, eta, energy, rises + step_rises
 
         carry = (
             initial_state,
             eta0,
-            jnp.full((batch_size,), jnp.inf, dtype=float_dtype),
+            prev_energy0,
             jnp.array(0, dtype=jnp.int32),
         )
         final_state, eta, _, rises = jax.lax.fori_loop(
