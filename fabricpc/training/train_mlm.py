@@ -217,7 +217,15 @@ def get_graph_param_gradient_pcn_mlm(
         clamps=clamps,
         params=params,
     )
-    final_state = run_inference(params, initial_state, clamps, structure)
+    inference_cls = type(structure.config["inference"])
+    if hasattr(inference_cls, "run_inference_with_stats"):
+        final_state, inference_stats = inference_cls.run_inference_with_stats(
+            params, initial_state, clamps, structure
+        )
+        energy_rises = inference_stats["energy_rises"]
+    else:
+        final_state = run_inference(params, initial_state, clamps, structure)
+        energy_rises = jnp.array(0, dtype=jnp.int32)
     grads = compute_local_weight_gradients(params, final_state, structure)
     output_energy = jnp.sum(final_state.nodes[output_node].energy) / batch_size
     total_energy = jnp.array(0.0)
@@ -231,6 +239,7 @@ def get_graph_param_gradient_pcn_mlm(
         "num_masked_tokens": jnp.sum(batch["loss_mask"].astype(jnp.float32)),
         "pc_output_energy": output_energy,
         "pc_total_energy": total_energy,
+        "pc_energy_rises": energy_rises,
     }
     return grads, metrics, initial_state, free_state, final_state
 
@@ -240,8 +249,8 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
     rng_key: jax.Array,
-) -> tuple[GraphParams, jax.Array, jax.Array]:
-    """Compute lean PC MLM grads and loss totals for accumulated training."""
+) -> tuple[GraphParams, jax.Array, jax.Array, jax.Array]:
+    """Compute lean PC MLM grads, loss totals and inference energy rises."""
     grads, metrics, _initial_state, _free_state, _final_state = (
         get_graph_param_gradient_pcn_mlm(
             params,
@@ -252,7 +261,7 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     )
     masked_count = metrics["num_masked_tokens"]
     loss_numerator = metrics["masked_loss"] * masked_count
-    return grads, loss_numerator, masked_count
+    return grads, loss_numerator, masked_count, metrics["pc_energy_rises"]
 
 
 def pc_node_gradient_norms(
@@ -489,6 +498,7 @@ def train_pcn_mlm(
     pending_micro_batches = 0
     pending_loss_numerator = jnp.array(0.0)
     pending_masked_count = jnp.array(0.0)
+    pending_energy_rises = jnp.array(0, dtype=jnp.int32)
 
     while step < max_steps:
         progressed = False
@@ -503,7 +513,9 @@ def train_pcn_mlm(
             batch = _convert_batch(batch_data)
             _validate_pcn_mlm_batch(batch, structure)
             rng_key, step_key = jax.random.split(rng_key)
-            grads, loss_numerator, masked_count = grad_fn(params, batch, step_key)
+            grads, loss_numerator, masked_count, energy_rises = grad_fn(
+                params, batch, step_key
+            )
             scaled_grads = jax.tree_util.tree_map(
                 lambda grad: grad / gradient_accumulation_steps,
                 grads,
@@ -519,6 +531,7 @@ def train_pcn_mlm(
             )
             pending_loss_numerator = pending_loss_numerator + loss_numerator
             pending_masked_count = pending_masked_count + masked_count
+            pending_energy_rises = pending_energy_rises + energy_rises
             pending_micro_batches += 1
             micro_steps += 1
             progressed = True
@@ -551,12 +564,21 @@ def train_pcn_mlm(
                 pending_loss_numerator / jnp.maximum(pending_masked_count, 1.0)
             )
             losses.append(loss)
+            should_log = verbose and log_interval > 0 and step % log_interval == 0
+            if should_log:
+                grad_norm = float(optax.tree.norm(pending_grads))
+                logged_rises = int(pending_energy_rises)
             pending_grads = None
             pending_micro_batches = 0
             pending_loss_numerator = jnp.array(0.0)
             pending_masked_count = jnp.array(0.0)
-            if verbose and log_interval > 0 and step % log_interval == 0:
-                print(f"step={step} masked_loss={loss:.4f}")
+            pending_energy_rises = jnp.array(0, dtype=jnp.int32)
+            if should_log:
+                print(
+                    f"step={step} masked_loss={loss:.4f} grad_norm={grad_norm:.4e} "
+                    f"param_norm={float(optax.tree.norm(params)):.4e} "
+                    f"energy_rises={logged_rises}"
+                )
             if checkpoint_path and step % checkpoint_interval == 0:
                 save_mlm_training_checkpoint(
                     checkpoint_path,
@@ -574,6 +596,15 @@ def train_pcn_mlm(
             ):
                 val_metrics = evaluate_mlm(params, structure, val_loader, rng_key)
                 validation.append(cast(dict[str, float], val_metrics))
+                if verbose:
+                    print(
+                        f"step={step} "
+                        f"validation_masked_loss={val_metrics['masked_loss']:.4f} "
+                        "validation_masked_accuracy="
+                        f"{val_metrics['masked_accuracy']:.4f} "
+                        "validation_masked_tokens="
+                        f"{val_metrics['num_masked_tokens']:.0f}"
+                    )
         if not progressed:
             raise ValueError("train_loader did not yield any supervised MLM batches")
 
