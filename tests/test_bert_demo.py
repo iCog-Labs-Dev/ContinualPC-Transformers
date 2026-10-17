@@ -554,3 +554,31 @@ def test_pc_incremental_pretrain_tiny_smoke(capsys):
     out = capsys.readouterr().out
     assert "step=2 masked_loss=" in out
     assert "energy_rises=" in out
+
+
+def test_adam_eps_flag_damps_updates_from_tiny_gradients():
+    import jax.numpy as jnp
+
+    from examples.bert_demo import build_optimizer, parse_args
+
+    assert parse_args(["--stage", "pretrain"]).adam_eps == 1e-8
+    with pytest.raises(ValueError, match="--adam_eps"):
+        parse_args(["--stage", "pretrain", "--adam_eps", "0"])
+
+    params = {"w": jnp.zeros(3)}
+    grads = {"w": jnp.full(3, 1e-8)}
+    steps = {}
+    for eps in (1e-8, 1e-6):
+        optimizer = build_optimizer(
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            grad_clip=0.0,
+            warmup_steps=0,
+            total_steps=10,
+            adam_eps=eps,
+        )
+        updates, _ = optimizer.update(grads, optimizer.init(params), params)
+        steps[eps] = float(jnp.max(jnp.abs(updates["w"])))
+
+    assert steps[1e-8] == pytest.approx(0.5e-3, rel=1e-2)
+    assert steps[1e-6] < 0.02e-3

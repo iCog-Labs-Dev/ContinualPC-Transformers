@@ -293,6 +293,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_total_chars", type=int, default=100_000_000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--adam_eps",
+        type=float,
+        default=1e-8,
+        help="AdamW epsilon; larger values damp updates from near-zero gradients",
+    )
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--mask_prob", type=float, default=0.15)
@@ -370,7 +376,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    if args.adam_eps <= 0.0:
+        raise ValueError("--adam_eps must be positive")
+    return args
 
 
 def _reject_unsupported_pc(args: argparse.Namespace) -> None:
@@ -386,12 +395,14 @@ def build_optimizer(
     warmup_steps: int,
     total_steps: int,
     schedule_step_divisor: int = 1,
+    adam_eps: float = 1e-8,
 ) -> optax.GradientTransformation:
     optimizer = build_warmup_cosine_adamw(
         learning_rate=learning_rate,
         total_steps=max(1, total_steps),
         warmup_steps=min(warmup_steps, max(1, total_steps)),
         weight_decay=weight_decay,
+        eps=adam_eps,
         schedule_step_divisor=schedule_step_divisor,
     )
     if grad_clip <= 0:
@@ -670,6 +681,7 @@ def train_classifier(params, structure, train_loader, test_loader, args, rng_key
         grad_clip=args.grad_clip,
         warmup_steps=args.warmup_steps,
         total_steps=args.num_epochs * len(train_loader),
+        adam_eps=args.adam_eps,
     )
     opt_state = optimizer.init(params)
     for _ in range(args.num_epochs):
@@ -985,6 +997,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         warmup_steps=args.warmup_steps,
         total_steps=max_steps,
         schedule_step_divisor=updates_per_batch,
+        adam_eps=args.adam_eps,
     )
     params, state = train_mlm(
         params,
@@ -1012,6 +1025,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 "grad_clip": args.grad_clip,
                 "warmup_steps": args.warmup_steps,
                 "total_steps": max_steps,
+                **({"adam_eps": args.adam_eps} if args.adam_eps != 1e-8 else {}),
             },
             "tokens_per_update": args.tokens_per_update,
             "gradient_accumulation_steps": gradient_accumulation_steps,
