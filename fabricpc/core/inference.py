@@ -4,6 +4,7 @@ Core inference dynamics for JAX predictive coding networks.
 This module provides:
 - InferenceBase: Abstract base class for inference algorithms
 - InferenceSGD: Default SGD-based inference (z -= eta * grad)
+- InferenceSpikingPrecision: Norm-clipped SGD with a depth-timed spike step
 - run_inference: Convenience function wrapping the class-based API
 
 Inference algorithms control how latent states are updated during the
@@ -25,6 +26,7 @@ import types
 import jax
 import jax.numpy as jnp
 
+from fabricpc.core.depth import DEPTH_MODES, node_output_depths
 from fabricpc.core.scaling import (
     scale_input_grads,
     scale_inputs,
@@ -497,6 +499,197 @@ class InferenceSGDNormClipDecay(InferenceSGDNormClip):
         structure: GraphStructure,
     ) -> GraphState:
         final_state, _ = InferenceSGDNormClipDecay.run_inference_with_stats(
+            params, initial_state, clamps, structure
+        )
+        return final_state
+
+
+class InferenceSpikingPrecision(InferenceSGDNormClip):
+    """
+    Norm-clipped SGD inference with a depth-timed spike step per node.
+
+    Each node at output depth ``d`` (path length in edges to the output nodes,
+    see ``node_output_depths``) takes one step of size ``spike_eta`` at
+    inference step ``t = d - 1 + spike_offset`` (0-based), the step at which
+    the output error first reaches it from a feedforward start. All other steps
+    are identical to ``InferenceSGDNormClip`` with rate ``eta_infer``. The spike
+    step skips norm clipping unless ``spike_clip`` is true and never applies
+    ``latent_decay``: it is exactly ``z - spike_eta * grad``. This is spiking
+    precision, Eq. 4, Qi et al. 2025 (arXiv 2506.23800), with step
+    ``eta / Sigma``. ``inference_step`` has no step index and raises;
+    use ``spiking_step`` or ``run_inference``.
+
+    Args:
+        eta_infer: Rate for non-spike steps; zero is allowed (default: 0.1)
+        infer_steps: Number of inference iterations (default: 20)
+        latent_decay: Latent decay on non-spike steps (default: 0.0)
+        max_norm: Maximum gradient norm per node (default: 1.0)
+        eps: Small constant for numerical stability (default: 1e-8)
+        spike_eta: Step size at a node's spike step (default: 1.0)
+        spike_offset: Non-negative shift of every spike step (default: 0)
+        spike_clip: Norm-clip the spike step as well (default: False)
+        depth_mode: "longest" or "shortest" path to the outputs
+            (default: "longest")
+    """
+
+    def __init__(
+        self,
+        eta_infer=0.1,
+        infer_steps=20,
+        latent_decay=0.0,
+        max_norm=1.0,
+        eps=1e-8,
+        spike_eta=1.0,
+        spike_offset=0,
+        spike_clip=False,
+        depth_mode="longest",
+    ):
+        if not spike_eta > 0.0:
+            raise ValueError("spike_eta must be positive")
+        if not eta_infer >= 0.0:
+            raise ValueError("eta_infer must be non-negative")
+        if isinstance(spike_offset, bool) or not isinstance(spike_offset, int):
+            raise ValueError("spike_offset must be an integer")
+        if spike_offset < 0:
+            raise ValueError("spike_offset must be non-negative")
+        if depth_mode not in DEPTH_MODES:
+            raise ValueError(f"depth_mode must be one of {DEPTH_MODES}")
+        InferenceBase.__init__(
+            self,
+            eta_infer=eta_infer,
+            latent_decay=latent_decay,
+            infer_steps=infer_steps,
+            max_norm=max_norm,
+            eps=eps,
+            spike_eta=spike_eta,
+            spike_offset=spike_offset,
+            spike_clip=bool(spike_clip),
+            depth_mode=depth_mode,
+        )
+
+    @staticmethod
+    def inference_step(params, state, clamps, structure, config):
+        """Raise: a spiking step needs the step index (see ``spiking_step``)."""
+        raise NotImplementedError(
+            "InferenceSpikingPrecision needs the step index; use spiking_step "
+            "or run_inference"
+        )
+
+    @staticmethod
+    def spike_steps(
+        structure: GraphStructure, config: Dict[str, Any]
+    ) -> Dict[str, int]:
+        """Return the 0-based inference step at which each node spikes."""
+        depths = node_output_depths(structure, config["depth_mode"])
+        return {
+            name: depth - 1 + config["spike_offset"] for name, depth in depths.items()
+        }
+
+    @staticmethod
+    def update_latents_at_step(
+        params: GraphParams,
+        state: GraphState,
+        t: jax.Array,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Update free latents with the spike rate where ``t`` is the spike step."""
+        spike_steps = InferenceSpikingPrecision.spike_steps(structure, config)
+        spike_config = {
+            **config,
+            "eta_infer": config["spike_eta"],
+            "latent_decay": 0.0,
+            "max_norm": config["max_norm"] if config["spike_clip"] else jnp.inf,
+        }
+        for node_name in structure.nodes:
+            if node_name in clamps:
+                continue
+            node_state = state.nodes[node_name]
+            new_z_latent = InferenceSGDNormClip.compute_new_latent(
+                node_name, node_state, config
+            )
+            if node_name in spike_steps:
+                spiked = InferenceSGDNormClip.compute_new_latent(
+                    node_name, node_state, spike_config
+                )
+                new_z_latent = jnp.where(
+                    t == spike_steps[node_name], spiked, new_z_latent
+                )
+            state = update_node_in_state(state, node_name, z_latent=new_z_latent)
+        return state
+
+    @staticmethod
+    def spiking_step(
+        params: GraphParams,
+        state: GraphState,
+        t: jax.Array,
+        prev_energy: jax.Array,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ):
+        """Run inference step ``t``.
+
+        Returns ``(state, energy, rises)`` where ``energy`` is the per-sample
+        total energy before the update and ``rises`` the int32 count of samples
+        whose energy rose against ``prev_energy``.
+        """
+        inference_obj = structure.config["inference"]
+        cls = type(inference_obj)
+        config = dict(inference_obj.config)
+        batch_size = prev_energy.shape[0]
+        state = cls.zero_grads(params, state, clamps, structure)
+        state = cls.forward_value_and_grad(params, state, clamps, structure)
+        energy = InferenceSGDNormClipDecay.total_energy(state, structure, batch_size)
+        rises = jnp.sum(energy > prev_energy, dtype=jnp.int32)
+        state = cls.update_latents_at_step(params, state, t, clamps, structure, config)
+        return state, energy, rises
+
+    @staticmethod
+    def run_inference_with_stats(
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ):
+        """Run spiking inference; return the final state and statistics.
+
+        Statistics match ``InferenceSGDNormClipDecay``: ``energy_rises``
+        counts sample-steps whose total energy rose, ``final_eta`` holds the
+        per-sample non-spike rate and ``final_eta_mean`` its mean.
+        """
+        inference_obj = structure.config["inference"]
+        config = dict(inference_obj.config)
+        batch_size = next(iter(clamps.values())).shape[0]
+        float_dtype = jnp.result_type(float)
+        prev_energy0 = jnp.full((batch_size,), jnp.inf, dtype=float_dtype)
+
+        def body_fn(t, carry):
+            state, prev_energy, rises = carry
+            state, energy, step_rises = InferenceSpikingPrecision.spiking_step(
+                params, state, t, prev_energy, clamps, structure
+            )
+            return state, energy, rises + step_rises
+
+        carry = (initial_state, prev_energy0, jnp.array(0, dtype=jnp.int32))
+        final_state, _, rises = jax.lax.fori_loop(
+            0, config["infer_steps"], body_fn, carry
+        )
+        eta = jnp.full((batch_size,), config["eta_infer"], dtype=float_dtype)
+        return final_state, {
+            "energy_rises": rises,
+            "final_eta": eta,
+            "final_eta_mean": jnp.mean(eta),
+        }
+
+    @staticmethod
+    def run_inference(
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        final_state, _ = InferenceSpikingPrecision.run_inference_with_stats(
             params, initial_state, clamps, structure
         )
         return final_state

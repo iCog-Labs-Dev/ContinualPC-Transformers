@@ -45,9 +45,12 @@ from fabricpc.core.inference import (
     InferenceSGD,
     InferenceSGDNormClip,
     InferenceSGDNormClipDecay,
+    InferenceSpikingPrecision,
     gather_inputs,
     run_inference,
 )
+
+from fabricpc.core.depth import node_output_depths
 
 # Initializers
 from fabricpc.core.initializers import (
@@ -98,6 +101,8 @@ __all__ = [
     "InferenceSGD",
     "InferenceSGDNormClip",
     "InferenceSGDNormClipDecay",
+    "InferenceSpikingPrecision",
+    "node_output_depths",
     "gather_inputs",
     "run_inference",
     # Initializers
