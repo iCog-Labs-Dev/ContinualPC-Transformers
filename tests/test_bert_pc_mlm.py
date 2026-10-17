@@ -1161,6 +1161,45 @@ def test_spiking_zil_stays_close_to_backprop_at_default_init():
     assert all(cosine > 0.9999 for cosine in cosines.values()), cosines
 
 
+def _zil_encoder_errors_with_dropout(dropout_rate: float):
+    """Return PC-vs-BP relative errors and cosines with dropout masks active."""
+
+    def build(infer_steps: int):
+        return create_encoder_mlm_model(
+            depth=2,
+            embed_dim=16,
+            num_heads=4,
+            mlp_dim=32,
+            seq_len=6,
+            vocab_size=20,
+            inference=InferenceSpikingPrecision(
+                eta_infer=0.0, infer_steps=infer_steps, max_norm=5.0
+            ),
+            use_attention_mask=True,
+            dropout_rate=dropout_rate,
+        )
+
+    structure = build(_max_free_depth(build(1), "longest"))
+    key = jax.random.PRNGKey(0)
+    params = initialize_params(structure, key)
+    batch = _two_sample_batch()
+    pc_grads, *_ = get_graph_param_gradient_pcn_mlm(
+        params, batch, structure, key, forward_updates="initial"
+    )
+    _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
+        params, batch, structure, key
+    )
+    return _relative_errors(pc_grads, bp_grads), _cosines(pc_grads, bp_grads)
+
+
+def test_spiking_zil_matches_backprop_with_dropout():
+    with jax.enable_x64(True):
+        errors, cosines = _zil_encoder_errors_with_dropout(0.3)
+
+    assert all(error < 1e-3 for error in errors.values()), errors
+    assert all(cosine > 0.9999 for cosine in cosines.values()), cosines
+
+
 def test_spiking_zil_shortest_depth_misaligns_block_inputs():
     with jax.enable_x64(True):
         longest, _ = _zil_encoder_errors("longest", transformer_init_std=0.3)
