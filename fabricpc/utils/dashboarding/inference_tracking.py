@@ -15,11 +15,21 @@ from fabricpc.core.types import (
     GraphStructure,
     NodeState,
 )
+from fabricpc.core.inference import InferenceSpikingPrecision
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 
 
 # TODO clarify collect_every refers to either batches or inference steps
+def _reject_step_indexed_inference(inference_obj) -> None:
+    """Raise for inference whose steps depend on the step index."""
+    if isinstance(inference_obj, InferenceSpikingPrecision):
+        raise NotImplementedError(
+            "inference history tracking does not support InferenceSpikingPrecision; "
+            "its spike steps need the step index"
+        )
+
+
 def run_inference_with_history(
     params: GraphParams,
     initial_state: GraphState,
@@ -51,6 +61,7 @@ def run_inference_with_history(
     # Get infer_steps from structure's inference config
     inference_obj = structure.config["inference"]
     inference_cls = type(inference_obj)
+    _reject_step_indexed_inference(inference_obj)
     config = inference_obj.config
     infer_steps = config["infer_steps"]
 
@@ -144,6 +155,7 @@ def run_inference_with_full_history(
     # Get infer_steps from structure's inference config
     inference_obj = structure.config["inference"]
     inference_cls = type(inference_obj)
+    _reject_step_indexed_inference(inference_obj)
     config = inference_obj.config
     infer_steps = config["infer_steps"]
 

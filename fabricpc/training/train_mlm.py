@@ -10,10 +10,22 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fabricpc.core.inference import InferenceSGDNormClipDecay, run_inference
-from fabricpc.core.learning import compute_local_weight_gradients
+from fabricpc.core.depth import output_node_names
+from fabricpc.core.inference import (
+    InferenceSGDNormClipDecay,
+    InferenceSpikingPrecision,
+    run_inference,
+)
+from fabricpc.core.learning import (
+    FORWARD_UPDATE_MODES,
+    compute_local_weight_gradients,
+    compute_local_weight_gradients_forward_update,
+)
 from fabricpc.core.types import GraphParams, GraphState, GraphStructure
-from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.graph_initialization.state_initializer import (
+    FeedforwardStateInit,
+    initialize_graph_state,
+)
 from fabricpc.training.train import _convert_batch
 from fabricpc.training.train_autoregressive import compute_loss, create_dropout_clamps
 from fabricpc.training.train_backprop import (
@@ -238,13 +250,71 @@ def _prepare_pcn_mlm_batch(
     return shared_clamps, free_metrics, free_state, initial_state, clamps
 
 
+def _validate_forward_updates(forward_updates: str) -> None:
+    allowed = ("none", *FORWARD_UPDATE_MODES)
+    if forward_updates not in allowed:
+        raise ValueError(
+            f"pc_forward_updates must be one of {allowed}, got {forward_updates!r}"
+        )
+
+
+def _validate_feedforward_start(
+    structure: GraphStructure, forward_updates: str
+) -> None:
+    """Require feedforward state init for forward updates and spiking inference.
+
+    Forward updates read the feedforward prediction from the initial state and
+    the spike schedule assumes zero hidden errors at the start.
+    """
+    spiking = isinstance(structure.config["inference"], InferenceSpikingPrecision)
+    if forward_updates == "none" and not spiking:
+        return
+    if not isinstance(
+        structure.config.get("graph_state_initializer"), FeedforwardStateInit
+    ):
+        raise ValueError(
+            "pc_forward_updates and InferenceSpikingPrecision require "
+            "FeedforwardStateInit as the graph_state_initializer"
+        )
+
+
+def ipc_weight_spike_steps(
+    structure: GraphStructure, clamps: Dict[str, jnp.ndarray]
+) -> dict[str, int]:
+    """Return the iPC iteration at which each node's weight gradient is scaled.
+
+    This is the spike step + 1, the first iteration whose state holds the
+    spiked latent. Output nodes and clamped nodes never spike and are left out.
+    """
+    inference_obj = structure.config["inference"]
+    outputs = set(output_node_names(structure))
+    return {
+        name: step + 1
+        for name, step in type(inference_obj)
+        .spike_steps(structure, dict(inference_obj.config))
+        .items()
+        if name not in outputs
+        and name not in clamps
+        and structure.nodes[name].node_info.in_degree > 0
+    }
+
+
 def get_graph_param_gradient_pcn_mlm(
     params: GraphParams,
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
     rng_key: jax.Array,
+    forward_updates: str = "none",
 ) -> Tuple[GraphParams, dict[str, jax.Array], GraphState, GraphState, GraphState]:
-    """Compute one BERT MLM PC local-gradient step without applying updates."""
+    """Compute one BERT MLM PC local-gradient step without applying updates.
+
+    ``forward_updates`` selects the weight-gradient rule: ``"none"`` uses
+    ``compute_local_weight_gradients`` on the final state, ``"initial"`` and
+    ``"final"`` use ``compute_local_weight_gradients_forward_update`` in that
+    mode.
+    """
+    _validate_forward_updates(forward_updates)
+    _validate_feedforward_start(structure, forward_updates)
     _shared_clamps, free_metrics, free_state, initial_state, clamps = (
         _prepare_pcn_mlm_batch(params, batch, structure, rng_key)
     )
@@ -259,7 +329,12 @@ def get_graph_param_gradient_pcn_mlm(
     else:
         final_state = run_inference(params, initial_state, clamps, structure)
         energy_rises = jnp.array(0, dtype=jnp.int32)
-    grads = compute_local_weight_gradients(params, final_state, structure)
+    if forward_updates == "none":
+        grads = compute_local_weight_gradients(params, final_state, structure)
+    else:
+        grads = compute_local_weight_gradients_forward_update(
+            params, initial_state, final_state, structure, forward_updates
+        )
     output_energy = jnp.sum(final_state.nodes[output_node].energy) / batch_size
     total_energy = jnp.array(0.0)
     for node_name, node in structure.nodes.items():
@@ -280,6 +355,7 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
     rng_key: jax.Array,
+    forward_updates: str = "none",
 ) -> tuple[GraphParams, jax.Array, jax.Array, jax.Array]:
     """Compute lean PC MLM grads, loss totals and inference energy rises."""
     grads, metrics, _initial_state, _free_state, _final_state = (
@@ -288,6 +364,7 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
             batch,
             structure,
             rng_key,
+            forward_updates,
         )
     )
     masked_count = metrics["num_masked_tokens"]
@@ -300,6 +377,7 @@ def pc_node_gradient_norms(
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
     rng_key: jax.Array,
+    forward_updates: str = "none",
 ) -> dict[str, float]:
     """Return the global L2 norm of each parameterised node's PC gradient.
 
@@ -308,7 +386,7 @@ def pc_node_gradient_norms(
     nodes, embeddings included, get an exactly zero gradient.
     """
     grads, _metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
-        params, batch, structure, rng_key
+        params, batch, structure, rng_key, forward_updates
     )
     norms = {}
     for name, node_grads in grads.nodes.items():
@@ -318,19 +396,24 @@ def pc_node_gradient_norms(
     return norms
 
 
-def create_pc_bp_gradient_comparison(structure: GraphStructure):
+def create_pc_bp_gradient_comparison(
+    structure: GraphStructure, forward_updates: str = "none"
+):
     """Create a JIT-compiled per-node PC vs backprop gradient comparison.
 
     The returned function maps ``(params, batch, rng_key)`` to
     ``{node: {"pc_norm", "bp_norm", "cosine"}}`` for every parameterised node,
     comparing PC local gradients with backprop gradients of the masked loss on
     the same batch. Norm ratios carry a global loss-scale constant; compare
-    them against the ``mlm_head`` ratio rather than against one.
+    them against the ``mlm_head`` ratio rather than against one. PC gradients
+    use the training rule selected by ``forward_updates``.
     """
+    _validate_forward_updates(forward_updates)
+    _validate_feedforward_start(structure, forward_updates)
 
     def compare(params, batch, rng_key):
         pc_grads, _metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
-            params, batch, structure, rng_key
+            params, batch, structure, rng_key, forward_updates
         )
         _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
             params, batch, structure, rng_key
@@ -361,6 +444,7 @@ def train_step_pcn_mlm(
     structure: GraphStructure,
     optimizer: optax.GradientTransformation,
     rng_key: jax.Array,
+    forward_updates: str = "none",
 ) -> Tuple[
     GraphParams,
     optax.OptState,
@@ -369,13 +453,18 @@ def train_step_pcn_mlm(
     GraphState,
     GraphState,
 ]:
-    """Single-device predictive-coding MLM training step."""
+    """Single-device predictive-coding MLM training step.
+
+    ``forward_updates`` selects the weight-gradient rule as in
+    ``get_graph_param_gradient_pcn_mlm``.
+    """
     grads, metrics, initial_state, free_state, final_state = (
         get_graph_param_gradient_pcn_mlm(
             params,
             batch,
             structure,
             rng_key,
+            forward_updates,
         )
     )
     params, opt_state = _apply_optimizer_update_when_masked(
@@ -388,11 +477,14 @@ def train_step_pcn_mlm(
     return params, opt_state, metrics, initial_state, free_state, final_state
 
 
-def create_jit_gradient_step_pcn_mlm(structure: GraphStructure):
+def create_jit_gradient_step_pcn_mlm(
+    structure: GraphStructure, forward_updates: str = "none"
+):
     """Create a JIT-compiled PC MLM gradient step for accumulation."""
+    _validate_forward_updates(forward_updates)
     return jax.jit(
         lambda p, b, k: get_graph_param_gradient_pcn_mlm_accumulation(
-            p, b, structure, k
+            p, b, structure, k, forward_updates
         )
     )
 
@@ -426,6 +518,17 @@ def _train_step_pcn_mlm_incremental_with_state(
     inference_cls = type(inference_obj)
     config = inference_obj.config
     guarded = issubclass(inference_cls, InferenceSGDNormClipDecay)
+    spiking = issubclass(inference_cls, InferenceSpikingPrecision)
+    if spiking:
+        _validate_feedforward_start(structure, "none")
+        if not config["eta_infer"] > 0.0:
+            raise ValueError("incremental PC with spiking needs eta_infer > 0")
+        if config["depth_mode"] != "longest":
+            raise ValueError(
+                "incremental PC with spiking supports only depth_mode='longest'"
+            )
+        weight_spike_steps = ipc_weight_spike_steps(structure, clamps)
+        spike_ratio = config["spike_eta"] / config["eta_infer"]
     masked_count = free_metrics["num_masked_tokens"]
     batch_size = batch["x"].shape[0]
     float_dtype = jnp.result_type(float)
@@ -433,6 +536,9 @@ def _train_step_pcn_mlm_incremental_with_state(
         eta0, prev_energy0 = InferenceSGDNormClipDecay.initial_guard_carry(
             batch_size, dict(config)
         )
+    elif spiking:
+        eta0 = jnp.zeros((batch_size,), dtype=float_dtype)
+        prev_energy0 = jnp.full((batch_size,), jnp.inf, dtype=float_dtype)
     else:
         eta0 = jnp.zeros((batch_size,), dtype=float_dtype)
         prev_energy0 = jnp.zeros((batch_size,), dtype=float_dtype)
@@ -446,6 +552,12 @@ def _train_step_pcn_mlm_incremental_with_state(
                 params, state, eta, prev_energy, clamps, structure
             )
             rises = rises + step_rises
+        elif spiking:
+            state, prev_energy, step_rises = inference_cls.spiking_step(
+                params, state, t, prev_energy, clamps, structure
+            )
+            rises = rises + step_rises
+            grads = _scale_spike_step_grads(grads, weight_spike_steps, spike_ratio, t)
         else:
             state = inference_cls.inference_step(
                 params, state, clamps, structure, config
@@ -480,6 +592,30 @@ def _train_step_pcn_mlm_incremental_with_state(
     return params, opt_state, metrics, final_state
 
 
+def _scale_spike_step_grads(
+    grads: GraphParams,
+    spike_steps: dict[str, int],
+    spike_ratio: float,
+    t: jax.Array,
+) -> GraphParams:
+    """Scale a node's gradient by ``spike_ratio`` where ``t`` equals its entry.
+
+    ``spike_steps`` holds the spike step + 1 per node (see
+    ``ipc_weight_spike_steps``). The ratio ``spike_eta / eta_infer`` matches
+    the latent step ratio only approximately, since spike steps are unclipped
+    and other steps are norm-clipped.
+    """
+    nodes = {}
+    for name, node_grads in grads.nodes.items():
+        if name in spike_steps:
+            factor = jnp.where(t == spike_steps[name], spike_ratio, 1.0)
+            node_grads = jax.tree_util.tree_map(
+                lambda grad: grad * factor.astype(grad.dtype), node_grads
+            )
+        nodes[name] = node_grads
+    return GraphParams(nodes=nodes)
+
+
 def train_step_pcn_mlm_incremental(
     params: GraphParams,
     opt_state: optax.OptState,
@@ -498,6 +634,16 @@ def train_step_pcn_mlm_incremental(
     inference is ``InferenceSGDNormClipDecay``) and applies one optimizer
     update. Batches without masked tokens leave params and optimizer state
     unchanged.
+
+    With ``InferenceSpikingPrecision`` the latent step ``t`` uses the spike
+    schedule, and each node's weight gradient is multiplied by
+    ``spike_eta / eta_infer`` at the iteration after its spike step, the
+    first one whose state holds the spiked latent, before the optimizer update:
+    the ``eta / Sigma`` weight step of Alg. 1, Qi et al. 2025, for latents
+    updated before weights. At the spike step itself the node's error is
+    still zero from a feedforward start. The scaling acts on the gradient, so
+    it scales the update linearly only for plain SGD; Adam-type optimizers
+    renormalise it.
 
     Metrics hold ``masked_loss``, ``masked_accuracy`` and
     ``num_masked_tokens`` of the feedforward state before any update,
@@ -538,6 +684,9 @@ def train_pcn_mlm(
     With ``config["pc_incremental"]`` true each batch runs incremental PC
     (``train_step_pcn_mlm_incremental``), applying one optimizer update per
     inference iteration; gradient accumulation is then rejected.
+    ``config["pc_forward_updates"]`` ("none", "initial" or "final") selects
+    the weight-gradient rule of standard PC and is rejected with incremental
+    PC.
     """
     if config.get("use_pmap"):
         raise ValueError("pmap PC MLM training is not implemented yet")
@@ -570,6 +719,14 @@ def train_pcn_mlm(
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     pc_incremental = bool(config.get("pc_incremental", False))
+    forward_updates = config.get("pc_forward_updates", "none")
+    _validate_forward_updates(forward_updates)
+    _validate_feedforward_start(structure, forward_updates)
+    if pc_incremental and forward_updates != "none":
+        raise ValueError(
+            "incremental PC MLM training does not support pc_forward_updates; "
+            f"got {forward_updates!r}"
+        )
     if pc_incremental and gradient_accumulation_steps > 1:
         raise ValueError(
             "incremental PC MLM training does not support gradient accumulation; "
@@ -607,7 +764,7 @@ def train_pcn_mlm(
             structure, optimizer
         )
     else:
-        grad_fn = create_jit_gradient_step_pcn_mlm(structure)
+        grad_fn = create_jit_gradient_step_pcn_mlm(structure, forward_updates)
         update_fn = create_jit_update_step_pcn_mlm(optimizer)
     losses: list[float] = []
     validation: list[dict[str, float]] = []
