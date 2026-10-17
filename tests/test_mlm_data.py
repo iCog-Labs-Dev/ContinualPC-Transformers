@@ -230,3 +230,132 @@ class TestTokenizeTextsBpe:
 
         assert same is tokenizer
         assert token_ids[-1] == tokenizer.token_to_id("[SEP]")
+
+
+def _reference_window_starts(
+    token_ids, special_token_ids, stride, window, max_sequences
+):
+    """Full-stream prefix-sum scan, kept as the expected output."""
+    starts = np.arange(0, len(token_ids), stride, dtype=np.int64)
+    eligible = ~np.isin(token_ids, list(special_token_ids))
+    eligible_before = np.concatenate([[0], np.cumsum(eligible)])
+    ends = np.minimum(starts + window, len(token_ids))
+    has_maskable = eligible_before[ends] - eligible_before[starts] > 0
+    starts = starts[has_maskable].astype(np.int32)
+    return starts if max_sequences is None else starts[:max_sequences]
+
+
+class TestMaskableWindowStarts:
+    @pytest.mark.parametrize("stride, window", [(2, 5), (5, 5), (3, 5), (40, 5)])
+    @pytest.mark.parametrize("max_sequences", [None, 0, 1, 3, 1000])
+    @pytest.mark.parametrize("block_tokens", [1, 7, 16, 64])
+    def test_matches_full_scan(self, stride, window, max_sequences, block_tokens):
+        rng = np.random.default_rng(stride * 100 + window)
+        tokens = rng.integers(0, 8, size=203).astype(np.int32)
+        tokens[50:90] = 2
+
+        result = mlm._maskable_window_starts(
+            tokens, SPECIALS, stride, window, max_sequences, block_tokens=block_tokens
+        )
+        expected = _reference_window_starts(
+            tokens, SPECIALS, stride, window, max_sequences
+        )
+
+        assert result.dtype == np.int32
+        assert np.array_equal(result, expected)
+
+    @pytest.mark.parametrize("block_tokens", [1, 4, 1 << 22])
+    def test_special_only_and_trailing_windows(self, block_tokens):
+        tokens = np.array([1, 2, 1, 2, 1, 10, 2, 2, 2, 2, 2, 11], dtype=np.int32)
+
+        for stride in (1, 3, 5):
+            result = mlm._maskable_window_starts(
+                tokens, SPECIALS, stride, 5, block_tokens=block_tokens
+            )
+            expected = _reference_window_starts(tokens, SPECIALS, stride, 5, None)
+            assert np.array_equal(result, expected)
+
+    def test_empty_stream(self):
+        result = mlm._maskable_window_starts(np.zeros(0, np.int32), SPECIALS, 5, 5)
+
+        assert result.dtype == np.int32 and result.size == 0
+
+    def test_batcher_rejects_negative_max_sequences(self):
+        tokens = np.tile(np.arange(10, 20, dtype=np.int32), 10)
+
+        with pytest.raises(ValueError, match="max_sequences"):
+            make_batcher(tokens, max_sequences=-1, batch_size=1)
+
+    def test_batcher_respects_max_sequences(self):
+        tokens = np.tile(np.arange(10, 20, dtype=np.int32), 10)
+
+        batcher = make_batcher(tokens, max_sequences=3, batch_size=1)
+
+        assert batcher.starts.tolist() == [0, 5, 10]
+
+
+class TestReplacementIds:
+    def test_matches_non_special_vocabulary(self):
+        ids = mlm._replacement_ids(12, {0, 3, 7}, excludes_special=True)
+
+        assert ids.dtype == np.int32
+        assert ids.tolist() == [i for i in range(12) if i not in {0, 3, 7}]
+        all_ids = mlm._replacement_ids(5, {0}, excludes_special=False)
+        assert all_ids.tolist() == list(range(5))
+
+    def test_batcher_precomputes_replacement_ids(self):
+        batcher = make_batcher(np.arange(10, 20))
+
+        assert batcher.replacement_ids.tolist() == list(range(4, 32))
+
+    def test_precomputed_ids_give_identical_masks(self):
+        tokens = np.tile(np.arange(4, 12, dtype=np.int32), (8, 2))
+        kwargs = dict(
+            mask_token_id=3,
+            vocab_size=32,
+            special_token_ids=SPECIALS,
+            seed=5,
+            mask_prob=0.5,
+        )
+
+        built = apply_mlm_mask(tokens, **kwargs)
+        given = apply_mlm_mask(
+            tokens, replacement_ids=np.arange(4, 32, dtype=np.int32), **kwargs
+        )
+
+        assert all(np.array_equal(a, b) for a, b in zip(built, given))
+
+    def test_random_replacements_come_from_given_ids(self):
+        tokens = np.full((50, 20), 5, dtype=np.int32)
+
+        masked, _, loss_mask = apply_mlm_mask(
+            tokens,
+            mask_token_id=3,
+            vocab_size=32,
+            special_token_ids=SPECIALS,
+            seed=0,
+            mask_prob=1.0,
+            replacement_ids=np.array([9], dtype=np.int32),
+        )
+
+        assert set(np.unique(masked[loss_mask]).tolist()) == {3, 5, 9}
+
+    def test_policy_shares_are_80_10_10(self):
+        tokens = np.tile(np.arange(4, 32, dtype=np.int32), (200, 1))
+
+        masked, targets, loss_mask = apply_mlm_mask(
+            tokens,
+            mask_token_id=3,
+            vocab_size=32,
+            special_token_ids=SPECIALS,
+            seed=2,
+            mask_prob=0.5,
+        )
+
+        selected = loss_mask.sum()
+        masked_share = np.sum(masked[loss_mask] == 3) / selected
+        kept_share = np.sum(masked[loss_mask] == targets[loss_mask]) / selected
+        assert loss_mask.mean() == pytest.approx(0.5, abs=0.02)
+        assert masked_share == pytest.approx(0.8, abs=0.02)
+        assert kept_share == pytest.approx(0.1 + 0.1 / 28, abs=0.02)
+        assert np.array_equal(masked[~loss_mask], tokens[~loss_mask])

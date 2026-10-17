@@ -453,6 +453,32 @@ def train_step_backprop_autoregressive_pmap(
     return params, opt_state, loss, predictions
 
 
+def _create_loop_train_step(
+    structure: GraphStructure,
+    optimizer: optax.GradientTransformation,
+    use_causal_mask: bool,
+    use_pmap: bool,
+) -> Callable:
+    """Compiled step for ``train_backprop_autoregressive`` that returns only
+    ``(params, opt_state, loss)``, so predictions are not kept as an output
+    buffer of the compiled call."""
+    if use_pmap:
+
+        def pmap_step(params, opt_state, batch, rng_key):
+            return train_step_backprop_autoregressive_pmap(
+                params, opt_state, batch, structure, optimizer, rng_key, use_causal_mask
+            )[:3]
+
+        return jax.pmap(pmap_step, axis_name="devices")
+
+    def step(params, opt_state, batch, rng_key):
+        return train_step_backprop_autoregressive(
+            params, opt_state, batch, structure, optimizer, rng_key, use_causal_mask
+        )[:3]
+
+    return jax.jit(step)
+
+
 def create_pmap_train_step_backprop_autoregressive(
     structure: GraphStructure,
     optimizer: optax.GradientTransformation,
@@ -511,15 +537,9 @@ def train_backprop_autoregressive(
     if use_pmap:
         params = replicate_params(params, n_devices)
         opt_state = replicate_opt_state(opt_state, n_devices)
-        step_fn = create_pmap_train_step_backprop_autoregressive(
-            structure, optimizer, use_causal_mask=config.get("use_causal_mask", True)
-        )
-    else:
-        step_fn = jax.jit(
-            lambda p, o, b, k: train_step_backprop_autoregressive(
-                p, o, b, structure, optimizer, k, config.get("use_causal_mask", True)
-            )
-        )
+    step_fn = _create_loop_train_step(
+        structure, optimizer, config.get("use_causal_mask", True), use_pmap
+    )
 
     # Training hyperparameters
     num_epochs = config.get("num_epochs", 10)  # supports float (e.g. 1.5)
@@ -582,12 +602,12 @@ def train_backprop_autoregressive(
                 _reject_masked_pmap_batch(batch)
                 _validate_pmap_batch(batch, n_devices)
                 batch = shard_batch(batch, n_devices)
-                params, opt_state, loss, _ = step_fn(
+                params, opt_state, loss = step_fn(
                     params, opt_state, batch, batch_keys[:, batch_idx]
                 )
                 loss = float(jnp.mean(loss))
             else:
-                params, opt_state, loss, _ = step_fn(
+                params, opt_state, loss = step_fn(
                     params, opt_state, batch, batch_keys[batch_idx]
                 )
                 loss = float(loss)
@@ -989,16 +1009,26 @@ def _masked_lm_batch_totals(
     return mean_loss * count, correct, count
 
 
-_masked_lm_eval_cache: Dict[str, Any] = {"structure": None, "fn": None}
+_MASKED_LM_EVAL_CACHE_SIZE = 8
+_masked_lm_eval_cache: Dict[int, Tuple[GraphStructure, Callable]] = {}
 
 
 def _jitted_masked_lm_batch_totals(structure: GraphStructure) -> Callable:
-    if _masked_lm_eval_cache["structure"] is not structure:
-        _masked_lm_eval_cache["fn"] = jax.jit(
-            lambda p, b, k: _masked_lm_batch_totals(p, structure, b, k)
-        )
-        _masked_lm_eval_cache["structure"] = structure
-    return _masked_lm_eval_cache["fn"]
+    """Jitted ``_masked_lm_batch_totals`` for ``structure``, cached per graph.
+
+    Entries hold the structure itself so its id cannot be reused while
+    cached; the least recently used entry is evicted beyond
+    ``_MASKED_LM_EVAL_CACHE_SIZE``.
+    """
+    entry = _masked_lm_eval_cache.pop(id(structure), None)
+    if entry is not None:
+        _masked_lm_eval_cache[id(structure)] = entry
+        return entry[1]
+    fn = jax.jit(lambda p, b, k: _masked_lm_batch_totals(p, structure, b, k))
+    while len(_masked_lm_eval_cache) >= _MASKED_LM_EVAL_CACHE_SIZE:
+        _masked_lm_eval_cache.pop(next(iter(_masked_lm_eval_cache)))
+    _masked_lm_eval_cache[id(structure)] = (structure, fn)
+    return fn
 
 
 def evaluate_mlm(
@@ -1022,7 +1052,8 @@ def evaluate_mlm(
     """
     batch_totals = _jitted_masked_lm_batch_totals(structure)
     saved_state = loader.state_dict() if hasattr(loader, "state_dict") else None
-    loss_sum, correct, count = 0.0, 0.0, 0.0
+    loss_sum = jnp.zeros((), dtype=jnp.float32)
+    correct = count = jnp.zeros((), dtype=jnp.int32)
     try:
         for batch_data in loader:
             if not isinstance(batch_data, dict) or "loss_mask" not in batch_data:
@@ -1032,17 +1063,18 @@ def evaluate_mlm(
             batch_loss, batch_correct, batch_count = batch_totals(
                 params, batch, step_key
             )
-            loss_sum += float(batch_loss)
-            correct += float(batch_correct)
-            count += float(batch_count)
+            loss_sum = loss_sum + batch_loss
+            correct = correct + batch_correct.astype(jnp.int32)
+            count = count + batch_count.astype(jnp.int32)
     finally:
         if saved_state is not None:
             loader.load_state_dict(saved_state)
 
+    loss_sum, correct, count = float(loss_sum), int(correct), int(count)
     if count == 0:
         raise ValueError("evaluate_mlm found no masked tokens in the loader")
     return {
         "masked_loss": loss_sum / count,
         "masked_accuracy": correct / count,
-        "num_masked_tokens": int(count),
+        "num_masked_tokens": count,
     }

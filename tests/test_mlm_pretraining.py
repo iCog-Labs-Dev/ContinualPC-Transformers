@@ -1,5 +1,7 @@
 """End-to-end masked-LM pretraining with the existing backprop training loop."""
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,7 +12,11 @@ from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.training import evaluate_mlm, train_backprop_autoregressive
+from fabricpc.training.train import replicate_opt_state, replicate_params, shard_batch
+from fabricpc.training.train_backprop import train_step_backprop_autoregressive
 from fabricpc.utils.data import MlmTextBatcher
+
+train_backprop = importlib.import_module("fabricpc.training.train_backprop")
 
 SEQ_LEN = 8
 VOCAB_SIZE = 24
@@ -147,3 +153,110 @@ class TestEvaluateMlm:
 
         with pytest.raises(ValueError, match="no masked tokens"):
             evaluate_mlm(params, structure, _ListLoader([empty]), rng_key)
+
+
+class TestEvaluatorCache:
+    def test_alternating_graphs_reuse_their_evaluators(self, rng_key, monkeypatch):
+        monkeypatch.setattr(train_backprop, "_masked_lm_eval_cache", {})
+        params_a, structure_a = build_model(rng_key)
+        params_b, structure_b = build_model(jax.random.PRNGKey(1))
+        loader = _ListLoader([_fixed_batch([1, 0, 1, 0, 0, 0, 0, 0])])
+
+        evaluate_mlm(params_a, structure_a, loader, rng_key)
+        first = train_backprop._jitted_masked_lm_batch_totals(structure_a)
+        evaluate_mlm(params_b, structure_b, loader, rng_key)
+        evaluate_mlm(params_a, structure_a, loader, rng_key)
+
+        assert train_backprop._jitted_masked_lm_batch_totals(structure_a) is first
+        assert train_backprop._jitted_masked_lm_batch_totals(structure_b) is not first
+
+    def test_least_recently_used_evaluator_is_evicted(self, rng_key, monkeypatch):
+        monkeypatch.setattr(train_backprop, "_masked_lm_eval_cache", {})
+        monkeypatch.setattr(train_backprop, "_MASKED_LM_EVAL_CACHE_SIZE", 2)
+        structures = [build_model(rng_key)[1] for _ in range(3)]
+
+        first = train_backprop._jitted_masked_lm_batch_totals(structures[0])
+        train_backprop._jitted_masked_lm_batch_totals(structures[1])
+        train_backprop._jitted_masked_lm_batch_totals(structures[0])
+        train_backprop._jitted_masked_lm_batch_totals(structures[2])
+
+        cache = train_backprop._masked_lm_eval_cache
+        assert id(structures[1]) not in cache
+        assert train_backprop._jitted_masked_lm_batch_totals(structures[0]) is first
+
+    def test_oldest_evaluator_is_evicted(self, rng_key, monkeypatch):
+        monkeypatch.setattr(train_backprop, "_masked_lm_eval_cache", {})
+        monkeypatch.setattr(train_backprop, "_MASKED_LM_EVAL_CACHE_SIZE", 2)
+        structures = [build_model(rng_key)[1] for _ in range(3)]
+
+        fns = [train_backprop._jitted_masked_lm_batch_totals(s) for s in structures]
+
+        cache = train_backprop._masked_lm_eval_cache
+        assert len(cache) == 2
+        assert id(structures[0]) not in cache
+        assert train_backprop._jitted_masked_lm_batch_totals(structures[2]) is fns[2]
+
+
+def _training_batches():
+    batches = list(make_loader(mask_prob=0.3))
+    return [{k: jnp.asarray(v) for k, v in batch.items()} for batch in batches]
+
+
+class TestLoopTrainStep:
+    @pytest.mark.parametrize("use_pmap", [False, True])
+    def test_compiled_step_returns_no_predictions(self, rng_key, use_pmap):
+        params, structure = build_model(rng_key)
+        optimizer = optax.adam(1e-3)
+        opt_state = optimizer.init(params)
+        batch = _training_batches()[0]
+        key = rng_key
+        if use_pmap:
+            params = replicate_params(params, 1)
+            opt_state = replicate_opt_state(opt_state, 1)
+            batch = shard_batch({k: v for k, v in batch.items() if k != "loss_mask"}, 1)
+            key = rng_key[None, :]
+
+        step = train_backprop._create_loop_train_step(
+            structure, optimizer, True, use_pmap
+        )
+        out = jax.eval_shape(step, params, opt_state, batch, key)
+
+        assert len(out) == 3
+        assert out[2].size == 1
+        assert not any(
+            leaf.shape[-2:] == (SEQ_LEN, VOCAB_SIZE)
+            for leaf in jax.tree_util.tree_leaves(out)
+            if leaf.ndim >= 3
+        )
+
+    def test_loop_losses_match_direct_steps(self, rng_key):
+        params, structure = build_model(rng_key)
+        optimizer = optax.adam(1e-3)
+        batches = _training_batches()
+
+        _, losses, _ = train_backprop_autoregressive(
+            params,
+            structure,
+            _ListLoader(batches),
+            optimizer,
+            {"num_epochs": 2},
+            rng_key,
+            verbose=False,
+        )
+
+        step = jax.jit(
+            lambda p, o, b, k: train_step_backprop_autoregressive(
+                p, o, b, structure, optimizer, k
+            )
+        )
+        opt_state, key, expected = optimizer.init(params), rng_key, []
+        for _ in range(2):
+            epoch_key, key = jax.random.split(key)
+            batch_keys = jax.random.split(epoch_key, len(batches))
+            epoch = []
+            for batch, batch_key in zip(batches, batch_keys):
+                params, opt_state, loss, _ = step(params, opt_state, batch, batch_key)
+                epoch.append(float(loss))
+            expected.append(epoch)
+
+        assert losses == expected

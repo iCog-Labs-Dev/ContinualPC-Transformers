@@ -18,17 +18,17 @@ MLM_SPECIAL_TOKENS = ["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"]
 
 _MAX_MASK_REDRAWS = 100
 
+_SCAN_BLOCK_TOKENS = 1 << 22
+
 
 def _replacement_ids(
     vocab_size: int, special_token_ids: set[int], excludes_special: bool
 ) -> np.ndarray:
     """Token ids a selected position may be randomly replaced with."""
+    ids = np.arange(vocab_size, dtype=np.int32)
     if excludes_special:
-        return np.array(
-            [idx for idx in range(vocab_size) if idx not in special_token_ids],
-            dtype=np.int32,
-        )
-    return np.arange(vocab_size, dtype=np.int32)
+        return np.setdiff1d(ids, np.fromiter(special_token_ids, dtype=np.int64))
+    return ids
 
 
 def _corrupt(
@@ -43,16 +43,19 @@ def _corrupt(
     Selected tokens become ``[MASK]`` (80%), a random id from
     ``replacement_ids`` (10%), or stay unchanged (10%); an empty
     ``replacement_ids`` leaves the random-replacement share unchanged.
+    Random draws are made only for selected positions.
     """
-    policy = rng.random(token_ids.shape)
-    random_tokens = (
-        rng.choice(replacement_ids, size=token_ids.shape)
-        if replacement_ids.size
-        else token_ids.copy()
-    )
-    masked = np.where(select & (policy < 0.8), mask_token_id, token_ids)
-    masked = np.where(select & (policy >= 0.8) & (policy < 0.9), random_tokens, masked)
-    return masked.astype(np.int32)
+    masked = token_ids.astype(np.int32, copy=True)
+    rows, cols = np.nonzero(select)
+    policy = rng.random(rows.size)
+    to_mask = policy < 0.8
+    masked[rows[to_mask], cols[to_mask]] = mask_token_id
+    to_random = (policy >= 0.8) & (policy < 0.9)
+    if replacement_ids.size and to_random.any():
+        masked[rows[to_random], cols[to_random]] = rng.choice(
+            replacement_ids, size=int(to_random.sum())
+        )
+    return masked
 
 
 def apply_mlm_mask(
@@ -64,12 +67,16 @@ def apply_mlm_mask(
     seed: int,
     mask_prob: float = 0.15,
     random_replacement_excludes_special: bool = True,
+    replacement_ids: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply BERT-style 80/10/10 masking to a ``(batch, seq_len)`` token batch.
 
     Each non-special token is selected independently with ``mask_prob``.
     Selected tokens become ``[MASK]`` (80%), a random token (10%), or stay
-    unchanged (10%).
+    unchanged (10%). ``replacement_ids`` lists the ids random replacement draws
+    from; when omitted it is built from ``vocab_size`` and
+    ``random_replacement_excludes_special``. Callers masking many batches can
+    pass it precomputed.
 
     Returns:
         ``(masked_ids, targets, loss_mask)`` where ``targets`` are the original
@@ -87,11 +94,54 @@ def apply_mlm_mask(
     rng = np.random.default_rng(seed)
     eligible = ~np.isin(token_ids, list(special_token_ids))
     loss_mask = (rng.random(token_ids.shape) < mask_prob) & eligible
-    replacement_ids = _replacement_ids(
-        vocab_size, special_token_ids, random_replacement_excludes_special
-    )
+    if replacement_ids is None:
+        replacement_ids = _replacement_ids(
+            vocab_size, special_token_ids, random_replacement_excludes_special
+        )
     masked = _corrupt(token_ids, loss_mask, rng, mask_token_id, replacement_ids)
     return masked, token_ids.astype(np.int32), loss_mask
+
+
+def _maskable_window_starts(
+    token_ids: np.ndarray,
+    special_token_ids: set[int],
+    stride: int,
+    window: int,
+    max_sequences: int | None = None,
+    block_tokens: int = _SCAN_BLOCK_TOKENS,
+) -> np.ndarray:
+    """Ascending int32 starts of windows holding at least one maskable token.
+
+    Windows of ``window`` tokens start every ``stride`` tokens; trailing
+    windows are clipped at the end of the stream. The stream is scanned in
+    blocks of consecutive starts whose token span is at most ``block_tokens``
+    (always at least one window), and the scan stops once ``max_sequences``
+    starts are found.
+    """
+    num_tokens = len(token_ids)
+    if max_sequences == 0 or num_tokens == 0:
+        return np.zeros(0, dtype=np.int32)
+    specials = list(special_token_ids)
+    num_starts = -(-num_tokens // stride)
+    starts_per_block = max(1, (block_tokens - window) // stride + 1)
+    found: list[np.ndarray] = []
+    num_found = 0
+    for first in range(0, num_starts, starts_per_block):
+        last = min(first + starts_per_block, num_starts)
+        starts = np.arange(first, last, dtype=np.int64) * stride
+        lo = int(starts[0])
+        hi = min(int(starts[-1]) + window, num_tokens)
+        eligible = ~np.isin(token_ids[lo:hi], specials)
+        eligible_before = np.zeros(hi - lo + 1, dtype=np.int32)
+        np.cumsum(eligible, dtype=np.int32, out=eligible_before[1:])
+        ends = np.minimum(starts + window, num_tokens) - lo
+        has_maskable = eligible_before[ends] - eligible_before[starts - lo] > 0
+        kept = starts[has_maskable]
+        found.append(kept)
+        num_found += kept.size
+        if max_sequences is not None and num_found >= max_sequences:
+            break
+    return np.concatenate(found)[:max_sequences].astype(np.int32)
 
 
 class MlmTextBatcher:
@@ -150,6 +200,8 @@ class MlmTextBatcher:
         self.stride = self.stream_window if stride is None else stride
         if self.stride <= 0:
             raise ValueError("stride must be positive")
+        if max_sequences is not None and max_sequences < 0:
+            raise ValueError("max_sequences must be non-negative")
 
         self.token_ids = np.asarray(token_ids, dtype=np.int32)
         self.seq_len = seq_len
@@ -163,20 +215,19 @@ class MlmTextBatcher:
         self.mask_prob = mask_prob
         self.shuffle = shuffle
         self.random_replacement_excludes_special = random_replacement_excludes_special
+        self.replacement_ids = _replacement_ids(
+            vocab_size, self.special_token_ids, random_replacement_excludes_special
+        )
         self._epoch = 0
 
-        starts = self._maskable_window_starts()
-        self.starts = starts if max_sequences is None else starts[:max_sequences]
+        self.starts = _maskable_window_starts(
+            self.token_ids,
+            self.special_token_ids,
+            self.stride,
+            self.stream_window,
+            max_sequences,
+        )
         self._num_batches = len(self.starts) // batch_size
-
-    def _maskable_window_starts(self) -> np.ndarray:
-        """Window starts whose window contains at least one maskable token."""
-        starts = np.arange(0, len(self.token_ids), self.stride, dtype=np.int64)
-        eligible = ~np.isin(self.token_ids, list(self.special_token_ids))
-        eligible_before = np.concatenate([[0], np.cumsum(eligible)])
-        ends = np.minimum(starts + self.stream_window, len(self.token_ids))
-        has_maskable = eligible_before[ends] - eligible_before[starts] > 0
-        return starts[has_maskable].astype(np.int32)
 
     def __len__(self) -> int:
         return self._num_batches
@@ -234,6 +285,7 @@ class MlmTextBatcher:
                 random_replacement_excludes_special=(
                     self.random_replacement_excludes_special
                 ),
+                replacement_ids=self.replacement_ids,
             )
             if loss_mask.any():
                 return masked, targets, loss_mask
@@ -241,12 +293,9 @@ class MlmTextBatcher:
         row, col = eligible[rng.integers(len(eligible))]
         loss_mask = np.zeros(original.shape, dtype=bool)
         loss_mask[row, col] = True
-        replacement_ids = _replacement_ids(
-            self.vocab_size,
-            self.special_token_ids,
-            self.random_replacement_excludes_special,
+        masked = _corrupt(
+            original, loss_mask, rng, self.mask_token_id, self.replacement_ids
         )
-        masked = _corrupt(original, loss_mask, rng, self.mask_token_id, replacement_ids)
         return masked, original.copy(), loss_mask
 
 
