@@ -582,3 +582,249 @@ def test_adam_eps_flag_damps_updates_from_tiny_gradients():
 
     assert steps[1e-8] == pytest.approx(0.5e-3, rel=1e-2)
     assert steps[1e-6] < 0.02e-3
+
+
+TINY_PC_PRETRAIN = [
+    "--stage",
+    "pretrain",
+    "--mode",
+    "pc",
+    "--seq_len",
+    "6",
+    "--embed_dim",
+    "16",
+    "--num_heads",
+    "4",
+    "--mlp_dim",
+    "32",
+    "--depth",
+    "1",
+    "--vocab_size",
+    "16",
+    "--max_steps",
+    "1",
+    "--log_interval",
+    "1",
+    "--validation_interval",
+    "0",
+    "--checkpoint",
+    "",
+    "--mask_prob",
+    "0.5",
+]
+
+
+def test_spiking_flags_parse_and_build_inference():
+    from examples.bert_demo import build_pretrain_inference
+    from fabricpc.core.inference import InferenceSGDNormClip, InferenceSpikingPrecision
+
+    default = parse_args(["--stage", "pretrain", "--mode", "pc"])
+    assert default.pc_inference == "sgd_clip"
+    assert default.pc_spike_eta == 1.0
+    assert default.pc_spike_offset == 0
+    assert default.pc_spike_depth == "longest"
+    assert default.pc_forward_updates == "none"
+    assert type(build_pretrain_inference(default)) is InferenceSGDNormClip
+
+    args = parse_args(
+        [
+            "--stage",
+            "pretrain",
+            "--mode",
+            "pc",
+            "--pc_inference",
+            "spiking",
+            "--pc_spike_eta",
+            "0.5",
+            "--pc_spike_offset",
+            "2",
+            "--pc_spike_depth",
+            "shortest",
+            "--pc_forward_updates",
+            "final",
+        ]
+    )
+    inference = build_pretrain_inference(args)
+    assert isinstance(inference, InferenceSpikingPrecision)
+    assert inference.config["spike_eta"] == 0.5
+    assert inference.config["spike_offset"] == 2
+    assert inference.config["depth_mode"] == "shortest"
+    with pytest.raises(ValueError, match="--pc_spike_eta"):
+        parse_args(["--stage", "pretrain", "--pc_spike_eta", "0"])
+    with pytest.raises(ValueError, match="--pc_spike_offset"):
+        parse_args(["--stage", "pretrain", "--pc_spike_offset", "-1"])
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--pc_inference", "spiking", "--pc_infer_guard", "decay"], "guard"),
+        (["--pc_spike_eta", "0.5"], "requires --pc_inference spiking"),
+        (["--pc_spike_depth", "shortest"], "requires --pc_inference spiking"),
+        (["--pc_forward_updates", "final", "--pc_incremental"], "--pc_incremental"),
+        (
+            [
+                "--pc_inference",
+                "spiking",
+                "--pc_incremental",
+                "--pc_spike_depth",
+                "shortest",
+            ],
+            "--pc_spike_depth longest",
+        ),
+        (
+            [
+                "--pc_inference",
+                "spiking",
+                "--pc_incremental",
+                "--pc_eta_infer",
+                "0",
+            ],
+            "--pc_eta_infer",
+        ),
+    ],
+)
+def test_spiking_flag_validation(extra, message, monkeypatch):
+    def fail_if_loading(*_args, **_kwargs):
+        raise AssertionError("validation must run before loading data")
+
+    monkeypatch.setattr("examples.bert_demo.build_mlm_loader", fail_if_loading)
+    args = parse_args(["--stage", "pretrain", "--mode", "pc", *extra])
+
+    with pytest.raises(ValueError, match=message):
+        run_pretrain(args)
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--mode", "backprop", "--pc_inference", "spiking"], "--mode pc"),
+        (["--mode", "backprop", "--pc_forward_updates", "initial"], "--mode pc"),
+    ],
+)
+def test_spiking_and_forward_updates_require_pc_mode(extra, message):
+    with pytest.raises(ValueError, match=message):
+        run_pretrain(parse_args(["--stage", "pretrain", *extra]))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--pc_inference", "spiking"], ["--pc_forward_updates", "final"]],
+)
+def test_spiking_and_forward_updates_rejected_for_finetuning(extra):
+    args = parse_args(["--stage", "finetune", "--mode", "backprop", *extra])
+
+    with pytest.raises(ValueError, match="only valid for pretraining"):
+        run_finetune(args)
+
+
+def _captured_train_config(monkeypatch, argv):
+    captured = {}
+
+    def fake_train_mlm(params, structure, *_args, **_kwargs):
+        captured["config"] = _args[2]
+        captured["structure"] = structure
+        return params, {"step": 0}
+
+    monkeypatch.setattr("examples.bert_demo.train_mlm", fake_train_mlm)
+    monkeypatch.setattr(
+        "examples.bert_demo.report_pc_gradient_reach", lambda *a, **k: {}
+    )
+    run_pretrain(parse_args([*TINY_PC_PRETRAIN, *argv]))
+    return captured
+
+
+def test_forward_updates_recorded_only_when_set(monkeypatch):
+    default = _captured_train_config(monkeypatch, [])
+    assert "pc_forward_updates" not in default["config"]
+    assert type(default["structure"].config["inference"]).__name__ == (
+        "InferenceSGDNormClip"
+    )
+
+    spiking = _captured_train_config(
+        monkeypatch,
+        ["--pc_inference", "spiking", "--pc_forward_updates", "initial"],
+    )
+    assert spiking["config"]["pc_forward_updates"] == "initial"
+    inference = spiking["structure"].config["inference"]
+    assert type(inference).__name__ == "InferenceSpikingPrecision"
+    assert inference.config["spike_eta"] == 1.0
+
+
+def test_spiking_pretrain_prints_depths_and_energy_rises(capsys):
+    args = parse_args(
+        [
+            *TINY_PC_PRETRAIN,
+            "--pc_inference",
+            "spiking",
+            "--pc_infer_steps",
+            "3",
+            "--pc_eta_infer",
+            "0.05",
+            "--pc_forward_updates",
+            "final",
+        ]
+    )
+
+    run_pretrain(args)
+
+    captured = capsys.readouterr()
+    assert "pc_spike_depths mode=longest max_depth=6" in captured.out
+    assert "deepest=token_embeddings steps_needed=6" in captured.out
+    assert (
+        "pc_spike_schedule final_layernorm=1@0 L0_mlp2=2@1 L0_mlp1=3@2 "
+        "L0_mha=4@3" in captured.out
+    )
+    assert "token_embeddings=6@5" in captured.out
+    assert "mlm_head=" not in captured.out.split("pc_spike_schedule")[1].split("\n")[0]
+    assert "--pc_infer_steps 3 < 6" in captured.err
+    assert "step=1 masked_loss=" in captured.out
+    assert "energy_rises=" in captured.out
+
+
+def test_spiking_incremental_pretrain_tiny_smoke(capsys):
+    args = parse_args(
+        [
+            *TINY_PC_PRETRAIN,
+            "--pc_inference",
+            "spiking",
+            "--pc_incremental",
+            "--pc_infer_steps",
+            "6",
+            "--pc_eta_infer",
+            "0.05",
+        ]
+    )
+
+    run_pretrain(args)
+
+    captured = capsys.readouterr()
+    assert "steps_needed=6" in captured.out
+    assert "warning" not in captured.err
+    assert "energy_rises=" in captured.out
+
+
+def test_spiking_probe_uses_forward_updates(capsys):
+    args = parse_args(
+        [
+            *TINY_PC_PRETRAIN,
+            "--pc_inference",
+            "spiking",
+            "--pc_infer_steps",
+            "6",
+            "--pc_eta_infer",
+            "0.0",
+            "--pc_forward_updates",
+            "initial",
+            "--pc_bp_probe",
+            "1",
+        ]
+    )
+
+    run_pretrain(args)
+
+    out = capsys.readouterr().out
+    head = next(line for line in out.splitlines() if "node=mlm_head" in line)
+    mlp1 = next(line for line in out.splitlines() if "node=L0_mlp1" in line)
+    assert "cosine_mean=1.0000" in head
+    assert "cosine_mean=1.0000" in mlp1
