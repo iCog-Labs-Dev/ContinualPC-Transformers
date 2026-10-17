@@ -34,7 +34,11 @@ import optax
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
-from fabricpc.training import evaluate_mlm, train_backprop_autoregressive
+from fabricpc.training import (
+    count_training_batches,
+    evaluate_mlm,
+    train_backprop_autoregressive,
+)
 from fabricpc.utils.data import MLM_SPECIAL_TOKENS, MlmTextBatcher, tokenize_texts_bpe
 
 TINY_TRAIN_TEXTS = [
@@ -126,21 +130,19 @@ def make_loader(
 def count_training_steps(num_epochs: float, batches_per_epoch: int) -> int:
     """Optimizer steps train_backprop_autoregressive runs for ``num_epochs``.
 
-    The loop truncates a fractional final epoch to
-    ``round(fraction * batches_per_epoch)`` batches and fails if that is 0.
+    Raises if ``num_epochs`` is not positive or its fractional final epoch
+    would run no batch, which the training loop rejects.
     """
     if num_epochs <= 0:
         raise ValueError("--num_epochs must be positive")
-    whole_epochs = math.floor(num_epochs)
-    fraction = num_epochs - whole_epochs
-    final_batches = round(fraction * batches_per_epoch)
-    if fraction > 0 and final_batches == 0:
+    fraction = num_epochs - math.floor(num_epochs)
+    if fraction > 0 and round(fraction * batches_per_epoch) == 0:
         raise ValueError(
             f"--num_epochs {num_epochs} leaves no batch in its final partial "
             f"epoch ({batches_per_epoch} batches per epoch); use a whole number "
             "or a larger fraction"
         )
-    return whole_epochs * batches_per_epoch + final_batches
+    return count_training_batches(num_epochs, batches_per_epoch)
 
 
 def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:

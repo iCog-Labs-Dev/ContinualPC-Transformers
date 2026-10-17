@@ -188,6 +188,12 @@ class MaskedVocabProjectionNode(NodeBase):
     The energy depends on the ``loss_mask`` input, so ``energy_functional``
     takes it as an extra argument; ``error`` stays the raw
     ``z_latent - z_mu`` at every position.
+
+    Weights, logits and the softmax output are the same as
+    ``VocabProjectionNode``'s, so backprop training gives the same results with
+    either head: the backprop loss applies ``loss_mask`` itself in
+    ``compute_loss`` and never reads this energy. The masked energy only
+    affects PC training.
     """
 
     DEFAULT_ENERGY = CrossEntropyEnergy

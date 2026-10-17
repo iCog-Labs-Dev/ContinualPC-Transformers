@@ -17,6 +17,7 @@ Use cases:
 
 from typing import Dict, Tuple, Any, List, Optional, Callable, cast
 import math
+import warnings
 import jax
 import jax.numpy as jnp
 import optax
@@ -33,6 +34,7 @@ from fabricpc.training.train_autoregressive import (
     compute_loss,
 )
 from fabricpc.training.train import (
+    epoch_batch_limit,
     replicate_opt_state,
     replicate_params,
     shard_batch,
@@ -53,6 +55,9 @@ def validate_feedforward_init(structure: GraphStructure):
         )
 
 
+_LOSS_INPUTS = frozenset({"y", "loss_mask"})
+
+
 def _input_clamps(
     structure: GraphStructure, batch: Dict[str, jnp.ndarray]
 ) -> Dict[str, jnp.ndarray]:
@@ -61,8 +66,22 @@ def _input_clamps(
     Besides ``x`` this covers auxiliary source nodes such as ``attention_mask``
     and ``loss_mask``; leaving those unclamped would give them random latents.
     Supplied entries take precedence: default ``dropout_*`` and ``causal_mask``
-    inputs are generated only for tasks missing from the batch.
+    inputs are generated only for tasks missing from the batch. Entries that
+    name no task are ignored with a warning, except ``y`` and ``loss_mask``,
+    which the loss reads from the batch directly.
     """
+    unused = sorted(
+        task_name
+        for task_name in batch
+        if task_name not in structure.task_map and task_name not in _LOSS_INPUTS
+    )
+    if unused:
+        warnings.warn(
+            f"Batch entries {unused} match no task in the graph and are ignored; "
+            "check that the model was built to consume them (e.g. "
+            "use_attention_mask=True for 'attention_mask').",
+            stacklevel=2,
+        )
     return {
         structure.task_map[task_name]: value
         for task_name, value in batch.items()
@@ -217,7 +236,6 @@ def train_backprop(
 
     # Support fractional epochs: e.g. 1.5 -> 2 loop iterations, last stops at 50%
     total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
 
     # JIT compile training step
     jit_train_step = jax.jit(
@@ -235,12 +253,7 @@ def train_backprop(
         except TypeError:
             raise TypeError("train_loader must support len()")
 
-        # On the final epoch, truncate if fractional
-        is_last_epoch = epoch_idx == total_epochs - 1
-        if is_last_epoch and frac > 0:
-            max_batches = round(frac * num_batches)
-        else:
-            max_batches = num_batches
+        max_batches = epoch_batch_limit(epoch_idx, num_epochs, num_batches)
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)
@@ -547,7 +560,6 @@ def train_backprop_autoregressive(
 
     # Support fractional epochs: e.g. 1.5 -> 2 loop iterations, last stops at 50%
     total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
 
     iter_results = []
     epoch_results = []
@@ -558,12 +570,7 @@ def train_backprop_autoregressive(
         except TypeError:
             raise TypeError("train_loader must support len()")
 
-        # On the final epoch, truncate if fractional
-        is_last_epoch = epoch_idx == total_epochs - 1
-        if is_last_epoch and frac > 0:
-            max_batches = round(frac * num_batches)
-        else:
-            max_batches = num_batches
+        max_batches = epoch_batch_limit(epoch_idx, num_epochs, num_batches)
 
         # Split keys for actual batch count
         epoch_rng_key, rng_key = jax.random.split(rng_key)

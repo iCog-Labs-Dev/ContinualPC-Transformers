@@ -139,7 +139,7 @@ class TestEncoderForward:
     def test_future_token_affects_first_position(self, rng_key):
         structure = build_mlm(use_attention_mask=False)
         params = initialize_params(structure, rng_key)
-        batch = mlm_batch()
+        batch = {k: v for k, v in mlm_batch().items() if k != "attention_mask"}
         changed = {**batch, "x": batch["x"].at[:, 3].set(9)}
 
         base = compute_forward_pass(params, structure, batch, rng_key)

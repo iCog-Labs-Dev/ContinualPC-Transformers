@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import warnings
 from pathlib import Path
 
 import jax
@@ -36,6 +37,7 @@ from fabricpc.nodes.transformer_v2 import MhaResidualNode, create_deep_transform
 from fabricpc.training import evaluate_mlm
 from fabricpc.training.train_autoregressive import compute_loss, create_dropout_clamps
 from fabricpc.training.train_backprop import (
+    _input_clamps,
     _target_labels,
     compute_forward_pass,
     compute_loss_autoregressive,
@@ -248,6 +250,25 @@ def _token_batch(rng_key, batch_size=4, vocab_size=11):
         "x": jax.random.randint(x_key, (batch_size, SEQ_LEN), 0, vocab_size),
         "y": jax.random.randint(y_key, (batch_size, SEQ_LEN), 0, vocab_size),
     }
+
+
+class TestInputClamps:
+    def test_warns_when_batch_entry_matches_no_task(self, tiny_lm, rng_key):
+        _, structure = tiny_lm
+        batch = {**_token_batch(rng_key), "attention_mask": jnp.ones((4, SEQ_LEN))}
+
+        with pytest.warns(UserWarning, match="attention_mask"):
+            clamps = _input_clamps(structure, batch)
+
+        assert set(clamps) == {structure.task_map["x"]}
+
+    def test_target_and_loss_mask_do_not_warn(self, tiny_lm, rng_key):
+        _, structure = tiny_lm
+        batch = {**_token_batch(rng_key), "loss_mask": jnp.ones((4, SEQ_LEN))}
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _input_clamps(structure, batch)
 
 
 class TestComputeLossAutoregressiveMask:

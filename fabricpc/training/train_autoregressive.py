@@ -26,6 +26,7 @@ from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.training.train import (
     _convert_batch,
+    epoch_batch_limit,
     replicate_params,
     replicate_opt_state,
     shard_batch,
@@ -432,7 +433,6 @@ def train_autoregressive(
 
     # Support fractional epochs: e.g. 1.5 -> 2 loop iterations, last stops at 50%
     total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
 
     # Device detection
     n_devices = jax.local_device_count()
@@ -466,12 +466,7 @@ def train_autoregressive(
         except TypeError:
             raise TypeError("train_loader must support len()")
 
-        # On the final epoch, truncate if fractional
-        is_last_epoch = epoch_idx == total_epochs - 1
-        if is_last_epoch and frac > 0:
-            max_batches = round(frac * num_batches)
-        else:
-            max_batches = num_batches
+        max_batches = epoch_batch_limit(epoch_idx, num_epochs, num_batches)
 
         # Split keys for this epoch
         epoch_rng_key, rng_key = jax.random.split(rng_key)

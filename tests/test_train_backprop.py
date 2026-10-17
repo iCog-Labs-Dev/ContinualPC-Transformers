@@ -15,6 +15,8 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.core.activations import ReLUActivation, SoftmaxActivation
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.graph_initialization.state_initializer import GlobalStateInit
+from fabricpc.training import count_training_batches
+from fabricpc.training.train import epoch_batch_limit
 from fabricpc.training.train_backprop import (
     train_backprop,
     evaluate_backprop,
@@ -76,6 +78,36 @@ def make_mock_loader(rng_key, batch_size=8, num_batches=4, input_dim=10, num_cla
         )
         batches.append({"x": x, "y": y})
     return MockDataLoader(batches)
+
+
+class TestEpochBatchCounts:
+    @pytest.mark.parametrize(
+        "num_epochs, num_batches, expected",
+        [(1, 5, 5), (2, 5, 10), (1.5, 5, 7), (0.4, 5, 2), (2.1, 3, 6), (0.5, 4, 2)],
+    )
+    def test_count_training_batches(self, num_epochs, num_batches, expected):
+        assert count_training_batches(num_epochs, num_batches) == expected
+
+    def test_only_fractional_final_epoch_is_truncated(self):
+        limits = [epoch_batch_limit(e, 2.5, 4) for e in range(3)]
+
+        assert limits == [4, 4, 2]
+
+    def test_train_backprop_runs_counted_batches(self, graph_with_feedforward, rng_key):
+        params, structure = graph_with_feedforward
+        train_loader = make_mock_loader(rng_key, num_batches=4)
+
+        _, iter_results, _ = train_backprop(
+            params,
+            structure,
+            train_loader,
+            optax.sgd(0.01),
+            {"num_epochs": 1.5},
+            rng_key,
+            verbose=False,
+        )
+
+        assert sum(map(len, iter_results)) == count_training_batches(1.5, 4)
 
 
 class TestTrainBackprop:

@@ -11,6 +11,7 @@ from fabricpc.training.train import (
     replicate_params,
     shard_batch,
     get_graph_param_gradient,
+    count_training_batches,
 )
 from fabricpc.training.train_autoregressive import (
     train_autoregressive,
@@ -46,6 +47,8 @@ __all__ = [
     "replicate_params",
     "shard_batch",
     "get_graph_param_gradient",
+    # Epoch utilities
+    "count_training_batches",
     # Deprecated aliases (will be removed)
     "train_pcn_multi_gpu",
     "evaluate_pcn_multi_gpu",

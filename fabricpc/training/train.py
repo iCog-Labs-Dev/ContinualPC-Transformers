@@ -19,6 +19,34 @@ from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 
+# ── epoch utilities ─────────────────────────────────────────────────
+
+
+def epoch_batch_limit(epoch_idx: int, num_epochs: float, num_batches: int) -> int:
+    """
+    Number of batches a training loop runs in epoch ``epoch_idx``.
+
+    ``num_epochs`` may be fractional: every epoch runs ``num_batches`` except a
+    fractional final epoch, which runs ``round(fraction * num_batches)``.
+    """
+    frac = num_epochs - math.floor(num_epochs)
+    if epoch_idx == math.ceil(num_epochs) - 1 and frac > 0:
+        return round(frac * num_batches)
+    return num_batches
+
+
+def count_training_batches(num_epochs: float, num_batches: int) -> int:
+    """
+    Total batches (optimizer steps) the training loops run for ``num_epochs``.
+
+    Use this to size learning-rate schedules for a fractional ``num_epochs``.
+    """
+    return sum(
+        epoch_batch_limit(epoch_idx, num_epochs, num_batches)
+        for epoch_idx in range(math.ceil(num_epochs))
+    )
+
+
 # ── pmap utilities ──────────────────────────────────────────────────
 
 
@@ -356,16 +384,10 @@ def train_pcn(
     # Epoch parameters
     num_epochs = config.get("num_epochs", 10)
     total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
 
     # Compute total batches for TQDM progress bar
     num_batches = len(train_loader)
-    total_batches = 0
-    for e in range(total_epochs):
-        if e == total_epochs - 1 and frac > 0:
-            total_batches += round(frac * num_batches)
-        else:
-            total_batches += num_batches
+    total_batches = count_training_batches(num_epochs, num_batches)
 
     # Progress bar across all epochs
     progress = _tqdm_cls(total=total_batches, disable=not use_tqdm, leave=True)
@@ -375,12 +397,7 @@ def train_pcn(
     iter_results = []
     epoch_results = []
     for epoch_idx in range(total_epochs):
-        # On the final epoch, truncate if fractional
-        is_last_epoch = epoch_idx == total_epochs - 1
-        if is_last_epoch and frac > 0:
-            max_batches = round(frac * num_batches)
-        else:
-            max_batches = num_batches
+        max_batches = epoch_batch_limit(epoch_idx, num_epochs, num_batches)
 
         progress.set_description(f"Epoch {epoch_idx + 1}/{total_epochs}")
 
