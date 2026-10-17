@@ -200,9 +200,12 @@ def _prepare_pcn_mlm_batch(
     Returns ``(shared_clamps, free_metrics, free_state, initial_state,
     clamps)``. ``free_metrics`` holds ``masked_loss``, ``masked_accuracy`` and
     ``num_masked_tokens`` of the feedforward state without target clamps.
+    Dropout masks come from the same key split as ``compute_forward_pass``,
+    so PC and backprop see identical masks for the same ``rng_key``.
     """
     _validate_pcn_mlm_batch(batch, structure)
-    dropout_key, free_state_key, pc_state_key = jax.random.split(rng_key, 3)
+    _, free_state_key, pc_state_key = jax.random.split(rng_key, 3)
+    dropout_key, _ = jax.random.split(rng_key)
     batch_size = batch["x"].shape[0]
     output_node = structure.task_map["y"]
 

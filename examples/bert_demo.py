@@ -1061,8 +1061,8 @@ def report_spike_schedule(structure, args: argparse.Namespace) -> int:
 def run_pretrain(args: argparse.Namespace) -> None:
     if args.pc_bp_probe < 0:
         raise ValueError("--pc_bp_probe must be non-negative")
-    if args.pc_bp_probe and (args.mode != "pc" or args.dropout_rate != 0.0):
-        raise ValueError("--pc_bp_probe needs --mode pc and --dropout_rate 0")
+    if args.pc_bp_probe and args.mode != "pc":
+        raise ValueError("--pc_bp_probe needs --mode pc")
     if args.probe_checkpoint and not args.pc_bp_probe:
         raise ValueError("--probe_checkpoint is only used with --pc_bp_probe")
     if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
