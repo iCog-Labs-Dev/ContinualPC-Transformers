@@ -24,7 +24,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fabricpc.core.inference import InferenceSGDNormClip, InferenceSGDNormClipDecay
+from fabricpc.core.depth import node_output_depths
+from fabricpc.core.inference import (
+    InferenceSGDNormClip,
+    InferenceSGDNormClipDecay,
+    InferenceSpikingPrecision,
+)
 from fabricpc.core.types import GraphParams, NodeParams
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import (
@@ -350,6 +355,27 @@ def build_parser() -> argparse.ArgumentParser:
         "the weight updates as well as the latent steps (PC pretraining only)",
     )
     parser.add_argument(
+        "--pc_inference",
+        choices=["sgd_clip", "spiking"],
+        default="sgd_clip",
+        help="spiking: each node takes one --pc_spike_eta step at the inference "
+        "step when the output error first reaches it, by graph depth (Qi et al. "
+        "2025); other steps use --pc_eta_infer with norm clipping",
+    )
+    parser.add_argument("--pc_spike_eta", type=float, default=1.0)
+    parser.add_argument("--pc_spike_offset", type=int, default=0)
+    parser.add_argument(
+        "--pc_spike_depth", choices=["longest", "shortest"], default="longest"
+    )
+    parser.add_argument(
+        "--pc_forward_updates",
+        choices=["none", "initial", "final"],
+        default="none",
+        help="Weight gradients from the error against the feedforward "
+        "prediction, with inputs from the feedforward (initial) or final state "
+        "(standard PC pretraining only)",
+    )
+    parser.add_argument(
         "--pc_bp_probe",
         type=int,
         default=0,
@@ -379,6 +405,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = build_parser().parse_args(argv)
     if args.adam_eps <= 0.0:
         raise ValueError("--adam_eps must be positive")
+    if args.pc_spike_eta <= 0.0:
+        raise ValueError("--pc_spike_eta must be positive")
+    if args.pc_spike_offset < 0:
+        raise ValueError("--pc_spike_offset must be non-negative")
     return args
 
 
@@ -789,7 +819,9 @@ def summarize_init_diagnostics(params: GraphParams) -> dict[str, float]:
     return diagnostics
 
 
-def report_pc_gradient_reach(structure, params, loader, rng_key) -> dict[str, float]:
+def report_pc_gradient_reach(
+    structure, params, loader, rng_key, forward_updates: str = "none"
+) -> dict[str, float]:
     """Print each node's PC gradient norm on the first batch and warn on zeros.
 
     The loader's state is restored so training sees the same batches.
@@ -797,7 +829,7 @@ def report_pc_gradient_reach(structure, params, loader, rng_key) -> dict[str, fl
     state = loader.state_dict()
     batch = _convert_batch(next(iter(loader)))
     loader.load_state_dict(state)
-    norms = pc_node_gradient_norms(params, batch, structure, rng_key)
+    norms = pc_node_gradient_norms(params, batch, structure, rng_key, forward_updates)
     print(
         "pc_grad_norms "
         + " ".join(f"{name}={norm:.3e}" for name, norm in norms.items())
@@ -814,13 +846,21 @@ def report_pc_gradient_reach(structure, params, loader, rng_key) -> dict[str, fl
     return norms
 
 
-def run_pc_bp_probe(structure, params, loader, rng_key, num_batches: int) -> dict:
+def run_pc_bp_probe(
+    structure,
+    params,
+    loader,
+    rng_key,
+    num_batches: int,
+    forward_updates: str = "none",
+) -> dict:
     """Print per-node PC vs backprop gradient norms and cosines over batches.
 
     ``rel_ratio`` is each node's PC/BP norm ratio divided by the ``mlm_head``
     ratio, which removes the global loss-scale constant between the two rules.
+    PC gradients use the training rule selected by ``forward_updates``.
     """
-    compare = create_pc_bp_gradient_comparison(structure)
+    compare = create_pc_bp_gradient_comparison(structure, forward_updates)
     per_batch = []
     for batch_idx, batch_data in enumerate(loader):
         if batch_idx >= num_batches:
@@ -857,10 +897,19 @@ def run_pc_bp_probe(structure, params, loader, rng_key, num_batches: int) -> dic
 
 
 def build_pretrain_inference(args: argparse.Namespace) -> InferenceSGDNormClip:
-    """Build the pretraining inference object, guarded when requested."""
+    """Build the pretraining inference object, spiking or guarded when requested."""
     if args.mode != "pc":
         return InferenceSGDNormClip(
             eta_infer=0.05, infer_steps=5, max_norm=args.pc_max_norm
+        )
+    if args.pc_inference == "spiking":
+        return InferenceSpikingPrecision(
+            eta_infer=args.pc_eta_infer,
+            infer_steps=args.pc_infer_steps,
+            max_norm=args.pc_max_norm,
+            spike_eta=args.pc_spike_eta,
+            spike_offset=args.pc_spike_offset,
+            depth_mode=args.pc_spike_depth,
         )
     if args.pc_infer_guard == "decay":
         return InferenceSGDNormClipDecay(
@@ -933,6 +982,82 @@ def _validate_pc_incremental_args(args: argparse.Namespace) -> None:
         raise ValueError("--pc_incremental requires --pc_infer_steps >= 1")
 
 
+def _spiking_flags_set(args: argparse.Namespace) -> list[str]:
+    return [
+        flag
+        for flag, value, default in (
+            ("--pc_spike_eta", args.pc_spike_eta, 1.0),
+            ("--pc_spike_offset", args.pc_spike_offset, 0),
+            ("--pc_spike_depth", args.pc_spike_depth, "longest"),
+        )
+        if value != default
+    ]
+
+
+def _validate_pc_spiking_args(args: argparse.Namespace) -> None:
+    spiking = args.pc_inference == "spiking"
+    if not spiking and _spiking_flags_set(args):
+        raise ValueError(
+            f"{', '.join(_spiking_flags_set(args))} requires --pc_inference spiking"
+        )
+    if spiking and args.mode != "pc":
+        raise ValueError("--pc_inference spiking requires --mode pc")
+    if spiking and args.pc_infer_guard != "none":
+        raise ValueError("--pc_inference spiking does not support --pc_infer_guard")
+    if spiking and args.pc_incremental and args.pc_spike_depth != "longest":
+        raise ValueError(
+            "--pc_inference spiking with --pc_incremental needs "
+            "--pc_spike_depth longest"
+        )
+    if spiking and args.pc_incremental and args.pc_eta_infer <= 0.0:
+        raise ValueError(
+            "--pc_inference spiking with --pc_incremental needs --pc_eta_infer > 0"
+        )
+    if args.pc_forward_updates != "none":
+        if args.mode != "pc":
+            raise ValueError("--pc_forward_updates requires --mode pc")
+        if args.pc_incremental:
+            raise ValueError("--pc_forward_updates does not support --pc_incremental")
+
+
+def report_spike_schedule(structure, args: argparse.Namespace) -> int:
+    """Print node depths and spike steps; warn if inference cannot reach them.
+
+    The schedule line lists ``node=depth@spike_step`` for every node with inputs.
+
+    Returns the number of inference steps needed for every free node with
+    inputs to spike.
+    """
+    depths = node_output_depths(structure, args.pc_spike_depth)
+    free_depths = {
+        name: depth
+        for name, depth in depths.items()
+        if structure.nodes[name].node_info.in_degree > 0
+    }
+    max_depth = max(free_depths.values())
+    deepest = [name for name, depth in free_depths.items() if depth == max_depth]
+    needed = max_depth + args.pc_spike_offset
+    print(
+        f"pc_spike_depths mode={args.pc_spike_depth} max_depth={max_depth} "
+        f"deepest={','.join(deepest)} steps_needed={needed}"
+    )
+    print(
+        "pc_spike_schedule "
+        + " ".join(
+            f"{name}={depth}@{depth - 1 + args.pc_spike_offset}"
+            for name, depth in free_depths.items()
+            if depth > 0
+        )
+    )
+    if args.pc_infer_steps < needed:
+        print(
+            f"warning: --pc_infer_steps {args.pc_infer_steps} < {needed} "
+            "(max depth + --pc_spike_offset); the deepest nodes never spike",
+            file=sys.stderr,
+        )
+    return needed
+
+
 def run_pretrain(args: argparse.Namespace) -> None:
     if args.pc_bp_probe < 0:
         raise ValueError("--pc_bp_probe must be non-negative")
@@ -943,6 +1068,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
     if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
         raise ValueError("--pc_output_energy_scale must be positive for PC pretraining")
     _validate_pc_incremental_args(args)
+    _validate_pc_spiking_args(args)
     _validate_validation_sequence_cap(args)
     validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)
@@ -971,16 +1097,31 @@ def run_pretrain(args: argparse.Namespace) -> None:
         pc_output_energy_scale=args.pc_output_energy_scale,
     )
     params = initialize_params(structure, rng_key)
+    if args.mode == "pc" and args.pc_inference == "spiking":
+        report_spike_schedule(structure, args)
     if args.pc_bp_probe:
         if args.probe_checkpoint:
             checkpoint = load_checkpoint(args.probe_checkpoint)
             if checkpoint is None:
                 raise ValueError(f"Checkpoint not found: {args.probe_checkpoint}")
             params = checkpoint["params"]
-        run_pc_bp_probe(structure, params, train_loader, rng_key, args.pc_bp_probe)
+        run_pc_bp_probe(
+            structure,
+            params,
+            train_loader,
+            rng_key,
+            args.pc_bp_probe,
+            forward_updates=args.pc_forward_updates,
+        )
         return
     if args.mode == "pc":
-        report_pc_gradient_reach(structure, params, train_loader, rng_key)
+        report_pc_gradient_reach(
+            structure,
+            params,
+            train_loader,
+            rng_key,
+            forward_updates=args.pc_forward_updates,
+        )
     init_diagnostics = {
         **summarize_init_diagnostics(params),
         "configured_embedding_init_std": args.embedding_init_std,
@@ -1031,6 +1172,11 @@ def run_pretrain(args: argparse.Namespace) -> None:
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "metrics_jsonl": args.metrics_jsonl,
             **({"pc_incremental": True} if args.pc_incremental else {}),
+            **(
+                {"pc_forward_updates": args.pc_forward_updates}
+                if args.pc_forward_updates != "none"
+                else {}
+            ),
             "init_diagnostics": init_diagnostics,
             "model": _model_config(args, train_loader.vocab_size),
             "validation_fn": None,
@@ -1080,6 +1226,10 @@ def run_pretrain(args: argparse.Namespace) -> None:
 def run_finetune(args: argparse.Namespace) -> None:
     if args.pc_incremental:
         raise ValueError("--pc_incremental is only valid for pretraining")
+    if args.pc_inference != "sgd_clip" or _spiking_flags_set(args):
+        raise ValueError("--pc_inference spiking is only valid for pretraining")
+    if args.pc_forward_updates != "none":
+        raise ValueError("--pc_forward_updates is only valid for pretraining")
     if args.max_validation_sequences is not None:
         raise ValueError("--max_validation_sequences is only valid for pretraining")
     _reject_unsupported_pc(args)
