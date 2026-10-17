@@ -1,25 +1,42 @@
 """Tests for the generic masking primitives used by masked-LM training.
 
 Covers the MhaResidualNode padding mask, ``compute_loss(loss_mask=...)``,
-auxiliary-task clamping in the backprop forward/loss paths, and the pmap guard
-for masked batches.
+auxiliary-task clamping in the backprop forward/loss paths, dropout in the
+generic backprop step, integer-target evaluation, and the pmap guard for
+masked batches.
 """
+
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
+from fabricpc.core.activations import (
+    GeluActivation,
+    IdentityActivation,
+    SoftmaxActivation,
+)
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.topology import Edge
-from fabricpc.core.types import GraphState, NodeState
+from fabricpc.core.types import GraphState, NodeParams, NodeState
 from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 from fabricpc.nodes import IdentityNode, Linear
+from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
+from fabricpc.nodes.transformer import TransformerBlock
 from fabricpc.nodes.transformer_v2 import MhaResidualNode, create_deep_transformer
-from fabricpc.training.train_autoregressive import compute_loss
+from fabricpc.training import evaluate_mlm
+from fabricpc.training.train_autoregressive import compute_loss, create_dropout_clamps
 from fabricpc.training.train_backprop import (
+    _target_labels,
     compute_forward_pass,
     compute_loss_autoregressive,
     eval_step_backprop,
@@ -27,6 +44,8 @@ from fabricpc.training.train_backprop import (
     train_backprop_autoregressive,
     train_step_backprop,
 )
+from fabricpc.utils.data import MlmTextBatcher
+from fabricpc.utils.helpers import layernorm
 
 SEQ_LEN = 6
 EMBED_DIM = 8
@@ -89,13 +108,25 @@ class TestAttentionMask:
         self, masked_attention_graph, rng_key
     ):
         params, structure = masked_attention_graph
+        params = _with_output_bias(params, 1.0)
         x = jax.random.normal(rng_key, (1, SEQ_LEN, EMBED_DIM))
         z_mu = (
             _forward(params, structure, x, _padded_mask(4), rng_key).nodes["mha"].z_mu
         )
 
-        b_o = params.nodes["mha"].biases["b_o"]
-        assert jnp.allclose(z_mu[:, 4:], x[:, 4:] + b_o, atol=1e-6)
+        assert jnp.array_equal(z_mu[:, 4:], x[:, 4:])
+
+    def test_valid_queries_match_key_masked_attention(
+        self, masked_attention_graph, rng_key
+    ):
+        params, structure = masked_attention_graph
+        params = _with_output_bias(params, 1.0)
+        x = jax.random.normal(rng_key, (1, SEQ_LEN, EMBED_DIM))
+        mask = _padded_mask(4)
+        z_mu = _forward(params, structure, x, mask, rng_key).nodes["mha"].z_mu
+
+        expected = _key_masked_attention(params.nodes["mha"], x, mask, num_heads=2)
+        assert jnp.allclose(z_mu[:, :4], expected[:, :4], atol=1e-5)
 
     def test_forward_pass_clamps_attention_mask(self, masked_attention_graph, rng_key):
         """Without clamping, the mask node gets a random latent and is ignored."""
@@ -107,6 +138,32 @@ class TestAttentionMask:
         assert jnp.allclose(padded.nodes["attention_mask"].z_latent, _padded_mask(4))
         delta = jnp.abs(full.nodes["mha"].z_mu - padded.nodes["mha"].z_mu)
         assert jnp.max(delta[:, :4]) > 1e-4
+
+
+def _with_output_bias(params, value):
+    mha = params.nodes["mha"]
+    biases = {**mha.biases, "b_o": jnp.full_like(mha.biases["b_o"], value)}
+    return params._replace(
+        nodes={**params.nodes, "mha": NodeParams(mha.weights, biases)}
+    )
+
+
+def _key_masked_attention(mha_params, x, mask, num_heads):
+    """Bidirectional MHA residual with padded keys excluded, no RoPE."""
+    w, b = mha_params.weights, mha_params.biases
+    batch, length, dim = x.shape
+    head_dim = dim // num_heads
+    h = layernorm(x, w["ln_gamma"], b["ln_beta"])
+
+    def heads(name):
+        out = jnp.dot(h, w[f"W_{name}"]) + b[f"b_{name}"]
+        return out.reshape(batch, length, num_heads, head_dim).transpose(0, 2, 1, 3)
+
+    scores = heads("q") @ heads("k").swapaxes(-1, -2) / jnp.sqrt(head_dim)
+    scores = jnp.where(mask[:, None, None, :] > 0, scores, -1e9)
+    attn = jax.nn.softmax(scores, axis=-1) @ heads("v")
+    attn = attn.transpose(0, 2, 1, 3).reshape(batch, length, dim)
+    return x + jnp.dot(attn, w["W_o"]) + b["b_o"]
 
 
 def _state_with_predictions(predictions):
@@ -301,3 +358,326 @@ class TestMaskedPmapGuard:
                 verbose=False,
                 pmap_single_device=True,
             )
+
+
+MLM_VOCAB = 16
+MLM_SPECIALS = {0, 1, 2, 3}
+
+
+def _encoder(rng_key, dropout_rate=0.0):
+    structure = create_encoder_mlm_model(
+        depth=1,
+        embed_dim=EMBED_DIM,
+        num_heads=2,
+        mlp_dim=16,
+        seq_len=SEQ_LEN,
+        vocab_size=MLM_VOCAB,
+        dropout_rate=dropout_rate,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+    )
+    return initialize_params(structure, rng_key), structure
+
+
+def _mlm_batch(batch_size, seed=0):
+    loader = MlmTextBatcher(
+        token_ids=np.tile(np.arange(4, MLM_VOCAB, dtype=np.int32), 6),
+        seq_len=SEQ_LEN,
+        batch_size=batch_size,
+        pad_token_id=0,
+        mask_token_id=3,
+        vocab_size=MLM_VOCAB,
+        special_token_ids=MLM_SPECIALS,
+        seed=seed,
+        mask_prob=0.4,
+    )
+    return next(iter(loader))
+
+
+def _trees_equal(a, b):
+    return all(
+        bool(jnp.array_equal(x, y))
+        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+    )
+
+
+class TestBackpropDropout:
+    def test_train_step_samples_dropout(self, rng_key):
+        params, structure = _encoder(rng_key, dropout_rate=0.5)
+        batch = {k: jnp.asarray(v) for k, v in _mlm_batch(4).items()}
+        optimizer = optax.sgd(1e-1)
+
+        def step(key):
+            new_params, _, _ = train_step_backprop(
+                params, optimizer.init(params), batch, structure, optimizer, key
+            )
+            return new_params
+
+        assert not _trees_equal(step(rng_key), step(jax.random.PRNGKey(7)))
+
+    def test_eval_step_is_deterministic(self, rng_key):
+        params, structure = _encoder(rng_key, dropout_rate=0.5)
+        batch = {k: jnp.asarray(v) for k, v in _mlm_batch(4).items()}
+
+        first = eval_step_backprop(params, batch, structure, rng_key)
+        second = eval_step_backprop(params, batch, structure, jax.random.PRNGKey(7))
+
+        assert all(float(a) == float(b) for a, b in zip(first, second))
+
+
+class TestEvalStepIntegerTargets:
+    @pytest.mark.parametrize("batch_size", [4, 1])
+    def test_masked_accuracy_matches_evaluate_mlm(self, rng_key, batch_size):
+        params, structure = _encoder(rng_key)
+        batch = {k: jnp.asarray(v) for k, v in _mlm_batch(batch_size).items()}
+        state = compute_forward_pass(params, structure, batch, rng_key)
+        predicted = jnp.argmax(state.nodes["mlm_head"].z_mu, axis=-1)
+        batch["y"] = predicted.at[:, -1].set((predicted[:, -1] + 1) % MLM_VOCAB)
+
+        loss, correct, total = eval_step_backprop(params, batch, structure, rng_key)
+        expected = evaluate_mlm(params, structure, _ListLoader([batch]), rng_key)
+
+        assert 0.0 < expected["masked_accuracy"]
+        assert int(total) == expected["num_masked_tokens"]
+        assert float(correct) / float(total) == pytest.approx(
+            expected["masked_accuracy"]
+        )
+        assert float(loss) == pytest.approx(expected["masked_loss"], rel=1e-5)
+
+    def test_one_hot_targets_are_reduced_to_labels(self):
+        predictions = jnp.zeros((3, 5))
+        labels = jnp.array([4, 0, 2])
+
+        result = _target_labels(jax.nn.one_hot(labels, 5), predictions)
+
+        assert jnp.array_equal(result, labels)
+
+    @pytest.mark.parametrize(
+        "target_shape, prediction_shape",
+        [((1, 6), (1, 6, 6)), ((4, 6), (4, 6, 11)), ((2, 3, 1), (2, 3, 5))],
+    )
+    def test_other_targets_are_used_as_labels(self, target_shape, prediction_shape):
+        targets = jnp.arange(np.prod(target_shape)).reshape(target_shape)
+
+        result = _target_labels(targets, jnp.zeros(prediction_shape))
+
+        assert result is targets
+
+
+def _reference_dropout_clamps(structure, batch_size, rng_key):
+    """Training-mode dropout masks: one key per task in sorted task order."""
+    tasks = sorted(k for k in structure.task_map if k.startswith("dropout_"))
+    keep = 1.0 - structure.config["dropout_rate"]
+    clamps = {}
+    for task, key in zip(tasks, jax.random.split(rng_key, len(tasks))):
+        node = structure.task_map[task]
+        shape = (batch_size, *structure.nodes[node].node_info.shape)
+        clamps[node] = jax.random.bernoulli(key, keep, shape).astype(jnp.float32) / keep
+    return clamps
+
+
+@pytest.fixture
+def causal_mask_graph(rng_key):
+    """one-hot input -> embed -> TransformerBlock (external mask) -> softmax."""
+    vocab = 7
+    input_node = Linear(
+        shape=(SEQ_LEN, vocab), activation=IdentityActivation(), name="input"
+    )
+    embed = Linear(
+        shape=(SEQ_LEN, EMBED_DIM), activation=IdentityActivation(), name="embed"
+    )
+    mask_node = Linear(
+        shape=(1, SEQ_LEN, SEQ_LEN), activation=IdentityActivation(), name="mask"
+    )
+    block = TransformerBlock(
+        shape=(SEQ_LEN, EMBED_DIM),
+        num_heads=2,
+        ff_dim=16,
+        internal_activation=GeluActivation(),
+        rope_theta=100.0,
+        name="block",
+    )
+    output = Linear(
+        shape=(SEQ_LEN, vocab), activation=SoftmaxActivation(), name="output"
+    )
+    structure = graph(
+        nodes=[input_node, embed, mask_node, block, output],
+        edges=[
+            Edge(source=input_node, target=embed.slot("in")),
+            Edge(source=embed, target=block.slot("in")),
+            Edge(source=mask_node, target=block.slot("mask")),
+            Edge(source=block, target=output.slot("in")),
+        ],
+        task_map=TaskMap(x=input_node, y=output, causal_mask=mask_node),
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        graph_state_initializer=FeedforwardStateInit(),
+    )
+    tokens = jax.random.randint(rng_key, (2, SEQ_LEN), 0, vocab)
+    batch = {"x": jax.nn.one_hot(tokens, vocab), "y": tokens}
+    return initialize_params(structure, rng_key), structure, batch
+
+
+class TestSuppliedInputsTakePrecedence:
+    def test_supplied_zero_dropout_mask_is_kept(self, rng_key):
+        params, structure = _encoder(rng_key, dropout_rate=0.5)
+        batch = {k: jnp.asarray(v) for k, v in _mlm_batch(2).items()}
+        batch["dropout_L0_mha"] = jnp.zeros((2, SEQ_LEN, EMBED_DIM))
+
+        for training in (False, True):
+            state = compute_forward_pass(params, structure, batch, rng_key, training)
+            assert jnp.all(state.nodes["dropout_L0_mha"].z_latent == 0.0)
+
+    def test_supplied_dropout_masks_fix_the_loss_path(self, rng_key):
+        params, structure = _encoder(rng_key, dropout_rate=0.5)
+        batch = {k: jnp.asarray(v) for k, v in _mlm_batch(2).items()}
+        batch["dropout_L0_mha"] = jnp.zeros((2, SEQ_LEN, EMBED_DIM))
+        batch["dropout_L0_mlp2"] = jnp.ones((2, SEQ_LEN, EMBED_DIM))
+
+        _, first = compute_loss_autoregressive(params, structure, batch, rng_key)
+        _, second = compute_loss_autoregressive(
+            params, structure, batch, jax.random.PRNGKey(7)
+        )
+        state = compute_forward_pass(params, structure, batch, rng_key)
+
+        assert jnp.array_equal(first, second)
+        assert jnp.allclose(first, state.nodes["mlm_head"].z_mu, atol=1e-6)
+
+    def test_generated_masks_are_reproducible(self, rng_key):
+        _, structure = _encoder(rng_key, dropout_rate=0.5)
+
+        clamps = create_dropout_clamps(structure, 2, rng_key, training=True)
+        expected = _reference_dropout_clamps(structure, 2, rng_key)
+
+        assert clamps.keys() == expected.keys()
+        assert all(jnp.array_equal(clamps[k], expected[k]) for k in expected)
+
+    def test_excluding_one_mask_keeps_the_others(self, rng_key):
+        _, structure = _encoder(rng_key, dropout_rate=0.5)
+
+        full = create_dropout_clamps(structure, 2, rng_key, training=True)
+        partial = create_dropout_clamps(
+            structure, 2, rng_key, training=True, exclude={"dropout_L0_mha"}
+        )
+
+        assert set(partial) == set(full) - {"dropout_L0_mha"}
+        assert all(jnp.array_equal(partial[k], full[k]) for k in partial)
+
+    def test_supplying_one_mask_keeps_the_others_in_forward_pass(self, rng_key):
+        params, structure = _encoder(rng_key, dropout_rate=0.5)
+        batch = {k: jnp.asarray(v) for k, v in _mlm_batch(2).items()}
+        supplied = {**batch, "dropout_L0_mha": jnp.zeros((2, SEQ_LEN, EMBED_DIM))}
+
+        base = compute_forward_pass(params, structure, batch, rng_key, True)
+        partial = compute_forward_pass(params, structure, supplied, rng_key, True)
+
+        assert jnp.array_equal(
+            base.nodes["dropout_L0_mlp2"].z_latent,
+            partial.nodes["dropout_L0_mlp2"].z_latent,
+        )
+
+    def test_supplied_causal_mask_is_kept(self, causal_mask_graph, rng_key):
+        params, structure, batch = causal_mask_graph
+        full = jnp.ones((2, 1, SEQ_LEN, SEQ_LEN))
+        causal = jnp.broadcast_to(
+            jnp.tril(jnp.ones((SEQ_LEN, SEQ_LEN))), (2, 1, SEQ_LEN, SEQ_LEN)
+        )
+
+        def predictions(extra):
+            _, preds = compute_loss_autoregressive(
+                params, structure, {**batch, **extra}, rng_key, training=False
+            )
+            return preds
+
+        default = predictions({})
+        assert jnp.allclose(predictions({"causal_mask": causal}), default)
+        assert not jnp.allclose(predictions({"causal_mask": full}), default)
+
+
+_PMAP_SCRIPT = textwrap.dedent("""
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from fabricpc.core.inference import InferenceSGDNormClip
+    from fabricpc.graph_initialization import initialize_params
+    from fabricpc.nodes.transformer_v2 import create_deep_transformer
+    from fabricpc.training.train import (
+        replicate_opt_state,
+        replicate_params,
+        shard_batch,
+    )
+    from fabricpc.training.train_backprop import (
+        create_pmap_eval_step_backprop_autoregressive,
+        create_pmap_train_step_backprop_autoregressive,
+        train_step_backprop_autoregressive,
+    )
+
+    assert jax.local_device_count() == 2
+    key = jax.random.PRNGKey(0)
+    structure = create_deep_transformer(
+        depth=1, embed_dim=8, num_heads=2, mlp_dim=16, seq_len=6, vocab_size=11,
+        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+    )
+    params = initialize_params(structure, key)
+    optimizer = optax.sgd(0.1)
+    x_key, y_key = jax.random.split(key)
+    batch = {
+        "x": jax.random.randint(x_key, (4, 6), 0, 11),
+        "y": jax.random.randint(y_key, (4, 6), 0, 11),
+    }
+    loss_mask = jnp.zeros((4, 6)).at[0, 0].set(1.0).at[2:, :2].set(1.0)
+    masked = {**batch, "loss_mask": loss_mask}
+    device_keys = jax.random.split(key, 2)
+    rep_params = replicate_params(params, 2)
+    rep_opt = replicate_opt_state(optimizer.init(params), 2)
+
+    step = create_pmap_train_step_backprop_autoregressive(structure, optimizer)
+    try:
+        step(rep_params, rep_opt, shard_batch(masked, 2), device_keys)
+    except NotImplementedError as error:
+        assert "loss_mask" in str(error)
+    else:
+        raise AssertionError("masked train batch was accepted")
+
+    new_params, _, _, _ = step(rep_params, rep_opt, shard_batch(batch, 2), device_keys)
+    single, _, _, _ = train_step_backprop_autoregressive(
+        params, optimizer.init(params), batch, structure, optimizer, key
+    )
+    diffs = jax.tree_util.tree_map(
+        lambda a, b: jnp.max(jnp.abs(a[0] - b)), new_params, single
+    )
+    assert max(float(d) for d in jax.tree_util.tree_leaves(diffs)) < 1e-5
+
+    eval_step = create_pmap_eval_step_backprop_autoregressive(structure, True)
+    try:
+        eval_step(rep_params, shard_batch(masked, 2), device_keys)
+    except NotImplementedError as error:
+        assert "loss_mask" in str(error)
+    else:
+        raise AssertionError("masked eval batch was accepted")
+    print("ok")
+    """)
+
+
+class TestPmapStepFactoriesRejectMaskedBatches:
+    def test_two_device_factories(self):
+        """Runs on two forced CPU devices, which must be set before JAX starts."""
+        repo_root = Path(__file__).resolve().parents[1]
+        env = {
+            **os.environ,
+            "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
+            "JAX_PLATFORMS": "cpu",
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (str(repo_root), os.environ.get("PYTHONPATH")) if p
+            ),
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", _PMAP_SCRIPT],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        assert result.returncode == 0, result.stderr[-4000:]
+        assert result.stdout.strip().endswith("ok")

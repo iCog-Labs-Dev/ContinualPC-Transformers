@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from fabricpc.utils.data import mlm
 from fabricpc.utils.data import (
     MLM_SPECIAL_TOKENS,
     MlmTextBatcher,
@@ -124,7 +125,29 @@ class TestMlmTextBatcher:
         assert all(batch["loss_mask"].sum() == 1 for batch in batches)
         for batch in batches:
             position = batch["loss_mask"].astype(bool)
-            assert batch["x"][position] == 3 and batch["y"][position] >= 10
+            assert batch["y"][position] >= 10
+            unselected = ~position & (batch["attention_mask"] > 0)
+            assert np.array_equal(batch["x"][unselected], batch["y"][unselected])
+
+    def test_forced_selection_keeps_the_replacement_policy(self, monkeypatch):
+        monkeypatch.setattr(mlm, "_MAX_MASK_REDRAWS", 1)
+        tokens = np.tile(np.arange(10, 30, dtype=np.int32), 500)
+        batcher = make_batcher(tokens, batch_size=1, mask_prob=1e-12)
+
+        outcomes = []
+        for batch in batcher:
+            position = batch["loss_mask"].astype(bool)
+            assert position.sum() == 1
+            x, y = batch["x"][position][0], batch["y"][position][0]
+            outcomes.append("mask" if x == 3 else "keep" if x == y else "random")
+
+        assert len(outcomes) == 2000
+        shares = {
+            k: outcomes.count(k) / len(outcomes) for k in ("mask", "random", "keep")
+        }
+        assert shares["mask"] == pytest.approx(0.8, abs=0.04)
+        assert shares["random"] == pytest.approx(0.1, abs=0.04)
+        assert shares["keep"] == pytest.approx(0.1, abs=0.04)
 
     def test_windows_of_only_special_tokens_are_skipped(self):
         batcher = make_batcher(np.array([10, 11, 12, 13, 14, 2]), batch_size=1)

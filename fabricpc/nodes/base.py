@@ -334,6 +334,13 @@ class NodeBase(ABC):
         6. Return ``jnp.sum(state.energy), state``: the scalar total energy
            first, the updated state second.
 
+        A node whose energy depends on one of its input slots (e.g. a loss mask
+        selecting supervised positions) may override ``energy_functional`` with
+        extra arguments and pass that input at step 5. It must still record
+        ``pre_activation`` and the raw ``error = z_latent - z_mu``, and call its
+        ``energy_functional`` at step 5; see ``MaskedVocabProjectionNode``
+        (encoder_transformer.py).
+
         muPC scaling is NOT applied here; the inference/learning callsite applies
         it. Do not scale inputs or gradients inside this method.
 

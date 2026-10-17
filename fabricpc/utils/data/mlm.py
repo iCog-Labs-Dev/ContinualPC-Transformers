@@ -19,6 +19,42 @@ MLM_SPECIAL_TOKENS = ["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"]
 _MAX_MASK_REDRAWS = 100
 
 
+def _replacement_ids(
+    vocab_size: int, special_token_ids: set[int], excludes_special: bool
+) -> np.ndarray:
+    """Token ids a selected position may be randomly replaced with."""
+    if excludes_special:
+        return np.array(
+            [idx for idx in range(vocab_size) if idx not in special_token_ids],
+            dtype=np.int32,
+        )
+    return np.arange(vocab_size, dtype=np.int32)
+
+
+def _corrupt(
+    token_ids: np.ndarray,
+    select: np.ndarray,
+    rng: np.random.Generator,
+    mask_token_id: int,
+    replacement_ids: np.ndarray,
+) -> np.ndarray:
+    """Apply the 80/10/10 policy to the ``select`` positions of ``token_ids``.
+
+    Selected tokens become ``[MASK]`` (80%), a random id from
+    ``replacement_ids`` (10%), or stay unchanged (10%); an empty
+    ``replacement_ids`` leaves the random-replacement share unchanged.
+    """
+    policy = rng.random(token_ids.shape)
+    random_tokens = (
+        rng.choice(replacement_ids, size=token_ids.shape)
+        if replacement_ids.size
+        else token_ids.copy()
+    )
+    masked = np.where(select & (policy < 0.8), mask_token_id, token_ids)
+    masked = np.where(select & (policy >= 0.8) & (policy < 0.9), random_tokens, masked)
+    return masked.astype(np.int32)
+
+
 def apply_mlm_mask(
     token_ids: np.ndarray,
     *,
@@ -51,26 +87,11 @@ def apply_mlm_mask(
     rng = np.random.default_rng(seed)
     eligible = ~np.isin(token_ids, list(special_token_ids))
     loss_mask = (rng.random(token_ids.shape) < mask_prob) & eligible
-
-    policy = rng.random(token_ids.shape)
-    if random_replacement_excludes_special:
-        replacement_ids = np.array(
-            [idx for idx in range(vocab_size) if idx not in special_token_ids],
-            dtype=np.int32,
-        )
-        random_tokens = (
-            rng.choice(replacement_ids, size=token_ids.shape)
-            if replacement_ids.size
-            else token_ids.copy()
-        )
-    else:
-        random_tokens = rng.integers(0, vocab_size, size=token_ids.shape)
-
-    masked = np.where(loss_mask & (policy < 0.8), mask_token_id, token_ids)
-    masked = np.where(
-        loss_mask & (policy >= 0.8) & (policy < 0.9), random_tokens, masked
+    replacement_ids = _replacement_ids(
+        vocab_size, special_token_ids, random_replacement_excludes_special
     )
-    return masked.astype(np.int32), token_ids.astype(np.int32), loss_mask
+    masked = _corrupt(token_ids, loss_mask, rng, mask_token_id, replacement_ids)
+    return masked, token_ids.astype(np.int32), loss_mask
 
 
 class MlmTextBatcher:
@@ -220,8 +241,12 @@ class MlmTextBatcher:
         row, col = eligible[rng.integers(len(eligible))]
         loss_mask = np.zeros(original.shape, dtype=bool)
         loss_mask[row, col] = True
-        masked = original.copy()
-        masked[row, col] = self.mask_token_id
+        replacement_ids = _replacement_ids(
+            self.vocab_size,
+            self.special_token_ids,
+            self.random_replacement_excludes_special,
+        )
+        masked = _corrupt(original, loss_mask, rng, self.mask_token_id, replacement_ids)
         return masked, original.copy(), loss_mask
 
 

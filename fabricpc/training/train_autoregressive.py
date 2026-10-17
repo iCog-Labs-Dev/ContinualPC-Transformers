@@ -14,7 +14,7 @@ The training loop supports both:
 - Last-token prediction (only predict final token, for efficiency)
 """
 
-from typing import Dict, Tuple, Any, List, Optional, Callable, cast
+from typing import Dict, Tuple, Any, List, Optional, Callable, Collection, cast
 import math
 import jax
 import jax.numpy as jnp
@@ -48,6 +48,7 @@ def create_dropout_clamps(
     batch_size: int,
     rng_key: jax.Array,
     training: bool,
+    exclude: Collection[str] = (),
 ) -> Dict[str, jnp.ndarray]:
     """Create clamps for transformer-v2 dropout mask source nodes.
 
@@ -56,6 +57,10 @@ def create_dropout_clamps(
     (inverted dropout). During evaluation/generation, masks are all ones, so
     no activation rescaling is applied at test time. Keeping dropout as clamped
     source data makes the mask fixed over the entire PC inference solve.
+
+    Tasks named in ``exclude`` (e.g. masks the caller supplies) get no clamp.
+    The key is still split over every dropout task, so the remaining tasks
+    receive the same masks as when nothing is excluded.
     """
     dropout_tasks = tuple(
         sorted(k for k in structure.task_map if k.startswith("dropout_"))
@@ -72,6 +77,8 @@ def create_dropout_clamps(
     clamps = {}
 
     for task_name, key in zip(dropout_tasks, keys):
+        if task_name in exclude:
+            continue
         node_name = structure.task_map[task_name]
         node_shape = structure.nodes[node_name].node_info.shape
         mask_shape = (batch_size, *node_shape)

@@ -60,6 +60,8 @@ def _input_clamps(
 
     Besides ``x`` this covers auxiliary source nodes such as ``attention_mask``
     and ``loss_mask``; leaving those unclamped would give them random latents.
+    Supplied entries take precedence: default ``dropout_*`` and ``causal_mask``
+    inputs are generated only for tasks missing from the batch.
     """
     return {
         structure.task_map[task_name]: value
@@ -79,7 +81,9 @@ def compute_forward_pass(
     Compute forward pass for backpropagation training.
 
     This runs a single forward pass through the network (no iterative
-    inference) and computes output at the output node.
+    inference) and computes output at the output node. Every batch entry that
+    names a task (except ``y``) is clamped as given; dropout masks are sampled
+    (or set to ones) only for ``dropout_*`` tasks absent from the batch.
 
     Args:
         params: Model parameters
@@ -101,7 +105,9 @@ def compute_forward_pass(
     if any(task_name.startswith("dropout_") for task_name in structure.task_map):
         rng_key, dropout_key = jax.random.split(rng_key)
         clamps.update(
-            create_dropout_clamps(structure, batch_size, dropout_key, training)
+            create_dropout_clamps(
+                structure, batch_size, dropout_key, training, exclude=batch.keys()
+            )
         )
 
     # Single forward pass via initialize_state with feedforward init
@@ -141,7 +147,7 @@ def train_step_backprop(
     """
 
     def loss_fn(p):
-        state = compute_forward_pass(p, structure, batch, rng_key)
+        state = compute_forward_pass(p, structure, batch, rng_key, training=True)
         return compute_loss(
             state,
             batch["y"],
@@ -314,7 +320,8 @@ def compute_loss_autoregressive(
     This runs a single forward pass (with causal masking when the graph
     defines a ``causal_mask`` task) and computes cross-entropy over all
     sequence positions, or only over ``batch["loss_mask"]`` positions when
-    present (masked-LM training).
+    present (masked-LM training). A ``causal_mask`` or ``dropout_*`` entry in
+    the batch is clamped as given instead of being generated.
 
     Args:
         params: Model parameters
@@ -339,7 +346,11 @@ def compute_loss_autoregressive(
     # Add an external causal mask only if the graph defines one (v1). The v2
     # decomposed MhaResidualNode masks internally via is_causal, so its task_map
     # has no "causal_mask" node and this is skipped.
-    if use_causal_mask and "causal_mask" in structure.task_map:
+    if (
+        use_causal_mask
+        and "causal_mask" in structure.task_map
+        and "causal_mask" not in batch
+    ):
         causal_mask = create_causal_mask(seq_len)
         causal_mask = causal_mask[None, None, :, :]  # (1, 1, seq, seq)
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, seq_len))
@@ -347,7 +358,9 @@ def compute_loss_autoregressive(
 
     rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
     clamps.update(
-        create_dropout_clamps(structure, batch_size, dropout_key, training=training)
+        create_dropout_clamps(
+            structure, batch_size, dropout_key, training=training, exclude=batch.keys()
+        )
     )
 
     # Single forward pass
@@ -422,7 +435,12 @@ def train_step_backprop_autoregressive_pmap(
     rng_key: jax.Array,
     use_causal_mask: bool = True,
 ) -> Tuple[GraphParams, optax.OptState, jnp.ndarray, jnp.ndarray]:
-    """Single backprop pmap training step with mean-gradient reduction."""
+    """Single backprop pmap training step with mean-gradient reduction.
+
+    Raises:
+        NotImplementedError: If the batch carries a ``loss_mask``.
+    """
+    _reject_masked_pmap_batch(batch)
     (loss, predictions), grads = jax.value_and_grad(
         lambda p: compute_loss_autoregressive(
             p, structure, batch, rng_key, use_causal_mask
@@ -481,7 +499,8 @@ def train_backprop_autoregressive(
         iter_callback: Optional callback per batch
 
     Returns:
-        Tuple of (trained_params, loss_history, epoch_results)
+        Tuple of (trained_params, loss_history, epoch_results). The reported
+        epoch loss is the mean of per-batch losses, not a token-weighted mean.
     """
     validate_feedforward_init(structure)
 
@@ -621,6 +640,14 @@ def train_backprop_autoregressive(
     return params, iter_results, epoch_results
 
 
+def _target_labels(targets: jnp.ndarray, predictions: jnp.ndarray) -> jnp.ndarray:
+    """Class labels from targets: argmax of one-hot targets, which have the
+    predictions' exact shape; any other targets are already integer labels."""
+    if targets.shape == predictions.shape:
+        return jnp.argmax(targets, axis=-1)
+    return targets
+
+
 def eval_step_backprop(
     params: GraphParams,
     batch: Dict[str, jnp.ndarray],
@@ -654,10 +681,7 @@ def eval_step_backprop(
 
     # Compute accuracy (for classification)
     pred_labels = jnp.argmax(predictions, axis=-1)
-    if targets.ndim > 1 and targets.shape[-1] > 1:
-        true_labels = jnp.argmax(targets, axis=-1)
-    else:
-        true_labels = targets
+    true_labels = _target_labels(targets, predictions)
 
     # Handle sequence vs non-sequence
     hits = pred_labels == true_labels
@@ -744,8 +768,13 @@ def create_pmap_eval_step_backprop_autoregressive(
     structure: GraphStructure,
     use_causal_mask: bool,
 ):
-    """Create a pmap'd backprop evaluation step with static args in closure."""
+    """Create a pmap'd backprop evaluation step with static args in closure.
+
+    The step raises ``NotImplementedError`` for batches with a ``loss_mask``.
+    """
+
     def step_fn(params, batch, rng_key):
+        _reject_masked_pmap_batch(batch)
         return compute_loss_autoregressive(
             params, structure, batch, rng_key, use_causal_mask, training=False
         )

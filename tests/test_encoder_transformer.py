@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from fabricpc.core.activations import SoftmaxActivation
+from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
@@ -11,7 +13,6 @@ from fabricpc.nodes import (
     AddPositionEmbeddingNode,
     FinalLayerNormNode,
     MaskedVocabProjectionNode,
-    VocabProjectionNode,
 )
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.training.train_backprop import compute_forward_pass
@@ -177,15 +178,134 @@ class TestEncoderForward:
         assert not jnp.allclose(head(rng_key, True), head(other_key, True))
 
 
-class TestMaskedVocabProjection:
-    def test_reuses_vocab_projection_params(self):
-        structure = build_mlm()
+def reference_head_energy(params, state, batch, targets, scale=1.0):
+    """Masked CE normalised by the batch's masked count, from the head logits."""
+    head = params.nodes["mlm_head"]
+    hidden = state.nodes["final_layernorm"].z_mu
+    logits = jnp.dot(hidden, head.weights["W_out"]) + head.biases["b_out"]
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    mask = batch["loss_mask"]
+    per_token = -jnp.sum(targets * log_probs, axis=-1)
+    return scale * jnp.sum(per_token * mask, axis=-1) / jnp.maximum(mask.sum(), 1.0)
 
-        assert issubclass(MaskedVocabProjectionNode, VocabProjectionNode)
+
+class TestMaskedVocabProjection:
+    def test_has_vocab_projection_params(self, rng_key):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        head = params.nodes["mlm_head"]
+
         assert (
             structure.nodes["mlm_head"].node_info.node_class
             is MaskedVocabProjectionNode
         )
+        assert set(head.weights) == {"W_out"} and set(head.biases) == {"b_out"}
+        assert head.weights["W_out"].shape == (16, VOCAB_SIZE)
+        assert head.biases["b_out"].shape == (VOCAB_SIZE,)
+
+    @pytest.mark.parametrize("fixed", ["activation", "energy"])
+    def test_rejects_activation_and_energy_overrides(self, fixed):
+        override = {"activation": SoftmaxActivation(), "energy": GaussianEnergy()}
+        with pytest.raises(ValueError, match=fixed):
+            MaskedVocabProjectionNode(
+                shape=(SEQ_LEN, VOCAB_SIZE),
+                name="head",
+                vocab_size=VOCAB_SIZE,
+                embed_dim=16,
+                **{fixed: override[fixed]},
+            )
+
+    @pytest.mark.parametrize(
+        "loss_mask",
+        [
+            jnp.array([[1, 0, 0, 0, 0, 0]], dtype=jnp.float32),
+            jnp.array([[1, 1, 0, 1, 0, 0]], dtype=jnp.float32),
+        ],
+    )
+    def test_energy_matches_masked_cross_entropy(self, rng_key, loss_mask):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        batch = mlm_batch(loss_mask=loss_mask)
+        targets = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+
+        state = initialize_graph_state(
+            structure, 1, rng_key, head_clamps(structure, batch, targets), params=params
+        )
+
+        expected = reference_head_energy(params, state, batch, targets)
+        assert jnp.allclose(state.nodes["mlm_head"].energy, expected, rtol=1e-6)
+
+    def test_energy_functional_without_mask_selects_every_position(self, rng_key):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        batch = mlm_batch(loss_mask=jnp.ones((1, SEQ_LEN), jnp.float32))
+        targets = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+        state = initialize_graph_state(
+            structure, 1, rng_key, head_clamps(structure, batch, targets), params=params
+        )
+        node_info = structure.nodes["mlm_head"].node_info
+        head_params = params.nodes["mlm_head"]
+        logits = (
+            jnp.dot(state.nodes["final_layernorm"].z_mu, head_params.weights["W_out"])
+            + head_params.biases["b_out"]
+        )
+        head = state.nodes["mlm_head"]._replace(pre_activation=logits)
+
+        out = node_info.node_class.energy_functional(head, node_info)
+
+        expected = reference_head_energy(params, state, batch, targets)
+        assert jnp.allclose(out.energy, expected, rtol=1e-6)
+
+    def test_error_is_raw_at_every_position(self, rng_key):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        batch = mlm_batch()
+        targets = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+
+        head = initialize_graph_state(
+            structure, 1, rng_key, head_clamps(structure, batch, targets), params=params
+        ).nodes["mlm_head"]
+
+        assert jnp.allclose(head.error, head.z_latent - head.z_mu)
+        assert jnp.max(jnp.abs(head.error[:, 1:])) > 1e-3
+
+    def test_forward_records_logits_and_matches_reference_gradients(self, rng_key):
+        structure = build_mlm()
+        params = initialize_params(structure, rng_key)
+        batch = mlm_batch(loss_mask=jnp.array([[1, 0, 1, 0, 0, 0]], jnp.float32))
+        targets = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+        state = initialize_graph_state(
+            structure, 1, rng_key, head_clamps(structure, batch, targets), params=params
+        )
+        node = structure.nodes["mlm_head"]
+        node_info = node.node_info
+        inputs = {
+            "final_layernorm->mlm_head:in": state.nodes["final_layernorm"].z_mu,
+            "mlm_loss_mask->mlm_head:loss_mask": batch["loss_mask"],
+        }
+        head_state = state.nodes["mlm_head"]
+
+        def node_energy(head_params):
+            energy, _ = node_info.node_class.forward(
+                head_params, inputs, head_state, node_info
+            )
+            return energy
+
+        def reference(head_params):
+            full = params._replace(nodes={**params.nodes, "mlm_head": head_params})
+            return jnp.sum(reference_head_energy(full, state, batch, targets))
+
+        _, out = node_info.node_class.forward(
+            params.nodes["mlm_head"], inputs, head_state, node_info
+        )
+        assert jnp.allclose(out.z_mu, jax.nn.softmax(out.pre_activation, axis=-1))
+
+        grads = jax.grad(node_energy)(params.nodes["mlm_head"])
+        expected = jax.grad(reference)(params.nodes["mlm_head"])
+        for got, want in zip(
+            jax.tree_util.tree_leaves(grads), jax.tree_util.tree_leaves(expected)
+        ):
+            assert jnp.allclose(got, want, atol=1e-6)
 
     def test_energy_ignores_unmasked_labels(self, rng_key):
         structure = build_mlm()
@@ -213,7 +333,7 @@ class TestMaskedVocabProjection:
             atol=1e-6,
         )
 
-    def test_energy_and_error_are_zero_for_empty_mask(self, rng_key):
+    def test_energy_is_zero_and_error_raw_for_empty_mask(self, rng_key):
         structure = build_mlm()
         params = initialize_params(structure, rng_key)
         batch = mlm_batch(loss_mask=jnp.zeros((1, SEQ_LEN)))
@@ -223,8 +343,9 @@ class TestMaskedVocabProjection:
             structure, 1, rng_key, head_clamps(structure, batch, targets), params=params
         )
 
-        assert jnp.allclose(state.nodes["mlm_head"].energy, 0.0)
-        assert jnp.allclose(state.nodes["mlm_head"].error, 0.0)
+        head = state.nodes["mlm_head"]
+        assert jnp.allclose(head.energy, 0.0)
+        assert jnp.allclose(head.error, head.z_latent - head.z_mu)
 
     def test_output_energy_scale_multiplies_energy(self, rng_key):
         batch = mlm_batch()

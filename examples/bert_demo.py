@@ -233,7 +233,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
         metrics = evaluate_mlm(epoch_params, structure, val_loader, key)
         print(
             f"epoch {epoch_idx + 1}/{num_epochs_to_run} "
-            f"train_masked_loss={ce_loss:.4f} "
+            f"train_batch_mean_loss={ce_loss:.4f} "
             f"val_masked_loss={metrics['masked_loss']:.4f} "
             f"val_masked_acc={metrics['masked_accuracy']:.2%} "
             f"val_tokens={metrics['num_masked_tokens']}"

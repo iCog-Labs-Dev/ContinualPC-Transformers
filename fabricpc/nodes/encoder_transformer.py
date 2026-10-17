@@ -15,13 +15,14 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
-from fabricpc.core.activations import IdentityActivation
-from fabricpc.core.energy import GaussianEnergy
+from fabricpc.core.activations import IdentityActivation, SoftmaxActivation
+from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.inference import InferenceBase
 from fabricpc.core.initializers import (
     InitializerBase,
     NormalInitializer,
     OnesInitializer,
+    XavierInitializer,
     initialize,
 )
 from fabricpc.core.mupc import MuPCConfig
@@ -173,15 +174,24 @@ def _input_by_slot(inputs: Dict[str, jnp.ndarray], slot_name: str) -> jnp.ndarra
     return matches[0]
 
 
-class MaskedVocabProjectionNode(VocabProjectionNode):
+class MaskedVocabProjectionNode(NodeBase):
     """Vocabulary projection whose cross-entropy energy only counts masked tokens.
 
     Takes the encoder output on ``in`` and a ``(batch, seq_len)`` MLM mask on
-    ``loss_mask``. The per-sample energy is the masked cross-entropy, normalised
-    by the number of masked tokens in the batch and scaled by
+    ``loss_mask``. The prediction is ``softmax(logits)`` with the parameters of
+    ``VocabProjectionNode``. The per-sample energy is the masked cross-entropy,
+    normalised by the number of masked tokens in the batch and scaled by
     ``output_energy_scale``, so in PC training unmasked positions exert no pull
-    on the latents.
+    on the latents. The activation and energy are fixed; passing
+    ``activation`` or ``energy`` raises ``ValueError``.
+
+    The energy depends on the ``loss_mask`` input, so ``energy_functional``
+    takes it as an extra argument; ``error`` stays the raw
+    ``z_latent - z_mu`` at every position.
     """
+
+    DEFAULT_ENERGY = CrossEntropyEnergy
+    DEFAULT_ACTIVATION = SoftmaxActivation
 
     def __init__(
         self,
@@ -190,14 +200,27 @@ class MaskedVocabProjectionNode(VocabProjectionNode):
         vocab_size,
         embed_dim,
         output_energy_scale: float = 1.0,
+        weight_init: Optional[InitializerBase] = None,
+        latent_init: Optional[InitializerBase] = None,
         **kwargs,
     ):
+        for fixed in ("activation", "energy"):
+            if kwargs.get(fixed) is not None:
+                raise ValueError(
+                    f"MaskedVocabProjectionNode does not accept {fixed}=; it "
+                    "always uses softmax with masked cross-entropy"
+                )
+            kwargs.pop(fixed, None)
         super().__init__(
             shape=shape,
             name=name,
             vocab_size=vocab_size,
             embed_dim=embed_dim,
             output_energy_scale=float(output_energy_scale),
+            activation=SoftmaxActivation(),
+            energy=CrossEntropyEnergy(),
+            weight_init=weight_init or XavierInitializer(),
+            latent_init=latent_init or NormalInitializer(),
             **kwargs,
         )
 
@@ -211,6 +234,12 @@ class MaskedVocabProjectionNode(VocabProjectionNode):
         }
 
     @staticmethod
+    def initialize_params(key, node_shape, input_shapes, weight_init, config):
+        return VocabProjectionNode.initialize_params(
+            key, node_shape, input_shapes, weight_init, config
+        )
+
+    @staticmethod
     def forward(params, inputs, state, node_info):
         hidden = _input_by_slot(inputs, "in")
         loss_mask = _input_by_slot(inputs, "loss_mask")
@@ -221,18 +250,38 @@ class MaskedVocabProjectionNode(VocabProjectionNode):
             )
 
         logits = jnp.dot(hidden, params.weights["W_out"]) + params.biases["b_out"]
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        probs = jnp.exp(log_probs)
-        mask = jax.lax.stop_gradient(loss_mask.astype(logits.dtype))
+        z_mu = jax.nn.softmax(logits, axis=-1)
+        error = state.z_latent - z_mu
+        state = state._replace(z_mu=z_mu, pre_activation=logits, error=error)
+        state = node_info.node_class.energy_functional(state, node_info, loss_mask)
+        return jnp.sum(state.energy), state
+
+    @staticmethod
+    def energy_functional(
+        state: NodeState,
+        node_info: NodeInfo,
+        loss_mask: Optional[jnp.ndarray] = None,
+    ) -> NodeState:
+        """Masked cross-entropy of ``z_latent`` under ``softmax(pre_activation)``.
+
+        Args:
+            state: NodeState with ``pre_activation`` holding the logits.
+            node_info: NodeInfo carrying ``output_energy_scale``.
+            loss_mask: ``(batch, seq_len)`` selection of supervised positions;
+                ``None`` selects every position.
+
+        Returns:
+            NodeState with a per-sample ``energy`` of shape ``(batch,)``.
+        """
+        log_probs = jax.nn.log_softmax(state.pre_activation, axis=-1)
+        if loss_mask is None:
+            loss_mask = jnp.ones(log_probs.shape[:2])
+        mask = jax.lax.stop_gradient(loss_mask.astype(log_probs.dtype))
         per_token_ce = -jnp.sum(state.z_latent * log_probs, axis=-1)
         masked_count = jnp.maximum(jnp.sum(mask), 1.0)
         scale = node_info.node_config.get("output_energy_scale", 1.0)
         energy = scale * jnp.sum(per_token_ce * mask, axis=-1) / masked_count
-        error = (state.z_latent - probs) * mask[..., None]
-        state = state._replace(
-            pre_activation=logits, z_mu=probs, error=error, energy=energy
-        )
-        return jnp.sum(energy), state
+        return state._replace(energy=energy)
 
 
 class EncoderBackbone(NamedTuple):

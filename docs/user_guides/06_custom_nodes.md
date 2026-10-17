@@ -252,6 +252,8 @@ Within that constraint, every `forward()` must perform these six steps in order:
 5. **Populate energy**: `node_class = node_info.node_class; state = node_class.energy_functional(state, node_info)`. This sets `state.energy` from `energy(z_latent, z_mu)`, so `z_mu` must already be set. Extra energy terms (for example the Hopfield attractor term in `StorkeyHopfield`) are added by replacing `state.energy` after this call.
 6. **Return**: `return jnp.sum(state.energy), state` — the scalar total energy first, the updated state second.
 
+A node whose energy depends on one of its input slots (for example a loss mask that selects which positions count) may override the `energy_functional` staticmethod with extra arguments and pass that input at step 5, e.g. `node_class.energy_functional(state, node_info, loss_mask)`. It must still record `pre_activation` and the raw, unmasked `error = z_latent - z_mu`, and call its `energy_functional` at step 5. `MaskedVocabProjectionNode` (encoder_transformer.py) is the worked example: it computes masked cross-entropy from `log_softmax(state.pre_activation)`.
+
 The steps *between* predicting `z_mu` and writing it back are free: input aggregation, weights and biases, the choice of activation, and any internal sub-structure are all node-specific.
 
 > **muPC scaling is not applied inside `forward()`.** The inference and learning callsites scale inputs and gradients; doing so again here double-scales them. See the [Initialization and Scaling guide](05_initialization_and_scaling.md).

@@ -266,11 +266,11 @@ class MhaResidualNode(NodeBase):
             scores = jnp.where(attention_mask[:, None, None, :], scores, -1e9)
 
         attn = jax.nn.softmax(scores, axis=-1)
-        if mask_key is not None:
-            attn = jnp.where(attention_mask[:, None, :, None], attn, 0.0)
         mha = jnp.matmul(attn, V).transpose(0, 2, 1, 3).reshape(B, L, D)
         mha = proj(mha, "W_o", "b_o")
         mha = _apply_dropout_mask(mha, inputs)
+        if mask_key is not None:
+            mha = jnp.where(attention_mask[:, :, None], mha, 0.0)
 
         z_mu = skip + mha
         error = state.z_latent - z_mu
