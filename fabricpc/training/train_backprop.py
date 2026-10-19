@@ -43,6 +43,7 @@ from fabricpc.training.train import (
     shard_batch,
 )
 
+
 def validate_feedforward_init(structure: GraphStructure):
     """
     Validate that the graph state initializer is feedforward type.
@@ -456,6 +457,7 @@ def create_pmap_train_step_backprop_autoregressive(
     use_causal_mask: bool = True,
 ):
     """Create a pmap'd backprop training step with static args in closure."""
+
     def step_fn(params, opt_state, batch, rng_key):
         return train_step_backprop_autoregressive_pmap(
             params, opt_state, batch, structure, optimizer, rng_key, use_causal_mask
@@ -543,9 +545,9 @@ def train_backprop_autoregressive(
                 if n_devices > 1
                 else epoch_rng_key[None, :]
             )
-            batch_keys = jax.vmap(
-                lambda key: jax.random.split(key, max_batches)
-            )(device_keys)
+            batch_keys = jax.vmap(lambda key: jax.random.split(key, max_batches))(
+                device_keys
+            )
         else:
             batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
@@ -781,7 +783,6 @@ def evaluate_backprop_autoregressive(
     debug: bool = False,
     pmap_single_device: bool = False,
 ) -> Dict[str, float]:
-
     """
     Evaluate backprop-trained autoregressive model on test data.
 
@@ -821,9 +822,9 @@ def evaluate_backprop_autoregressive(
             if n_devices > 1
             else epoch_key[None, :]
         )
-        batch_keys = jax.vmap(
-            lambda key: jax.random.split(key, num_batches_total)
-        )(device_keys)
+        batch_keys = jax.vmap(lambda key: jax.random.split(key, num_batches_total))(
+            device_keys
+        )
     else:
         batch_keys = jax.random.split(rng_key, num_batches_total)
 
@@ -866,7 +867,10 @@ def evaluate_backprop_autoregressive(
             if pad_size:
                 batch = {
                     key: jnp.concatenate(
-                        [value, jnp.zeros((pad_size,) + value.shape[1:], dtype=value.dtype)]
+                        [
+                            value,
+                            jnp.zeros((pad_size,) + value.shape[1:], dtype=value.dtype),
+                        ]
                     )
                     for key, value in batch.items()
                 }

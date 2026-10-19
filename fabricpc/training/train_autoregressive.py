@@ -573,9 +573,7 @@ def train_autoregressive(
                 if n_devices > 1
                 else epoch_rng_key[None, :]
             )
-            batch_keys = jax.vmap(
-                lambda k: jax.random.split(k, max_batches)
-            )(dev_keys)
+            batch_keys = jax.vmap(lambda k: jax.random.split(k, max_batches))(dev_keys)
         else:
             batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
@@ -628,9 +626,7 @@ def train_autoregressive(
         # without recomputing them. Callbacks should accept **kwargs.
         if epoch_callback is not None:
             cb_params = (
-                jax.tree_util.tree_map(lambda x: x[0], params)
-                if use_pmap
-                else params
+                jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
             )
             epoch_results.append(
                 epoch_callback(
@@ -1046,9 +1042,7 @@ def evaluate_autoregressive(
                 else:
                     batch_loss = -float(
                         jnp.mean(
-                            jnp.take_along_axis(
-                                log_preds, targets[..., None], axis=-1
-                            )
+                            jnp.take_along_axis(log_preds, targets[..., None], axis=-1)
                         )
                     )
             else:
