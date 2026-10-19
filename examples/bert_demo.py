@@ -53,6 +53,7 @@ from fabricpc.training import (
 from fabricpc.training.train_autoregressive import (
     get_graph_param_gradient_autoregressive,
 )
+from fabricpc.training.train_backprop import compute_loss_autoregressive
 from fabricpc.utils.data import MLM_SPECIAL_TOKENS, MlmTextBatcher, tokenize_texts_bpe
 
 TINY_TRAIN_TEXTS = [
@@ -159,8 +160,13 @@ def count_training_steps(num_epochs: float, batches_per_epoch: int) -> int:
     return count_training_batches(num_epochs, batches_per_epoch)
 
 
-def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
-    """AdamW with linear warmup, cosine decay and global-norm clipping."""
+def build_optimizer(
+    args, total_steps: int, grad_scale: float = 1.0
+) -> optax.GradientTransformation:
+    """AdamW with linear warmup, cosine decay and global-norm clipping.
+
+    Gradients are multiplied by ``grad_scale`` before clipping.
+    """
     if not 0.0 <= args.warmup_fraction < 1.0:
         raise ValueError("warmup_fraction must be in [0, 1)")
     schedule = optax.warmup_cosine_decay_schedule(
@@ -171,8 +177,35 @@ def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
     )
     adamw = optax.adamw(schedule, weight_decay=args.weight_decay)
     if args.grad_clip <= 0:
-        return adamw
-    return optax.chain(optax.clip_by_global_norm(args.grad_clip), adamw)
+        return optax.chain(optax.scale(grad_scale), adamw)
+    return optax.chain(
+        optax.scale(grad_scale), optax.clip_by_global_norm(args.grad_clip), adamw
+    )
+
+
+def expected_masked_tokens(loader, max_batches: int = 50) -> float:
+    """Mean ``loss_mask`` count over the loader's first batches.
+
+    The loader's state is restored so training sees the same batches.
+    """
+    state = loader.state_dict()
+    counts = []
+    for batch in loader:
+        counts.append(float(np.sum(batch["loss_mask"])))
+        if len(counts) == max_batches:
+            break
+    loader.load_state_dict(state)
+    return float(np.mean(counts))
+
+
+def pc_grad_scale(loader) -> float:
+    """Scale that puts PC weight gradients on backprop's per-token footing.
+
+    PC weight gradients sum over masked tokens while the backprop loss averages
+    them, so dividing by the expected masked count per batch makes
+    ``--grad_clip`` act on comparable norms in both modes.
+    """
+    return 1.0 / expected_masked_tokens(loader)
 
 
 TRAINERS = {"backprop": train_backprop_autoregressive, "pc": train_autoregressive}
@@ -204,7 +237,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--warmup_fraction", type=float, default=0.1, help="of total steps"
     )
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=1.0,
+        help="global-norm clip; in PC mode gradients are first divided by the "
+        "expected masked tokens per batch so the clip matches backprop's scale",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--pc_infer_steps", type=int, default=10, help="PC only")
     parser.add_argument("--pc_eta_infer", type=float, default=0.05, help="PC only")
@@ -274,34 +313,71 @@ def print_data_summary(train_ids, val_ids, vocab, batches_per_epoch: int) -> Non
     )
 
 
-def warn_unreached_pc_nodes(structure, params, loader, rng_key) -> List[str]:
-    """Warn about nodes whose parameters get no PC gradient on the first batch.
+NEGLIGIBLE_GRADIENT_RATIO = 1e-3
+MISALIGNED_GRADIENT_COSINE = 0.5
 
-    Starting from feedforward latents, inference moves the output error back
-    about one node per step, so too few ``--pc_infer_steps`` leave the earliest
-    layers, embeddings included, without any PC update. The loader's state is
-    restored so training sees the same batches.
+
+def _tree_norm(tree) -> float:
+    return float(
+        jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(tree)))
+    )
+
+
+def _tree_dot(a, b) -> float:
+    return float(
+        sum(
+            jnp.sum(x * y)
+            for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+        )
+    )
+
+
+def warn_weak_pc_gradients(structure, params, loader, rng_key) -> Dict[str, List[str]]:
+    """Warn about nodes whose PC gradient on the first batch falls short of backprop's.
+
+    Each node's PC weight gradient, divided by the batch's masked-token count,
+    is compared with the backprop gradient of the masked loss. A node is
+    ``negligible`` when that norm ratio is below ``NEGLIGIBLE_GRADIENT_RATIO``
+    and ``misaligned`` when the cosine is below ``MISALIGNED_GRADIENT_COSINE``.
+    How far the output error reaches depends on ``--pc_infer_steps`` times
+    ``--pc_eta_infer`` and on float32 precision, not on step count alone. The
+    loader's state is restored so training sees the same batches.
     """
     state = loader.state_dict()
     batch = {k: jnp.asarray(v) for k, v in next(iter(loader)).items()}
     loader.load_state_dict(state)
-    grads, _, _, _ = get_graph_param_gradient_autoregressive(
+    pc_grads, _, _, _ = get_graph_param_gradient_autoregressive(
         params, batch, structure, rng_key
     )
-    unreached = [
-        name
-        for name, node_grads in grads.nodes.items()
-        if jax.tree_util.tree_leaves(node_grads)
-        and not any(jnp.any(leaf) for leaf in jax.tree_util.tree_leaves(node_grads))
-    ]
-    if unreached:
-        steps = structure.config["inference"].config["infer_steps"]
-        print(
-            f"warning: with --pc_infer_steps {steps} these nodes get no PC "
-            f"gradient: {', '.join(unreached)}; increase --pc_infer_steps",
-            file=sys.stderr,
-        )
-    return unreached
+    bp_grads = jax.grad(
+        lambda p: compute_loss_autoregressive(p, structure, batch, rng_key)[0]
+    )(params)
+    masked = float(jnp.sum(batch["loss_mask"]))
+
+    weak: Dict[str, List[str]] = {"negligible": [], "misaligned": []}
+    for name, pc_node in pc_grads.nodes.items():
+        bp_norm = _tree_norm(bp_grads.nodes[name])
+        if not jax.tree_util.tree_leaves(pc_node) or bp_norm == 0.0:
+            continue
+        pc_norm = _tree_norm(pc_node) / masked
+        if pc_norm / bp_norm < NEGLIGIBLE_GRADIENT_RATIO:
+            weak["negligible"].append(name)
+        elif (
+            _tree_dot(pc_node, bp_grads.nodes[name]) / masked / (pc_norm * bp_norm)
+            < MISALIGNED_GRADIENT_COSINE
+        ):
+            weak["misaligned"].append(name)
+
+    config = structure.config["inference"].config
+    for kind, names in weak.items():
+        if names:
+            print(
+                f"warning: with --pc_infer_steps {config['infer_steps']} and "
+                f"--pc_eta_infer {config['eta_infer']} these nodes get a {kind} "
+                f"PC gradient relative to backprop: {', '.join(names)}",
+                file=sys.stderr,
+            )
+    return weak
 
 
 def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
@@ -312,7 +388,7 @@ def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
     if args.mode == "pc":
-        warn_unreached_pc_nodes(structure, params, train_loader, init_key)
+        warn_weak_pc_gradients(structure, params, train_loader, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
     num_epochs_to_run = math.ceil(args.num_epochs)
     train_label = (
@@ -330,11 +406,12 @@ def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
         )
         return metrics
 
+    grad_scale = pc_grad_scale(train_loader) if args.mode == "pc" else 1.0
     _, _, epoch_metrics = TRAINERS[args.mode](
         params,
         structure,
         train_loader,
-        build_optimizer(args, total_steps),
+        build_optimizer(args, total_steps, grad_scale),
         {"num_epochs": args.num_epochs},
         train_key,
         verbose=False,
@@ -348,13 +425,13 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
 
     Every trial pretrains both arms from a fresh initialisation on the same
     loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``. Both
-    arms share the same optimizer and settings; ``--mode`` is not used.
+    arms share the same settings; the PC arm's gradients are divided by the
+    expected masked tokens per batch before clipping (see ``pc_grad_scale``).
+    ``--mode`` is not used.
     """
     batches_per_epoch = len(make_loaders(args, train_ids, val_ids, vocab, 0)[0])
     print_data_summary(train_ids, val_ids, vocab, batches_per_epoch)
-    optimizer = build_optimizer(
-        args, count_training_steps(args.num_epochs, batches_per_epoch)
-    )
+    total_steps = count_training_steps(args.num_epochs, batches_per_epoch)
 
     def model_factory(key):
         structure = build_model(args, vocab_size=len(vocab))
@@ -363,7 +440,11 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
     key = jax.random.PRNGKey(args.seed)
     params, structure = model_factory(key)
     train_loader, _ = make_loaders(args, train_ids, val_ids, vocab, args.seed)
-    warn_unreached_pc_nodes(structure, params, train_loader, key)
+    warn_weak_pc_gradients(structure, params, train_loader, key)
+    optimizers = {
+        "backprop": build_optimizer(args, total_steps),
+        "pc": build_optimizer(args, total_steps, pc_grad_scale(train_loader)),
+    }
 
     def eval_fn(params, structure, loader, config, key):
         return evaluate_mlm(params, structure, loader, key)
@@ -374,7 +455,7 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
             model_factory=model_factory,
             train_fn=TRAINERS[mode],
             eval_fn=eval_fn,
-            optimizer=optimizer,
+            optimizer=optimizers[mode],
             train_config={"num_epochs": args.num_epochs},
         )
         for mode in ("backprop", "pc")
@@ -389,6 +470,8 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
         n_trials=args.ab_trials,
         seed_offset=args.seed,
     ).run()
+    direction = "lower" if args.ab_metric == "masked_loss" else "higher"
+    print(f"{args.ab_metric}: {direction} is better; Diff = backprop - pc")
     results.print_summary()
     return results
 

@@ -182,8 +182,9 @@ class MaskedVocabProjectionNode(NodeBase):
     ``VocabProjectionNode``. The per-sample energy is the cross-entropy summed
     over that sample's masked tokens and scaled by ``output_energy_scale``,
     matching ``CrossEntropyEnergy`` restricted to masked positions, so in PC
-    training unmasked positions exert no pull on the latents. The activation and energy are fixed; passing
-    ``activation`` or ``energy`` raises ``ValueError``.
+    training unmasked positions exert no pull on the latents. The activation
+    and energy are fixed; passing ``activation`` or ``energy`` raises
+    ``ValueError``.
 
     The energy depends on the ``loss_mask`` input, so ``energy_functional``
     takes it as an extra argument; ``error`` stays the raw

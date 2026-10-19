@@ -45,6 +45,7 @@ def create_causal_mask(seq_len: int) -> jnp.ndarray:
     """
     return jnp.tril(jnp.ones((seq_len, seq_len)))
 
+
 _LOSS_INPUTS = frozenset({"y", "loss_mask"})
 
 
@@ -70,7 +71,7 @@ def _input_clamps(
             f"Batch entries {unused} match no task in the graph and are ignored; "
             "check that the model was built to consume them (e.g. "
             "use_attention_mask=True for 'attention_mask').",
-            stacklevel=2,
+            stacklevel=3,
         )
     return {
         structure.task_map[task_name]: value
@@ -220,6 +221,13 @@ def get_graph_param_gradient_autoregressive(
     """
     batch_size = batch["x"].shape[0]
     seq_len = batch["x"].shape[1]
+    if "loss_mask" in batch and "loss_mask" not in structure.task_map:
+        raise ValueError(
+            "PC training cannot apply 'loss_mask' to a graph without a "
+            "'loss_mask' task; its output energy would cover every position. "
+            "Build the model with a masked output node (e.g. "
+            "create_encoder_mlm_model) or drop 'loss_mask' from the batch."
+        )
 
     clamps = _input_clamps(structure, batch)
 
@@ -237,10 +245,10 @@ def get_graph_param_gradient_autoregressive(
     y = jax.nn.one_hot(y, structure.nodes[structure.task_map["y"]].node_info.shape[-1])
     clamps[structure.task_map["y"]] = y
 
-    # Clamp an external causal mask only if the graph defines one and the batch
-    # does not supply it (the v1 monolithic TransformerBlock). The v2 decomposed MhaResidualNode masks
-    # internally via is_causal, so its task_map has no "causal_mask" node and
-    # this branch is skipped.
+    # Clamp an external causal mask only if the graph defines one (the v1
+    # monolithic TransformerBlock) and the batch does not supply it. The v2
+    # decomposed MhaResidualNode masks internally via is_causal, so its
+    # task_map has no "causal_mask" node and this branch is skipped.
     if (
         use_causal_mask
         and "causal_mask" in structure.task_map

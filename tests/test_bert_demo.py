@@ -154,6 +154,14 @@ def test_ab_comparison_pretrains_both_modes_per_trial(demo):
     assert values_a != values_b
 
 
+def test_ab_comparison_states_metric_direction(demo, capsys):
+    pytest.importorskip("scipy")
+
+    demo.main(SMALL + ["--ab_trials", "2", "--num_epochs", "1"])
+
+    assert "masked_loss: lower is better" in capsys.readouterr().out
+
+
 def test_ab_comparison_fails_before_training_without_scipy(demo, monkeypatch):
     real_find_spec = demo.importlib.util.find_spec
     monkeypatch.setattr(
@@ -166,22 +174,69 @@ def test_ab_comparison_fails_before_training_without_scipy(demo, monkeypatch):
         demo.parse_args(["--ab_trials", "2"])
 
 
-@pytest.mark.parametrize("infer_steps, warns", [(2, True), (10, False)])
-def test_warns_when_pc_inference_cannot_reach_early_layers(
-    demo, capsys, infer_steps, warns
-):
-    args = demo.parse_args(
-        SMALL + ["--mode", "pc", "--pc_infer_steps", str(infer_steps)]
-    )
+def _pc_setup(demo, extra):
+    args = demo.parse_args(SMALL + ["--mode", "pc"] + extra)
     train_ids, val_ids, vocab = demo.load_token_streams(args)
     loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
     structure = demo.build_model(args, vocab_size=len(vocab))
     key = demo.jax.random.PRNGKey(0)
-    params = demo.initialize_params(structure, key)
+    return structure, demo.initialize_params(structure, key), loader, key
+
+
+def test_flags_noise_level_pc_gradients_as_negligible(demo, capsys):
+    structure, params, loader, key = _pc_setup(demo, ["--pc_infer_steps", "2"])
     state = loader.state_dict()
 
-    unreached = demo.warn_unreached_pc_nodes(structure, params, loader, key)
+    weak = demo.warn_weak_pc_gradients(structure, params, loader, key)
 
-    assert ("token_embeddings" in unreached) is warns
-    assert ("warning:" in capsys.readouterr().err) is warns
+    assert {"token_embeddings", "L0_mha", "L0_mlp1"} <= set(weak["negligible"])
+    assert "mlm_head" not in weak["negligible"] + weak["misaligned"]
+    assert "negligible PC gradient" in capsys.readouterr().err
     assert loader.state_dict() == state
+
+
+def test_long_inference_reaches_the_embeddings(demo):
+    structure, params, loader, key = _pc_setup(
+        demo, ["--pc_infer_steps", "40", "--pc_eta_infer", "0.1"]
+    )
+
+    weak = demo.warn_weak_pc_gradients(structure, params, loader, key)
+
+    assert not {"token_embeddings", "position_embeddings"} & set(
+        weak["negligible"] + weak["misaligned"]
+    )
+
+
+def test_pc_grad_scale_is_inverse_mean_masked_count(demo):
+    _, _, loader, _ = _pc_setup(demo, [])
+    state = loader.state_dict()
+    counts = [float(np.sum(batch["loss_mask"])) for batch in loader]
+    loader.load_state_dict(state)
+
+    scale = demo.pc_grad_scale(loader)
+
+    assert scale == pytest.approx(1.0 / np.mean(counts[:50]))
+    assert loader.state_dict() == state
+
+
+@pytest.mark.parametrize("grad_clip, scale_matters", [(1.0, True), (0, False)])
+def test_grad_scale_only_changes_updates_through_clipping(
+    demo, grad_clip, scale_matters
+):
+    import jax.numpy as jnp
+
+    args = SimpleNamespace(
+        lr=1.0, weight_decay=0.0, warmup_fraction=0.0, grad_clip=grad_clip
+    )
+    params = {"w": jnp.zeros(2)}
+    grads = [{"w": jnp.array([3.0, 4.0])}, {"w": jnp.array([0.3, 0.4])}]
+
+    def second_update(grad_scale):
+        optimizer = demo.build_optimizer(args, total_steps=4, grad_scale=grad_scale)
+        state = optimizer.init(params)
+        for grad in grads:
+            updates, state = optimizer.update(grad, state, params)
+        return updates["w"]
+
+    same = bool(jnp.allclose(second_update(1.0), second_update(0.1), rtol=1e-4))
+    assert same != scale_matters

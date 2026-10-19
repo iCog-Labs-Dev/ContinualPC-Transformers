@@ -11,6 +11,7 @@ import pytest
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
+from fabricpc.nodes.transformer_v2 import create_deep_transformer
 from fabricpc.training import (
     evaluate_autoregressive,
     evaluate_mlm,
@@ -367,6 +368,25 @@ class TestPcStepInputs:
         batch["segment_ids"] = jnp.zeros((4, SEQ_LEN))
 
         with pytest.warns(UserWarning, match="segment_ids"):
+            get_graph_param_gradient_autoregressive(params, batch, structure, rng_key)
+
+
+class TestPcLossMaskNeedsMaskedOutput:
+    def test_rejects_loss_mask_on_graph_without_loss_mask_task(self, rng_key):
+        structure = create_deep_transformer(
+            depth=1,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=SEQ_LEN,
+            vocab_size=VOCAB_SIZE,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        )
+        params = initialize_params(structure, rng_key)
+        tokens = jnp.zeros((4, SEQ_LEN), dtype=jnp.int32)
+        batch = {"x": tokens, "y": tokens, "loss_mask": jnp.ones((4, SEQ_LEN))}
+
+        with pytest.raises(ValueError, match="loss_mask"):
             get_graph_param_gradient_autoregressive(params, batch, structure, rng_key)
 
 
