@@ -60,7 +60,17 @@ def _input_clamps(
     inputs are generated only for tasks missing from the batch. Entries that
     name no task are ignored with a warning, except ``y`` and ``loss_mask``,
     which the loss reads from the batch directly.
+
+    Raises:
+        ValueError: If the graph has a ``loss_mask`` task and the batch has no
+            ``loss_mask``; its source node would otherwise keep an initialised
+            latent that the loss treats as mask weights.
     """
+    if "loss_mask" in structure.task_map and "loss_mask" not in batch:
+        raise ValueError(
+            "This graph has a 'loss_mask' task, so every batch needs a "
+            "'loss_mask' entry (e.g. from MlmTextBatcher)."
+        )
     unused = sorted(
         task_name
         for task_name in batch

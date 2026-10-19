@@ -218,16 +218,30 @@ def _training_batches():
 class TestLoopTrainStep:
     @pytest.mark.parametrize("use_pmap", [False, True])
     def test_compiled_step_returns_no_predictions(self, rng_key, use_pmap):
-        params, structure = build_model(rng_key)
         optimizer = optax.adam(1e-3)
-        opt_state = optimizer.init(params)
-        batch = _training_batches()[0]
-        key = rng_key
         if use_pmap:
+            structure = create_deep_transformer(
+                depth=1,
+                embed_dim=16,
+                num_heads=2,
+                mlp_dim=32,
+                seq_len=SEQ_LEN,
+                vocab_size=VOCAB_SIZE,
+                inference=InferenceSGDNormClip(
+                    eta_infer=0.1, infer_steps=2, max_norm=5.0
+                ),
+            )
+            params = initialize_params(structure, rng_key)
+            tokens = jnp.zeros((4, SEQ_LEN), dtype=jnp.int32)
+            opt_state = replicate_opt_state(optimizer.init(params), 1)
             params = replicate_params(params, 1)
-            opt_state = replicate_opt_state(opt_state, 1)
-            batch = shard_batch({k: v for k, v in batch.items() if k != "loss_mask"}, 1)
+            batch = shard_batch({"x": tokens, "y": tokens}, 1)
             key = rng_key[None, :]
+        else:
+            params, structure = build_model(rng_key)
+            opt_state = optimizer.init(params)
+            batch = _training_batches()[0]
+            key = rng_key
 
         step = train_backprop._create_loop_train_step(
             structure, optimizer, True, use_pmap
@@ -369,6 +383,40 @@ class TestPcStepInputs:
 
         with pytest.warns(UserWarning, match="segment_ids"):
             get_graph_param_gradient_autoregressive(params, batch, structure, rng_key)
+
+
+class TestLossMaskIsRequired:
+    def _batch_without_loss_mask(self):
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+        return {k: v for k, v in batch.items() if k != "loss_mask"}
+
+    def test_pc_training_rejects_missing_loss_mask(self, rng_key):
+        params, structure = build_model(rng_key)
+
+        with pytest.raises(ValueError, match="needs a 'loss_mask'"):
+            train_autoregressive(
+                params,
+                structure,
+                _ListLoader([self._batch_without_loss_mask()]),
+                optax.adam(1e-2),
+                {"num_epochs": 1},
+                rng_key,
+                verbose=False,
+            )
+
+    def test_backprop_training_rejects_missing_loss_mask(self, rng_key):
+        params, structure = build_model(rng_key)
+
+        with pytest.raises(ValueError, match="needs a 'loss_mask'"):
+            train_backprop_autoregressive(
+                params,
+                structure,
+                _ListLoader([self._batch_without_loss_mask()]),
+                optax.adam(1e-2),
+                {"num_epochs": 1},
+                rng_key,
+                verbose=False,
+            )
 
 
 class TestPcLossMaskNeedsMaskedOutput:

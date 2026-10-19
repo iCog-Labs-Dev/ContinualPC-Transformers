@@ -456,8 +456,9 @@ def create_encoder_mlm_model(
     token ids), ``loss_mask`` (1 at masked positions), plus ``attention_mask``
     (1 at real tokens, 0 at padding) when ``use_attention_mask`` is set, and
     ``dropout_*`` mask sources when ``dropout_rate > 0``. Batches must provide
-    ``loss_mask`` and, with ``use_attention_mask``, ``attention_mask``;
-    ``fabricpc.utils.data.MlmTextBatcher`` yields both.
+    ``loss_mask``; the training paths raise without it. An omitted
+    ``attention_mask`` attends to every position, which is only correct for
+    unpadded batches. ``fabricpc.utils.data.MlmTextBatcher`` yields both.
     """
     _validate_encoder_config(
         depth=depth,
