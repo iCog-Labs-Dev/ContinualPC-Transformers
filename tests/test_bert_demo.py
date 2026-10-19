@@ -195,16 +195,18 @@ def test_flags_noise_level_pc_gradients_as_negligible(demo, capsys):
     assert loader.state_dict() == state
 
 
-def test_long_inference_reaches_the_embeddings(demo):
-    structure, params, loader, key = _pc_setup(
-        demo, ["--pc_infer_steps", "40", "--pc_eta_infer", "0.1"]
-    )
+def test_default_pc_inference_gives_no_negligible_gradients(demo):
+    args = demo.parse_args(["--mode", "pc"])
+    train_ids, val_ids, vocab = demo.load_token_streams(args)
+    loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
+    structure = demo.build_model(args, vocab_size=len(vocab))
+    key = demo.jax.random.PRNGKey(0)
+    params = demo.initialize_params(structure, key)
 
     weak = demo.warn_weak_pc_gradients(structure, params, loader, key)
 
-    assert not {"token_embeddings", "position_embeddings"} & set(
-        weak["negligible"] + weak["misaligned"]
-    )
+    assert weak["negligible"] == []
+    assert not {"token_embeddings", "position_embeddings"} & set(weak["misaligned"])
 
 
 def test_pc_grad_scale_is_inverse_mean_masked_count(demo):

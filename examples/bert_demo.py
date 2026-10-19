@@ -199,11 +199,12 @@ def expected_masked_tokens(loader, max_batches: int = 50) -> float:
 
 
 def pc_grad_scale(loader) -> float:
-    """Scale that puts PC weight gradients on backprop's per-token footing.
+    """Scale that approximately matches PC weight gradients to backprop's per token.
 
     PC weight gradients sum over masked tokens while the backprop loss averages
-    them, so dividing by the expected masked count per batch makes
-    ``--grad_clip`` act on comparable norms in both modes.
+    them. Dividing by the mean masked count per batch (estimated from the
+    loader's first batches) makes ``--grad_clip`` act on comparable norms in
+    both modes. Per-batch counts vary, so the match is approximate.
     """
     return 1.0 / expected_masked_tokens(loader)
 
@@ -242,11 +243,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="global-norm clip; in PC mode gradients are first divided by the "
-        "expected masked tokens per batch so the clip matches backprop's scale",
+        "mean masked-token count per batch, so the clip approximately matches "
+        "backprop's per-token scale",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--pc_infer_steps", type=int, default=10, help="PC only")
-    parser.add_argument("--pc_eta_infer", type=float, default=0.05, help="PC only")
+    parser.add_argument("--pc_infer_steps", type=int, default=40, help="PC only")
+    parser.add_argument("--pc_eta_infer", type=float, default=0.1, help="PC only")
     parser.add_argument("--pc_max_norm", type=float, default=5.0, help="PC only")
     parser.add_argument(
         "--pc_output_energy_scale", type=float, default=1.0, help="PC only"
@@ -426,7 +428,8 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
     Every trial pretrains both arms from a fresh initialisation on the same
     loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``. Both
     arms share the same settings; the PC arm's gradients are divided by the
-    expected masked tokens per batch before clipping (see ``pc_grad_scale``).
+    mean masked-token count per batch before clipping, so clipping is only
+    approximately matched (see ``pc_grad_scale``).
     ``--mode`` is not used.
     """
     batches_per_epoch = len(make_loaders(args, train_ids, val_ids, vocab, 0)[0])
