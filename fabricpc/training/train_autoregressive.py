@@ -14,7 +14,7 @@ The training loop supports both:
 - Last-token prediction (only predict final token, for efficiency)
 """
 
-from typing import Dict, Tuple, Any, List, Optional, Callable, cast
+from typing import Dict, Tuple, Any, List, Optional, Callable, Collection, cast
 import math
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.training.train import (
     _convert_batch,
+    epoch_batch_limit,
     replicate_params,
     replicate_opt_state,
     shard_batch,
@@ -48,6 +49,7 @@ def create_dropout_clamps(
     batch_size: int,
     rng_key: jax.Array,
     training: bool,
+    exclude: Collection[str] = (),
 ) -> Dict[str, jnp.ndarray]:
     """Create clamps for transformer-v2 dropout mask source nodes.
 
@@ -56,6 +58,10 @@ def create_dropout_clamps(
     (inverted dropout). During evaluation/generation, masks are all ones, so
     no activation rescaling is applied at test time. Keeping dropout as clamped
     source data makes the mask fixed over the entire PC inference solve.
+
+    Tasks named in ``exclude`` (e.g. masks the caller supplies) get no clamp.
+    The key is still split over every dropout task, so the remaining tasks
+    receive the same masks as when nothing is excluded.
     """
     dropout_tasks = tuple(
         sorted(k for k in structure.task_map if k.startswith("dropout_"))
@@ -72,6 +78,8 @@ def create_dropout_clamps(
     clamps = {}
 
     for task_name, key in zip(dropout_tasks, keys):
+        if task_name in exclude:
+            continue
         node_name = structure.task_map[task_name]
         node_shape = structure.nodes[node_name].node_info.shape
         mask_shape = (batch_size, *node_shape)
@@ -86,11 +94,21 @@ def create_dropout_clamps(
 
     return clamps
 
+
+def _masked_mean(values: jnp.ndarray, mask: Optional[jnp.ndarray]) -> jnp.ndarray:
+    """Mean over all entries, or over entries where ``mask`` is nonzero."""
+    if mask is None:
+        return jnp.mean(values)
+    mask = mask.astype(values.dtype)
+    return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+
 def compute_loss(
     final_state: GraphState,
     targets: jnp.ndarray,
     output_node: str,
     loss_type: str = "cross_entropy",
+    loss_mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """
     Compute differentiable loss
@@ -100,9 +118,13 @@ def compute_loss(
         targets: Target values (labels) for output node, expects one-hot for cross-entropy
         output_node: Name of the output node
         loss_type: Loss function type: "cross_entropy" or "mse"
+        loss_mask: Optional mask selecting which prediction positions enter the
+            average (e.g. masked-language-model positions). For cross-entropy it
+            must match the per-position loss shape exactly; for MSE it is
+            broadcast over trailing feature dimensions.
 
     Returns:
-        Scalar loss value (mean over batch)
+        Scalar loss value (mean over batch, or over masked positions)
     """
 
     # Get prediction from output node
@@ -116,10 +138,22 @@ def compute_loss(
         if targets.ndim == predictions.ndim - 1:
             targets = jax.nn.one_hot(targets, predictions.shape[-1])
         log_preds = jnp.log(predictions + 1e-10)
-        loss = -jnp.mean(jnp.sum(targets * log_preds, axis=-1))
+        per_item_loss = -jnp.sum(targets * log_preds, axis=-1)
+        if loss_mask is not None and loss_mask.shape != per_item_loss.shape:
+            raise ValueError(
+                "cross_entropy loss_mask shape must match per-item loss shape "
+                f"exactly; got {loss_mask.shape}, expected {per_item_loss.shape}"
+            )
+        loss = _masked_mean(per_item_loss, loss_mask)
 
     elif loss_type == "mse":
-        loss = jnp.mean((predictions - targets) ** 2)
+        per_item_loss = (predictions - targets) ** 2
+        if loss_mask is not None:
+            loss_mask = loss_mask.reshape(
+                loss_mask.shape + (1,) * (per_item_loss.ndim - loss_mask.ndim)
+            )
+            loss_mask = jnp.broadcast_to(loss_mask, per_item_loss.shape)
+        loss = _masked_mean(per_item_loss, loss_mask)
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
@@ -399,7 +433,6 @@ def train_autoregressive(
 
     # Support fractional epochs: e.g. 1.5 -> 2 loop iterations, last stops at 50%
     total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
 
     # Device detection
     n_devices = jax.local_device_count()
@@ -433,12 +466,7 @@ def train_autoregressive(
         except TypeError:
             raise TypeError("train_loader must support len()")
 
-        # On the final epoch, truncate if fractional
-        is_last_epoch = epoch_idx == total_epochs - 1
-        if is_last_epoch and frac > 0:
-            max_batches = round(frac * num_batches)
-        else:
-            max_batches = num_batches
+        max_batches = epoch_batch_limit(epoch_idx, num_epochs, num_batches)
 
         # Split keys for this epoch
         epoch_rng_key, rng_key = jax.random.split(rng_key)

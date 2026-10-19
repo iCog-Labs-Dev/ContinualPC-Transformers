@@ -10,6 +10,12 @@ from fabricpc.utils.data.dataloader import (
     FewShotLoader,
     NoisyTestLoader,
 )
+from fabricpc.utils.data.mlm import (
+    MLM_SPECIAL_TOKENS,
+    MlmTextBatcher,
+    apply_mlm_mask,
+    tokenize_texts_bpe,
+)
 
 __all__ = [
     "split_np_seed",
@@ -22,4 +28,8 @@ __all__ = [
     "FashionMnistLoader",
     "FewShotLoader",
     "NoisyTestLoader",
+    "MLM_SPECIAL_TOKENS",
+    "MlmTextBatcher",
+    "apply_mlm_mask",
+    "tokenize_texts_bpe",
 ]
