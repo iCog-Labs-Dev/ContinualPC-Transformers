@@ -271,3 +271,30 @@ def test_demo_trains_on_a_two_device_host(mode):
 
     assert result.returncode == 0, result.stderr[-4000:]
     assert "val_masked_loss=" in result.stdout
+
+
+def test_ab_checks_each_pc_trial_on_its_own_initialisation(demo, monkeypatch):
+    pytest.importorskip("scipy")
+    checked, trained = [], []
+    real_pc = demo.TRAINERS["pc"]
+
+    def spy_check(structure, params, loader, key):
+        checked.append(params)
+        return {"negligible": [], "misaligned": []}
+
+    def spy_train(params, *args, **kwargs):
+        trained.append(params)
+        return real_pc(params, *args, **kwargs)
+
+    monkeypatch.setattr(demo, "warn_weak_pc_gradients", spy_check)
+    monkeypatch.setitem(demo.TRAINERS, "pc", spy_train)
+
+    demo.main(SMALL + ["--ab_trials", "2", "--num_epochs", "1"])
+
+    assert len(checked) == len(trained) == 2
+    for seen, used in zip(checked, trained):
+        assert seen is used
+    first, second = (
+        demo.jax.tree_util.tree_leaves(p)[0] for p in (trained[0], trained[1])
+    )
+    assert not demo.jnp.array_equal(first, second)

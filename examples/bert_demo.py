@@ -436,7 +436,8 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
     loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``. Both
     arms share the same settings; the PC arm's gradients are divided by the
     mean masked-token count per batch before clipping, so clipping is only
-    approximately matched (see ``pc_grad_scale``).
+    approximately matched (see ``pc_grad_scale``). Each PC trial checks its
+    own initialisation with ``warn_weak_pc_gradients`` before training.
     ``--mode`` is not used.
     """
     batches_per_epoch = len(make_loaders(args, train_ids, val_ids, vocab, 0)[0])
@@ -447,10 +448,7 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
         structure = build_model(args, vocab_size=len(vocab))
         return initialize_params(structure, key), structure
 
-    key = jax.random.PRNGKey(args.seed)
-    params, structure = model_factory(key)
     train_loader, _ = make_loaders(args, train_ids, val_ids, vocab, args.seed)
-    warn_weak_pc_gradients(structure, params, train_loader, key)
     optimizers = {
         "backprop": build_optimizer(args, total_steps),
         "pc": build_optimizer(args, total_steps, pc_grad_scale(train_loader)),
@@ -459,11 +457,19 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
     def eval_fn(params, structure, loader, config, key):
         return evaluate_mlm(params, structure, loader, key)
 
+    def pc_train_fn(params, structure, loader, optimizer, config, key, **kwargs):
+        warn_weak_pc_gradients(structure, params, loader, key)
+        return TRAINERS["pc"](
+            params, structure, loader, optimizer, config, key, **kwargs
+        )
+
+    train_fns = {"backprop": TRAINERS["backprop"], "pc": pc_train_fn}
+
     arm_a, arm_b = (
         ExperimentArm(
             name=mode,
             model_factory=model_factory,
-            train_fn=TRAINERS[mode],
+            train_fn=train_fns[mode],
             eval_fn=eval_fn,
             optimizer=optimizers[mode],
             train_config={"num_epochs": args.num_epochs},
