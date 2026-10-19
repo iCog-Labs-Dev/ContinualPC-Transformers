@@ -442,9 +442,22 @@ def _reject_masked_pmap_batch(batch: Dict[str, jnp.ndarray]) -> None:
     if "loss_mask" in batch:
         raise NotImplementedError(
             "Batches with 'loss_mask' (masked-LM training) are not supported on "
-            "the multi-device pmap path yet; run on a single device, e.g. with "
-            "CUDA_VISIBLE_DEVICES=0."
+            "the multi-device pmap path yet; pass use_pmap=False to the training "
+            "loop, or expose one device (e.g. CUDA_VISIBLE_DEVICES=0)."
         )
+
+
+def _select_pmap(use_pmap: Optional[bool], pmap_single_device: bool) -> bool:
+    """Resolve the training loop's device path.
+
+    ``use_pmap=None`` picks pmap when more than one device is visible (or when
+    ``pmap_single_device`` forces it); an explicit bool overrides detection.
+    """
+    if use_pmap is None:
+        return jax.local_device_count() > 1 or pmap_single_device
+    if not use_pmap and pmap_single_device:
+        raise ValueError("use_pmap=False conflicts with pmap_single_device=True")
+    return use_pmap
 
 
 def _reject_masked_eval_batch(batch: Dict[str, jnp.ndarray], evaluator: str) -> None:
@@ -476,6 +489,7 @@ def train_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
+    use_pmap: Optional[bool] = None,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main training loop for autoregressive predictive coding.
@@ -502,6 +516,9 @@ def train_autoregressive(
             accept **kwargs.
         iter_callback: Optional callback (epoch, batch_idx, loss) -> any
         pmap_single_device: Force pmap code path for testing
+        use_pmap: ``None`` detects the device path; ``False`` forces the
+            single-device JIT path (required for masked-LM batches on
+            multi-device hosts), ``True`` forces pmap.
 
     Returns:
         Tuple of (trained_params, energy_history, epoch_results)
@@ -516,7 +533,7 @@ def train_autoregressive(
 
     # Device detection
     n_devices = jax.local_device_count()
-    use_pmap = (n_devices > 1) or pmap_single_device
+    use_pmap = _select_pmap(use_pmap, pmap_single_device)
 
     if verbose:
         print(f"Training on {n_devices} device(s): {jax.devices()}")

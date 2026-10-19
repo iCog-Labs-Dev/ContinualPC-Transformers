@@ -28,6 +28,7 @@ from fabricpc.graph_initialization.state_initializer import (
 )
 from fabricpc.training.train_autoregressive import (
     _input_clamps,
+    _select_pmap,
     _reject_masked_eval_batch,
     _reject_masked_pmap_batch,
     _validate_pmap_batch,
@@ -474,6 +475,7 @@ def train_backprop_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
+    use_pmap: Optional[bool] = None,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main autoregressive backprop training loop.
@@ -493,6 +495,10 @@ def train_backprop_autoregressive(
         verbose: Print progress
         epoch_callback: Optional callback per epoch
         iter_callback: Optional callback per batch
+        pmap_single_device: Force pmap code path for testing
+        use_pmap: ``None`` detects the device path; ``False`` forces the
+            single-device JIT path (required for masked-LM batches on
+            multi-device hosts), ``True`` forces pmap.
 
     Returns:
         Tuple of (trained_params, loss_history, epoch_results). The reported
@@ -501,7 +507,7 @@ def train_backprop_autoregressive(
     validate_feedforward_init(structure)
 
     n_devices = jax.local_device_count()
-    use_pmap = (n_devices > 1) or pmap_single_device
+    use_pmap = _select_pmap(use_pmap, pmap_single_device)
 
     opt_state = optimizer.init(params)
     if use_pmap:

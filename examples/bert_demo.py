@@ -28,6 +28,7 @@ from jax_setup import set_jax_flags_before_importing_jax
 set_jax_flags_before_importing_jax()
 
 import argparse
+import functools
 import importlib.util
 import math
 import re
@@ -209,7 +210,13 @@ def pc_grad_scale(loader) -> float:
     return 1.0 / expected_masked_tokens(loader)
 
 
-TRAINERS = {"backprop": train_backprop_autoregressive, "pc": train_autoregressive}
+TRAINERS = {
+    mode: functools.partial(trainer, use_pmap=False)
+    for mode, trainer in (
+        ("backprop", train_backprop_autoregressive),
+        ("pc", train_autoregressive),
+    )
+}
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

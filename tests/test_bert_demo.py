@@ -1,6 +1,9 @@
 """Smoke tests for examples/bert_demo.py (MLM pretraining demo)."""
 
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,7 +140,8 @@ def test_pc_flags_configure_inference_and_output_energy(demo):
     assert inference["max_norm"] == pytest.approx(3.0)
     head_config = structure.nodes["mlm_head"].node_info.node_config
     assert head_config["output_energy_scale"] == pytest.approx(2.5)
-    assert demo.TRAINERS[args.mode] is demo.train_autoregressive
+    assert demo.TRAINERS[args.mode].func is demo.train_autoregressive
+    assert demo.TRAINERS[args.mode].keywords == {"use_pmap": False}
 
 
 def test_ab_comparison_pretrains_both_modes_per_trial(demo):
@@ -242,3 +246,28 @@ def test_grad_scale_only_changes_updates_through_clipping(
 
     same = bool(jnp.allclose(second_update(1.0), second_update(0.1), rtol=1e-4))
     assert same != scale_matters
+
+
+@pytest.mark.parametrize("mode", ["backprop", "pc"])
+def test_demo_trains_on_a_two_device_host(mode):
+    """Runs on two forced CPU devices, which must be set before JAX starts."""
+    repo_root = DEMO_PATH.parents[1]
+    env = {
+        **os.environ,
+        "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
+        "JAX_PLATFORMS": "cpu",
+        "PYTHONPATH": os.pathsep.join(
+            p for p in (str(repo_root), os.environ.get("PYTHONPATH")) if p
+        ),
+    }
+    result = subprocess.run(
+        [sys.executable, str(DEMO_PATH), "--mode", mode, "--num_epochs", "0.2"] + SMALL,
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert "val_masked_loss=" in result.stdout

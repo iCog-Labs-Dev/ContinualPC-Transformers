@@ -419,6 +419,22 @@ class TestLossMaskIsRequired:
             )
 
 
+class TestSelectPmap:
+    def test_none_detects_devices(self):
+        assert train_backprop._select_pmap(None, False) is (
+            jax.local_device_count() > 1
+        )
+        assert train_backprop._select_pmap(None, True) is True
+
+    @pytest.mark.parametrize("use_pmap", [False, True])
+    def test_explicit_choice_wins(self, use_pmap):
+        assert train_backprop._select_pmap(use_pmap, False) is use_pmap
+
+    def test_rejects_conflicting_flags(self):
+        with pytest.raises(ValueError, match="conflicts"):
+            train_backprop._select_pmap(False, True)
+
+
 class TestPcLossMaskNeedsMaskedOutput:
     def test_rejects_loss_mask_on_graph_without_loss_mask_task(self, rng_key):
         structure = create_deep_transformer(
