@@ -16,6 +16,7 @@ The training loop supports both:
 
 from typing import Dict, Tuple, Any, List, Optional, Callable, Collection, cast
 import math
+import warnings
 import jax
 import jax.numpy as jnp
 import optax
@@ -43,6 +44,40 @@ def create_causal_mask(seq_len: int) -> jnp.ndarray:
         This ensures position i can only attend to positions 0...i
     """
     return jnp.tril(jnp.ones((seq_len, seq_len)))
+
+_LOSS_INPUTS = frozenset({"y", "loss_mask"})
+
+
+def _input_clamps(
+    structure: GraphStructure, batch: Dict[str, jnp.ndarray]
+) -> Dict[str, jnp.ndarray]:
+    """Clamp every batch entry that names a task node, except the target ``y``.
+
+    Besides ``x`` this covers auxiliary source nodes such as ``attention_mask``
+    and ``loss_mask``; leaving those unclamped would give them random latents.
+    Supplied entries take precedence: default ``dropout_*`` and ``causal_mask``
+    inputs are generated only for tasks missing from the batch. Entries that
+    name no task are ignored with a warning, except ``y`` and ``loss_mask``,
+    which the loss reads from the batch directly.
+    """
+    unused = sorted(
+        task_name
+        for task_name in batch
+        if task_name not in structure.task_map and task_name not in _LOSS_INPUTS
+    )
+    if unused:
+        warnings.warn(
+            f"Batch entries {unused} match no task in the graph and are ignored; "
+            "check that the model was built to consume them (e.g. "
+            "use_attention_mask=True for 'attention_mask').",
+            stacklevel=2,
+        )
+    return {
+        structure.task_map[task_name]: value
+        for task_name, value in batch.items()
+        if task_name in structure.task_map and task_name != "y"
+    }
+
 
 def create_dropout_clamps(
     structure: GraphStructure,
@@ -186,12 +221,7 @@ def get_graph_param_gradient_autoregressive(
     batch_size = batch["x"].shape[0]
     seq_len = batch["x"].shape[1]
 
-    # Map tasks to nodes using task_map
-    clamps = {}
-    for task_name, task_value in batch.items():
-        if task_name in structure.task_map:
-            node_name = structure.task_map[task_name]
-            clamps[node_name] = task_value
+    clamps = _input_clamps(structure, batch)
 
     # Targets arrive as integer token ids (batch, seq_len) to keep the
     # host->device transfer int32 (a one-hot is vocab_size x larger). The
@@ -207,11 +237,15 @@ def get_graph_param_gradient_autoregressive(
     y = jax.nn.one_hot(y, structure.nodes[structure.task_map["y"]].node_info.shape[-1])
     clamps[structure.task_map["y"]] = y
 
-    # Clamp an external causal mask only if the graph defines one (the v1
-    # monolithic TransformerBlock). The v2 decomposed MhaResidualNode masks
+    # Clamp an external causal mask only if the graph defines one and the batch
+    # does not supply it (the v1 monolithic TransformerBlock). The v2 decomposed MhaResidualNode masks
     # internally via is_causal, so its task_map has no "causal_mask" node and
     # this branch is skipped.
-    if use_causal_mask and "causal_mask" in structure.task_map:
+    if (
+        use_causal_mask
+        and "causal_mask" in structure.task_map
+        and "causal_mask" not in batch
+    ):
         # Create causal mask: (seq_len, seq_len) where mask[i,j] = 1 if j <= i
         causal_mask = create_causal_mask(seq_len)
         # Broadcast to (batch, 1, seq_len, seq_len) for attention scores
@@ -224,7 +258,9 @@ def get_graph_param_gradient_autoregressive(
 
     rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
     clamps.update(
-        create_dropout_clamps(structure, batch_size, dropout_key, training=True)
+        create_dropout_clamps(
+            structure, batch_size, dropout_key, training=True, exclude=batch.keys()
+        )
     )
 
     # Initialize state

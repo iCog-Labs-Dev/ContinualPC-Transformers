@@ -337,6 +337,39 @@ class TestPcMlmGradient:
         assert metric == pytest.approx(float(expected), rel=1e-5)
 
 
+class TestPcStepInputs:
+    def test_supplied_dropout_mask_is_kept(self, rng_key):
+        structure = create_encoder_mlm_model(
+            depth=1,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=SEQ_LEN,
+            vocab_size=VOCAB_SIZE,
+            dropout_rate=0.5,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        )
+        params = initialize_params(structure, rng_key)
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+        task = sorted(t for t in structure.task_map if t.startswith("dropout_"))[0]
+        zeros = jnp.zeros((4, SEQ_LEN, 16))
+
+        _, _, _, final_state = get_graph_param_gradient_autoregressive(
+            params, {**batch, task: zeros}, structure, rng_key
+        )
+
+        node = structure.task_map[task]
+        assert jnp.array_equal(final_state.nodes[node].z_latent, zeros)
+
+    def test_warns_when_batch_entry_matches_no_task(self, rng_key):
+        params, structure = build_model(rng_key)
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+        batch["segment_ids"] = jnp.zeros((4, SEQ_LEN))
+
+        with pytest.warns(UserWarning, match="segment_ids"):
+            get_graph_param_gradient_autoregressive(params, batch, structure, rng_key)
+
+
 class TestPcLoopRejectsUnsupportedMaskedPaths:
     def test_training_rejects_masked_batches_on_pmap(self, rng_key):
         params, structure = build_model(rng_key)

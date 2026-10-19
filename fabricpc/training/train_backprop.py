@@ -17,7 +17,6 @@ Use cases:
 
 from typing import Dict, Tuple, Any, List, Optional, Callable, cast
 import math
-import warnings
 import jax
 import jax.numpy as jnp
 import optax
@@ -28,6 +27,7 @@ from fabricpc.graph_initialization.state_initializer import (
     FeedforwardStateInit,
 )
 from fabricpc.training.train_autoregressive import (
+    _input_clamps,
     _reject_masked_eval_batch,
     _reject_masked_pmap_batch,
     _validate_pmap_batch,
@@ -55,40 +55,6 @@ def validate_feedforward_init(structure: GraphStructure):
             f"GraphState initializer must be FeedforwardStateInit for backprop training, "
             f"got {type(init).__name__}"
         )
-
-
-_LOSS_INPUTS = frozenset({"y", "loss_mask"})
-
-
-def _input_clamps(
-    structure: GraphStructure, batch: Dict[str, jnp.ndarray]
-) -> Dict[str, jnp.ndarray]:
-    """Clamp every batch entry that names a task node, except the target ``y``.
-
-    Besides ``x`` this covers auxiliary source nodes such as ``attention_mask``
-    and ``loss_mask``; leaving those unclamped would give them random latents.
-    Supplied entries take precedence: default ``dropout_*`` and ``causal_mask``
-    inputs are generated only for tasks missing from the batch. Entries that
-    name no task are ignored with a warning, except ``y`` and ``loss_mask``,
-    which the loss reads from the batch directly.
-    """
-    unused = sorted(
-        task_name
-        for task_name in batch
-        if task_name not in structure.task_map and task_name not in _LOSS_INPUTS
-    )
-    if unused:
-        warnings.warn(
-            f"Batch entries {unused} match no task in the graph and are ignored; "
-            "check that the model was built to consume them (e.g. "
-            "use_attention_mask=True for 'attention_mask').",
-            stacklevel=2,
-        )
-    return {
-        structure.task_map[task_name]: value
-        for task_name, value in batch.items()
-        if task_name in structure.task_map and task_name != "y"
-    }
 
 
 def compute_forward_pass(
