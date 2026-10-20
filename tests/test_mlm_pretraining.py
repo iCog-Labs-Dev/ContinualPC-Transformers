@@ -1,4 +1,4 @@
-"""End-to-end masked-LM pretraining with the existing backprop training loop."""
+"""End-to-end masked-LM pretraining with the existing backprop and PC loops."""
 
 import importlib
 
@@ -11,8 +11,19 @@ import pytest
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
-from fabricpc.training import evaluate_mlm, train_backprop_autoregressive
+from fabricpc.nodes.transformer_v2 import create_deep_transformer
+from fabricpc.training import (
+    evaluate_autoregressive,
+    evaluate_mlm,
+    train_autoregressive,
+    train_backprop_autoregressive,
+)
 from fabricpc.training.train import replicate_opt_state, replicate_params, shard_batch
+from fabricpc.training.train_autoregressive import (
+    compute_loss,
+    create_pmap_train_step_autoregressive,
+    get_graph_param_gradient_autoregressive,
+)
 from fabricpc.training.train_backprop import train_step_backprop_autoregressive
 from fabricpc.utils.data import MlmTextBatcher
 
@@ -23,7 +34,7 @@ VOCAB_SIZE = 24
 SPECIALS = {0, 1, 2, 3}
 
 
-def build_model(rng_key):
+def build_model(rng_key, infer_steps=2):
     structure = create_encoder_mlm_model(
         depth=1,
         embed_dim=16,
@@ -31,7 +42,9 @@ def build_model(rng_key):
         mlp_dim=32,
         seq_len=SEQ_LEN,
         vocab_size=VOCAB_SIZE,
-        inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        inference=InferenceSGDNormClip(
+            eta_infer=0.1, infer_steps=infer_steps, max_norm=5.0
+        ),
     )
     return initialize_params(structure, rng_key), structure
 
@@ -205,16 +218,30 @@ def _training_batches():
 class TestLoopTrainStep:
     @pytest.mark.parametrize("use_pmap", [False, True])
     def test_compiled_step_returns_no_predictions(self, rng_key, use_pmap):
-        params, structure = build_model(rng_key)
         optimizer = optax.adam(1e-3)
-        opt_state = optimizer.init(params)
-        batch = _training_batches()[0]
-        key = rng_key
         if use_pmap:
+            structure = create_deep_transformer(
+                depth=1,
+                embed_dim=16,
+                num_heads=2,
+                mlp_dim=32,
+                seq_len=SEQ_LEN,
+                vocab_size=VOCAB_SIZE,
+                inference=InferenceSGDNormClip(
+                    eta_infer=0.1, infer_steps=2, max_norm=5.0
+                ),
+            )
+            params = initialize_params(structure, rng_key)
+            tokens = jnp.zeros((4, SEQ_LEN), dtype=jnp.int32)
+            opt_state = replicate_opt_state(optimizer.init(params), 1)
             params = replicate_params(params, 1)
-            opt_state = replicate_opt_state(opt_state, 1)
-            batch = shard_batch({k: v for k, v in batch.items() if k != "loss_mask"}, 1)
+            batch = shard_batch({"x": tokens, "y": tokens}, 1)
             key = rng_key[None, :]
+        else:
+            params, structure = build_model(rng_key)
+            opt_state = optimizer.init(params)
+            batch = _training_batches()[0]
+            key = rng_key
 
         step = train_backprop._create_loop_train_step(
             structure, optimizer, True, use_pmap
@@ -260,3 +287,213 @@ class TestLoopTrainStep:
             expected.append(epoch)
 
         assert losses == expected
+
+
+def test_pc_mlm_training_updates_encoder_and_reduces_masked_loss(rng_key):
+    params, structure = build_model(rng_key, infer_steps=8)
+    val_loader = make_loader(seed=1)
+    before = evaluate_mlm(params, structure, val_loader, rng_key)["masked_loss"]
+
+    trained, _, _ = train_autoregressive(
+        params,
+        structure,
+        make_loader(),
+        optax.adam(1e-2),
+        {"num_epochs": 10},
+        rng_key,
+        verbose=False,
+    )
+
+    after = evaluate_mlm(trained, structure, val_loader, rng_key)["masked_loss"]
+    assert after < before
+    for node in ("token_embeddings", "L0_mha", "L0_mlp1", "L0_mlp2"):
+        for name, initial in params.nodes[node].weights.items():
+            final = trained.nodes[node].weights[name]
+            assert jnp.all(jnp.isfinite(final))
+            assert not jnp.allclose(final, initial), f"{node}.{name} never updated"
+
+
+class TestPcMlmGradient:
+    def test_gradients_ignore_unmasked_targets(self, rng_key):
+        params, structure = build_model(rng_key)
+        batch = next(iter(make_loader()))
+        batch = {k: jnp.asarray(v) for k, v in batch.items()}
+        unmasked = batch["loss_mask"] == 0
+        changed = {**batch, "y": jnp.where(unmasked, (batch["y"] + 1) % 24, batch["y"])}
+
+        grads, _, _, _ = get_graph_param_gradient_autoregressive(
+            params, batch, structure, rng_key
+        )
+        changed_grads, _, _, _ = get_graph_param_gradient_autoregressive(
+            params, changed, structure, rng_key
+        )
+
+        assert all(
+            jnp.allclose(a, b, atol=1e-6)
+            for a, b in zip(
+                jax.tree_util.tree_leaves(grads),
+                jax.tree_util.tree_leaves(changed_grads),
+            )
+        )
+
+    def test_reported_cross_entropy_counts_masked_tokens_only(self, rng_key):
+        params, structure = build_model(rng_key)
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+
+        _, _, metric, final_state = get_graph_param_gradient_autoregressive(
+            params, batch, structure, rng_key
+        )
+
+        probs = final_state.nodes["mlm_head"].z_mu
+        one_hot = jax.nn.one_hot(batch["y"], VOCAB_SIZE)
+        per_token = -jnp.sum(one_hot * jnp.log(probs + 1e-10), axis=-1)
+        mask = batch["loss_mask"]
+        expected = jnp.sum(per_token * mask) / jnp.sum(mask)
+        assert metric == pytest.approx(float(expected), rel=1e-5)
+
+
+class TestPcStepInputs:
+    def test_supplied_dropout_mask_is_kept(self, rng_key):
+        structure = create_encoder_mlm_model(
+            depth=1,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=SEQ_LEN,
+            vocab_size=VOCAB_SIZE,
+            dropout_rate=0.5,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        )
+        params = initialize_params(structure, rng_key)
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+        task = sorted(t for t in structure.task_map if t.startswith("dropout_"))[0]
+        zeros = jnp.zeros((4, SEQ_LEN, 16))
+
+        _, _, _, final_state = get_graph_param_gradient_autoregressive(
+            params, {**batch, task: zeros}, structure, rng_key
+        )
+
+        node = structure.task_map[task]
+        assert jnp.array_equal(final_state.nodes[node].z_latent, zeros)
+
+    def test_warns_when_batch_entry_matches_no_task(self, rng_key):
+        params, structure = build_model(rng_key)
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+        batch["segment_ids"] = jnp.zeros((4, SEQ_LEN))
+
+        with pytest.warns(UserWarning, match="segment_ids"):
+            get_graph_param_gradient_autoregressive(params, batch, structure, rng_key)
+
+
+class TestLossMaskIsRequired:
+    def _batch_without_loss_mask(self):
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+        return {k: v for k, v in batch.items() if k != "loss_mask"}
+
+    def test_pc_training_rejects_missing_loss_mask(self, rng_key):
+        params, structure = build_model(rng_key)
+
+        with pytest.raises(ValueError, match="needs a 'loss_mask'"):
+            train_autoregressive(
+                params,
+                structure,
+                _ListLoader([self._batch_without_loss_mask()]),
+                optax.adam(1e-2),
+                {"num_epochs": 1},
+                rng_key,
+                verbose=False,
+            )
+
+    def test_backprop_training_rejects_missing_loss_mask(self, rng_key):
+        params, structure = build_model(rng_key)
+
+        with pytest.raises(ValueError, match="needs a 'loss_mask'"):
+            train_backprop_autoregressive(
+                params,
+                structure,
+                _ListLoader([self._batch_without_loss_mask()]),
+                optax.adam(1e-2),
+                {"num_epochs": 1},
+                rng_key,
+                verbose=False,
+            )
+
+
+class TestSelectPmap:
+    def test_none_detects_devices(self):
+        assert train_backprop._select_pmap(None, False) is (
+            jax.local_device_count() > 1
+        )
+        assert train_backprop._select_pmap(None, True) is True
+
+    @pytest.mark.parametrize("use_pmap", [False, True])
+    def test_explicit_choice_wins(self, use_pmap):
+        assert train_backprop._select_pmap(use_pmap, False) is use_pmap
+
+    def test_rejects_conflicting_flags(self):
+        with pytest.raises(ValueError, match="conflicts"):
+            train_backprop._select_pmap(False, True)
+
+
+class TestPcLossMaskNeedsMaskedOutput:
+    def test_rejects_loss_mask_on_graph_without_loss_mask_task(self, rng_key):
+        structure = create_deep_transformer(
+            depth=1,
+            embed_dim=16,
+            num_heads=2,
+            mlp_dim=32,
+            seq_len=SEQ_LEN,
+            vocab_size=VOCAB_SIZE,
+            inference=InferenceSGDNormClip(eta_infer=0.1, infer_steps=2, max_norm=5.0),
+        )
+        params = initialize_params(structure, rng_key)
+        tokens = jnp.zeros((4, SEQ_LEN), dtype=jnp.int32)
+        batch = {"x": tokens, "y": tokens, "loss_mask": jnp.ones((4, SEQ_LEN))}
+
+        with pytest.raises(ValueError, match="loss_mask"):
+            get_graph_param_gradient_autoregressive(params, batch, structure, rng_key)
+
+
+class TestPcLoopRejectsUnsupportedMaskedPaths:
+    def test_training_rejects_masked_batches_on_pmap(self, rng_key):
+        params, structure = build_model(rng_key)
+
+        with pytest.raises(NotImplementedError, match="CUDA_VISIBLE_DEVICES"):
+            train_autoregressive(
+                params,
+                structure,
+                make_loader(),
+                optax.adam(1e-2),
+                {"num_epochs": 1},
+                rng_key,
+                verbose=False,
+                pmap_single_device=True,
+            )
+
+    def test_pmap_step_factory_rejects_masked_batches(self, rng_key):
+        params, structure = build_model(rng_key)
+        optimizer = optax.adam(1e-2)
+        step = create_pmap_train_step_autoregressive(structure, optimizer)
+        batch = {k: jnp.asarray(v) for k, v in next(iter(make_loader())).items()}
+
+        with pytest.raises(NotImplementedError, match="loss_mask"):
+            step(
+                replicate_params(params, 1),
+                replicate_opt_state(optimizer.init(params), 1),
+                shard_batch(batch, 1),
+                rng_key[None],
+            )
+
+    @pytest.mark.parametrize("pmap_single_device", [False, True])
+    def test_evaluator_points_to_evaluate_mlm(self, rng_key, pmap_single_device):
+        params, structure = build_model(rng_key)
+
+        with pytest.raises(ValueError, match="evaluate_mlm"):
+            evaluate_autoregressive(
+                params,
+                structure,
+                make_loader(),
+                {"use_causal_mask": False},
+                rng_key,
+                pmap_single_device=pmap_single_device,
+            )

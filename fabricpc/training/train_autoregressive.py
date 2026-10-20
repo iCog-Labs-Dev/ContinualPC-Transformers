@@ -16,6 +16,7 @@ The training loop supports both:
 
 from typing import Dict, Tuple, Any, List, Optional, Callable, Collection, cast
 import math
+import warnings
 import jax
 import jax.numpy as jnp
 import optax
@@ -43,6 +44,51 @@ def create_causal_mask(seq_len: int) -> jnp.ndarray:
         This ensures position i can only attend to positions 0...i
     """
     return jnp.tril(jnp.ones((seq_len, seq_len)))
+
+
+_LOSS_INPUTS = frozenset({"y", "loss_mask"})
+
+
+def _input_clamps(
+    structure: GraphStructure, batch: Dict[str, jnp.ndarray]
+) -> Dict[str, jnp.ndarray]:
+    """Clamp every batch entry that names a task node, except the target ``y``.
+
+    Besides ``x`` this covers auxiliary source nodes such as ``attention_mask``
+    and ``loss_mask``; leaving those unclamped would give them random latents.
+    Supplied entries take precedence: default ``dropout_*`` and ``causal_mask``
+    inputs are generated only for tasks missing from the batch. Entries that
+    name no task are ignored with a warning, except ``y`` and ``loss_mask``,
+    which the loss reads from the batch directly.
+
+    Raises:
+        ValueError: If the graph has a ``loss_mask`` task and the batch has no
+            ``loss_mask``; its source node would otherwise keep an initialised
+            latent that the loss treats as mask weights.
+    """
+    if "loss_mask" in structure.task_map and "loss_mask" not in batch:
+        raise ValueError(
+            "This graph has a 'loss_mask' task, so every batch needs a "
+            "'loss_mask' entry (e.g. from MlmTextBatcher)."
+        )
+    unused = sorted(
+        task_name
+        for task_name in batch
+        if task_name not in structure.task_map and task_name not in _LOSS_INPUTS
+    )
+    if unused:
+        warnings.warn(
+            f"Batch entries {unused} match no task in the graph and are ignored; "
+            "check that the model was built to consume them (e.g. "
+            "use_attention_mask=True for 'attention_mask').",
+            stacklevel=3,
+        )
+    return {
+        structure.task_map[task_name]: value
+        for task_name, value in batch.items()
+        if task_name in structure.task_map and task_name != "y"
+    }
+
 
 def create_dropout_clamps(
     structure: GraphStructure,
@@ -185,13 +231,15 @@ def get_graph_param_gradient_autoregressive(
     """
     batch_size = batch["x"].shape[0]
     seq_len = batch["x"].shape[1]
+    if "loss_mask" in batch and "loss_mask" not in structure.task_map:
+        raise ValueError(
+            "PC training cannot apply 'loss_mask' to a graph without a "
+            "'loss_mask' task; its output energy would cover every position. "
+            "Build the model with a masked output node (e.g. "
+            "create_encoder_mlm_model) or drop 'loss_mask' from the batch."
+        )
 
-    # Map tasks to nodes using task_map
-    clamps = {}
-    for task_name, task_value in batch.items():
-        if task_name in structure.task_map:
-            node_name = structure.task_map[task_name]
-            clamps[node_name] = task_value
+    clamps = _input_clamps(structure, batch)
 
     # Targets arrive as integer token ids (batch, seq_len) to keep the
     # host->device transfer int32 (a one-hot is vocab_size x larger). The
@@ -208,10 +256,14 @@ def get_graph_param_gradient_autoregressive(
     clamps[structure.task_map["y"]] = y
 
     # Clamp an external causal mask only if the graph defines one (the v1
-    # monolithic TransformerBlock). The v2 decomposed MhaResidualNode masks
-    # internally via is_causal, so its task_map has no "causal_mask" node and
-    # this branch is skipped.
-    if use_causal_mask and "causal_mask" in structure.task_map:
+    # monolithic TransformerBlock) and the batch does not supply it. The v2
+    # decomposed MhaResidualNode masks internally via is_causal, so its
+    # task_map has no "causal_mask" node and this branch is skipped.
+    if (
+        use_causal_mask
+        and "causal_mask" in structure.task_map
+        and "causal_mask" not in batch
+    ):
         # Create causal mask: (seq_len, seq_len) where mask[i,j] = 1 if j <= i
         causal_mask = create_causal_mask(seq_len)
         # Broadcast to (batch, 1, seq_len, seq_len) for attention scores
@@ -224,7 +276,9 @@ def get_graph_param_gradient_autoregressive(
 
     rng_key, dropout_key, state_key = jax.random.split(rng_key, 3)
     clamps.update(
-        create_dropout_clamps(structure, batch_size, dropout_key, training=True)
+        create_dropout_clamps(
+            structure, batch_size, dropout_key, training=True, exclude=batch.keys()
+        )
     )
 
     # Initialize state
@@ -252,7 +306,11 @@ def get_graph_param_gradient_autoregressive(
 
     # Compute output cross-entropy loss for perplexity metric - not used for gradients
     output_cross_entropy = compute_loss(
-        final_state, y, structure.task_map["y"], loss_type="cross_entropy"
+        final_state,
+        y,
+        structure.task_map["y"],
+        loss_type="cross_entropy",
+        loss_mask=batch.get("loss_mask"),
     )
 
     return grads, avg_energy, output_cross_entropy, final_state
@@ -325,6 +383,7 @@ def train_step_autoregressive_pmap(
     Returns:
         Tuple of (updated_params, updated_opt_state, energy_per_device, ce_loss_per_device, final_state)
     """
+    _reject_masked_pmap_batch(batch)
     grads, avg_energy, output_cross_entropy, final_state = (
         get_graph_param_gradient_autoregressive(
             params, batch, structure, rng_key, use_causal_mask
@@ -378,6 +437,38 @@ def create_pmap_train_step_autoregressive(
     return jax.pmap(step_fn, axis_name="devices")
 
 
+def _reject_masked_pmap_batch(batch: Dict[str, jnp.ndarray]) -> None:
+    """Refuse masked-LM batches on the pmap path (no token-weighted reduction)."""
+    if "loss_mask" in batch:
+        raise NotImplementedError(
+            "Batches with 'loss_mask' (masked-LM training) are not supported on "
+            "the multi-device pmap path yet; pass use_pmap=False to the training "
+            "loop, or expose one device (e.g. CUDA_VISIBLE_DEVICES=0)."
+        )
+
+
+def _select_pmap(use_pmap: Optional[bool], pmap_single_device: bool) -> bool:
+    """Resolve the training loop's device path.
+
+    ``use_pmap=None`` picks pmap when more than one device is visible (or when
+    ``pmap_single_device`` forces it); an explicit bool overrides detection.
+    """
+    if use_pmap is None:
+        return jax.local_device_count() > 1 or pmap_single_device
+    if not use_pmap and pmap_single_device:
+        raise ValueError("use_pmap=False conflicts with pmap_single_device=True")
+    return use_pmap
+
+
+def _reject_masked_eval_batch(batch: Dict[str, jnp.ndarray], evaluator: str) -> None:
+    """Refuse masked-LM batches in evaluators that average over every position."""
+    if "loss_mask" in batch:
+        raise ValueError(
+            f"{evaluator} averages over every position; use evaluate_mlm for "
+            "batches with a 'loss_mask'"
+        )
+
+
 def _validate_pmap_batch(batch: Dict[str, jnp.ndarray], n_devices: int) -> None:
     batch_size = next(iter(batch.values())).shape[0]
     if batch_size % n_devices != 0:
@@ -398,6 +489,7 @@ def train_autoregressive(
     epoch_callback: Optional[Callable] = None,
     iter_callback: Optional[Callable] = None,
     pmap_single_device: bool = False,
+    use_pmap: Optional[bool] = None,
 ) -> Tuple[GraphParams, List[List[float]], List[Any]]:
     """
     Main training loop for autoregressive predictive coding.
@@ -408,7 +500,9 @@ def train_autoregressive(
     Args:
         params: Initial parameters
         structure: Graph structure
-        train_loader: Data loader yielding batches with 'x' and 'y' keys
+        train_loader: Data loader yielding batches with 'x' and 'y' keys, plus
+            any auxiliary task inputs (e.g. masked-LM 'loss_mask' and
+            'attention_mask'; batches with 'loss_mask' are rejected on pmap)
         optimizer: Optax optimizer (e.g., optax.adam(1e-3))
         config: Training configuration:
             - num_epochs: Number of training epochs
@@ -422,6 +516,9 @@ def train_autoregressive(
             accept **kwargs.
         iter_callback: Optional callback (epoch, batch_idx, loss) -> any
         pmap_single_device: Force pmap code path for testing
+        use_pmap: ``None`` detects the device path; ``False`` forces the
+            single-device JIT path (required for masked-LM batches on
+            multi-device hosts), ``True`` forces pmap.
 
     Returns:
         Tuple of (trained_params, energy_history, epoch_results)
@@ -436,7 +533,7 @@ def train_autoregressive(
 
     # Device detection
     n_devices = jax.local_device_count()
-    use_pmap = (n_devices > 1) or pmap_single_device
+    use_pmap = _select_pmap(use_pmap, pmap_single_device)
 
     if verbose:
         print(f"Training on {n_devices} device(s): {jax.devices()}")
@@ -476,9 +573,7 @@ def train_autoregressive(
                 if n_devices > 1
                 else epoch_rng_key[None, :]
             )
-            batch_keys = jax.vmap(
-                lambda k: jax.random.split(k, max_batches)
-            )(dev_keys)
+            batch_keys = jax.vmap(lambda k: jax.random.split(k, max_batches))(dev_keys)
         else:
             batch_keys = jax.random.split(epoch_rng_key, max_batches)
 
@@ -494,6 +589,7 @@ def train_autoregressive(
             batch = _convert_batch(batch_data)
 
             if use_pmap:
+                _reject_masked_pmap_batch(batch)
                 _validate_pmap_batch(batch, n_devices)
                 batch = shard_batch(batch, n_devices)
 
@@ -530,9 +626,7 @@ def train_autoregressive(
         # without recomputing them. Callbacks should accept **kwargs.
         if epoch_callback is not None:
             cb_params = (
-                jax.tree_util.tree_map(lambda x: x[0], params)
-                if use_pmap
-                else params
+                jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
             )
             epoch_results.append(
                 epoch_callback(
@@ -913,6 +1007,7 @@ def evaluate_autoregressive(
         for batch_idx, batch_data in enumerate(test_loader):
             batch_key_for_step = batch_keys_per_device[:, batch_idx]
             batch = _convert_batch(batch_data)
+            _reject_masked_eval_batch(batch, "evaluate_autoregressive")
             batch_size = next(iter(batch.values())).shape[0]
 
             # Pad incomplete batches so no test data is dropped.
@@ -947,9 +1042,7 @@ def evaluate_autoregressive(
                 else:
                     batch_loss = -float(
                         jnp.mean(
-                            jnp.take_along_axis(
-                                log_preds, targets[..., None], axis=-1
-                            )
+                            jnp.take_along_axis(log_preds, targets[..., None], axis=-1)
                         )
                     )
             else:
@@ -996,6 +1089,7 @@ def evaluate_autoregressive(
 
         for batch_idx, batch_data in enumerate(test_loader):
             batch = _convert_batch(batch_data)
+            _reject_masked_eval_batch(batch, "evaluate_autoregressive")
             batch_size = batch["x"].shape[0]
 
             # Run JIT-compiled evaluation step

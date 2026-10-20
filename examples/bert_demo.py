@@ -1,10 +1,14 @@
 """
-BERT-style encoder: masked-language-model pretraining with backprop.
+BERT-style encoder: masked-language-model pretraining with backprop or PC.
 
 Builds a bidirectional encoder (``create_encoder_mlm_model``), batches text
 with ``MlmTextBatcher`` (BERT 80/10/10 masking, padding masks) and trains it
-with the standard ``train_backprop_autoregressive`` loop. Validation reports
-masked-token loss and accuracy each epoch.
+with the standard loops: ``train_backprop_autoregressive`` for ``--mode
+backprop`` or ``train_autoregressive`` (predictive coding) for ``--mode pc``.
+Validation reports feedforward masked-token loss and accuracy each epoch,
+comparable across modes. The training loss is the backprop masked loss, or in
+PC mode ``train_pc_inferred_loss``: the masked loss after inference has moved
+the latents toward the targets, which reads lower than a feedforward loss.
 
 Without arguments it runs on a small built-in corpus with a word-level
 vocabulary (no extra dependencies). Pass text files (one document per line)
@@ -13,6 +17,8 @@ to pretrain on your own data; ``--tokenizer bpe`` needs the ``text`` extra
 
 Usage:
     PYTHONPATH=. python examples/bert_demo.py
+    PYTHONPATH=. python examples/bert_demo.py --mode pc --pc_infer_steps 10
+    PYTHONPATH=. python examples/bert_demo.py --ab_trials 5
     PYTHONPATH=. python examples/bert_demo.py --train_file train.txt \\
         --val_file val.txt --tokenizer bpe --vocab_size 4000 --seq_len 64
 """
@@ -22,23 +28,33 @@ from jax_setup import set_jax_flags_before_importing_jax
 set_jax_flags_before_importing_jax()
 
 import argparse
+import functools
+import importlib.util
 import math
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 
 from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.experiments.ab_experiment import ABExperiment, ABResults, ExperimentArm
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.training import (
     count_training_batches,
     evaluate_mlm,
+    train_autoregressive,
     train_backprop_autoregressive,
 )
+from fabricpc.training.train_autoregressive import (
+    get_graph_param_gradient_autoregressive,
+)
+from fabricpc.training.train_backprop import compute_loss_autoregressive
 from fabricpc.utils.data import MLM_SPECIAL_TOKENS, MlmTextBatcher, tokenize_texts_bpe
 
 TINY_TRAIN_TEXTS = [
@@ -145,8 +161,13 @@ def count_training_steps(num_epochs: float, batches_per_epoch: int) -> int:
     return count_training_batches(num_epochs, batches_per_epoch)
 
 
-def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
-    """AdamW with linear warmup, cosine decay and global-norm clipping."""
+def build_optimizer(
+    args, total_steps: int, grad_scale: float = 1.0
+) -> optax.GradientTransformation:
+    """AdamW with linear warmup, cosine decay and global-norm clipping.
+
+    Gradients are multiplied by ``grad_scale`` before clipping.
+    """
     if not 0.0 <= args.warmup_fraction < 1.0:
         raise ValueError("warmup_fraction must be in [0, 1)")
     schedule = optax.warmup_cosine_decay_schedule(
@@ -157,12 +178,50 @@ def build_optimizer(args, total_steps: int) -> optax.GradientTransformation:
     )
     adamw = optax.adamw(schedule, weight_decay=args.weight_decay)
     if args.grad_clip <= 0:
-        return adamw
-    return optax.chain(optax.clip_by_global_norm(args.grad_clip), adamw)
+        return optax.chain(optax.scale(grad_scale), adamw)
+    return optax.chain(
+        optax.scale(grad_scale), optax.clip_by_global_norm(args.grad_clip), adamw
+    )
+
+
+def expected_masked_tokens(loader, max_batches: int = 50) -> float:
+    """Mean ``loss_mask`` count over the loader's first batches.
+
+    The loader's state is restored so training sees the same batches.
+    """
+    state = loader.state_dict()
+    counts = []
+    for batch in loader:
+        counts.append(float(np.sum(batch["loss_mask"])))
+        if len(counts) == max_batches:
+            break
+    loader.load_state_dict(state)
+    return float(np.mean(counts))
+
+
+def pc_grad_scale(loader) -> float:
+    """Scale that approximately matches PC weight gradients to backprop's per token.
+
+    PC weight gradients sum over masked tokens while the backprop loss averages
+    them. Dividing by the mean masked count per batch (estimated from the
+    loader's first batches) makes ``--grad_clip`` act on comparable norms in
+    both modes. Per-batch counts vary, so the match is approximate.
+    """
+    return 1.0 / expected_masked_tokens(loader)
+
+
+TRAINERS = {
+    mode: functools.partial(trainer, use_pmap=False)
+    for mode, trainer in (
+        ("backprop", train_backprop_autoregressive),
+        ("pc", train_autoregressive),
+    )
+}
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BERT-style MLM pretraining")
+    parser.add_argument("--mode", choices=sorted(TRAINERS), default="backprop")
     parser.add_argument("--train_file", type=Path, default=None)
     parser.add_argument("--val_file", type=Path, default=None)
     parser.add_argument(
@@ -186,73 +245,260 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--warmup_fraction", type=float, default=0.1, help="of total steps"
     )
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=1.0,
+        help="global-norm clip; in PC mode gradients are first divided by the "
+        "mean masked-token count per batch, so the clip approximately matches "
+        "backprop's per-token scale",
+    )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pc_infer_steps", type=int, default=40, help="PC only")
+    parser.add_argument("--pc_eta_infer", type=float, default=0.1, help="PC only")
+    parser.add_argument("--pc_max_norm", type=float, default=5.0, help="PC only")
+    parser.add_argument(
+        "--pc_output_energy_scale", type=float, default=1.0, help="PC only"
+    )
+    parser.add_argument(
+        "--ab_trials",
+        type=int,
+        default=0,
+        help="Compare backprop vs PC over this many paired seeds instead of "
+        "training --mode (needs scipy, from the experiments extra)",
+    )
+    parser.add_argument(
+        "--ab_metric", choices=["masked_loss", "masked_accuracy"], default="masked_loss"
+    )
     args = parser.parse_args(argv)
     if (args.train_file is None) != (args.val_file is None):
         parser.error("--train_file and --val_file must be given together")
+    if args.ab_trials > 0 and importlib.util.find_spec("scipy") is None:
+        parser.error("--ab_trials needs scipy: pip install -e '.[experiments]'")
     return args
 
 
-def main(argv: Optional[Sequence[str]] = None) -> Dict[str, float]:
-    """Pretrain and return the final validation metrics."""
-    args = parse_args(argv)
-    if args.train_file is None:
-        train_texts, val_texts = TINY_TRAIN_TEXTS, TINY_VAL_TEXTS
-    else:
-        train_texts, val_texts = read_texts(args.train_file), read_texts(args.val_file)
-
-    if args.tokenizer == "bpe":
-        train_ids, val_ids, vocab = bpe_tokenize(
-            train_texts, val_texts, args.vocab_size
-        )
-    else:
-        train_ids, val_ids, vocab = word_tokenize(train_texts, val_texts)
-    train_loader = make_loader(train_ids, vocab, args, seed=args.seed, shuffle=True)
-    val_loader = make_loader(val_ids, vocab, args, seed=args.seed + 1, shuffle=False)
-    print(
-        f"vocab={len(vocab)} train_tokens={len(train_ids)} "
-        f"val_tokens={len(val_ids)} batches_per_epoch={len(train_loader)}"
-    )
-
-    structure = create_encoder_mlm_model(
+def build_model(args, vocab_size: int):
+    """Encoder MLM graph; the PC inference settings only matter for ``--mode pc``."""
+    return create_encoder_mlm_model(
         depth=args.depth,
         embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         mlp_dim=args.mlp_dim,
         seq_len=args.seq_len,
-        vocab_size=len(vocab),
+        vocab_size=vocab_size,
         dropout_rate=args.dropout_rate,
-        inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
+        pc_output_energy_scale=args.pc_output_energy_scale,
+        inference=InferenceSGDNormClip(
+            eta_infer=args.pc_eta_infer,
+            infer_steps=args.pc_infer_steps,
+            max_norm=args.pc_max_norm,
+        ),
     )
+
+
+def load_token_streams(args) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Tokenize the training and validation texts into token-id streams."""
+    if args.train_file is None:
+        train_texts, val_texts = TINY_TRAIN_TEXTS, TINY_VAL_TEXTS
+    else:
+        train_texts, val_texts = read_texts(args.train_file), read_texts(args.val_file)
+    if args.tokenizer == "bpe":
+        return bpe_tokenize(train_texts, val_texts, args.vocab_size)
+    return word_tokenize(train_texts, val_texts)
+
+
+def make_loaders(args, train_ids, val_ids, vocab, seed: int):
+    return (
+        make_loader(train_ids, vocab, args, seed=seed, shuffle=True),
+        make_loader(val_ids, vocab, args, seed=seed + 1, shuffle=False),
+    )
+
+
+def print_data_summary(train_ids, val_ids, vocab, batches_per_epoch: int) -> None:
+    print(
+        f"vocab={len(vocab)} train_tokens={len(train_ids)} "
+        f"val_tokens={len(val_ids)} batches_per_epoch={batches_per_epoch}"
+    )
+
+
+NEGLIGIBLE_GRADIENT_RATIO = 1e-3
+MISALIGNED_GRADIENT_COSINE = 0.5
+
+
+def _tree_norm(tree) -> float:
+    return float(
+        jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(tree)))
+    )
+
+
+def _tree_dot(a, b) -> float:
+    return float(
+        sum(
+            jnp.sum(x * y)
+            for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+        )
+    )
+
+
+def warn_weak_pc_gradients(structure, params, loader, rng_key) -> Dict[str, List[str]]:
+    """Warn about nodes whose PC gradient on the first batch falls short of backprop's.
+
+    Each node's PC weight gradient, divided by the batch's masked-token count,
+    is compared with the backprop gradient of the masked loss. A node is
+    ``negligible`` when that norm ratio is below ``NEGLIGIBLE_GRADIENT_RATIO``
+    and ``misaligned`` when the cosine is below ``MISALIGNED_GRADIENT_COSINE``.
+    How far the output error reaches depends on ``--pc_infer_steps`` times
+    ``--pc_eta_infer`` and on float32 precision, not on step count alone. The
+    loader's state is restored so training sees the same batches.
+    """
+    state = loader.state_dict()
+    batch = {k: jnp.asarray(v) for k, v in next(iter(loader)).items()}
+    loader.load_state_dict(state)
+    pc_grads, _, _, _ = get_graph_param_gradient_autoregressive(
+        params, batch, structure, rng_key
+    )
+    bp_grads = jax.grad(
+        lambda p: compute_loss_autoregressive(p, structure, batch, rng_key)[0]
+    )(params)
+    masked = float(jnp.sum(batch["loss_mask"]))
+
+    weak: Dict[str, List[str]] = {"negligible": [], "misaligned": []}
+    for name, pc_node in pc_grads.nodes.items():
+        bp_norm = _tree_norm(bp_grads.nodes[name])
+        if not jax.tree_util.tree_leaves(pc_node) or bp_norm == 0.0:
+            continue
+        pc_norm = _tree_norm(pc_node) / masked
+        if pc_norm / bp_norm < NEGLIGIBLE_GRADIENT_RATIO:
+            weak["negligible"].append(name)
+        elif (
+            _tree_dot(pc_node, bp_grads.nodes[name]) / masked / (pc_norm * bp_norm)
+            < MISALIGNED_GRADIENT_COSINE
+        ):
+            weak["misaligned"].append(name)
+
+    config = structure.config["inference"].config
+    for kind, names in weak.items():
+        if names:
+            print(
+                f"warning: with --pc_infer_steps {config['infer_steps']} and "
+                f"--pc_eta_infer {config['eta_infer']} these nodes get a {kind} "
+                f"PC gradient relative to backprop: {', '.join(names)}",
+                file=sys.stderr,
+            )
+    return weak
+
+
+def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
+    """Pretrain with ``--mode`` and return the final validation metrics."""
+    train_loader, val_loader = make_loaders(args, train_ids, val_ids, vocab, args.seed)
+    print_data_summary(train_ids, val_ids, vocab, len(train_loader))
+    structure = build_model(args, vocab_size=len(vocab))
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
+    if args.mode == "pc":
+        warn_weak_pc_gradients(structure, params, train_loader, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
-
     num_epochs_to_run = math.ceil(args.num_epochs)
+    train_label = (
+        "train_batch_mean_loss" if args.mode == "backprop" else "train_pc_inferred_loss"
+    )
 
     def validate(epoch_idx, epoch_params, structure, config, key, ce_loss, **_):
         metrics = evaluate_mlm(epoch_params, structure, val_loader, key)
         print(
             f"epoch {epoch_idx + 1}/{num_epochs_to_run} "
-            f"train_batch_mean_loss={ce_loss:.4f} "
+            f"{train_label}={ce_loss:.4f} "
             f"val_masked_loss={metrics['masked_loss']:.4f} "
             f"val_masked_acc={metrics['masked_accuracy']:.2%} "
             f"val_tokens={metrics['num_masked_tokens']}"
         )
         return metrics
 
-    _, _, epoch_metrics = train_backprop_autoregressive(
+    grad_scale = pc_grad_scale(train_loader) if args.mode == "pc" else 1.0
+    _, _, epoch_metrics = TRAINERS[args.mode](
         params,
         structure,
         train_loader,
-        build_optimizer(args, total_steps),
+        build_optimizer(args, total_steps, grad_scale),
         {"num_epochs": args.num_epochs},
         train_key,
         verbose=False,
         epoch_callback=validate,
     )
     return epoch_metrics[-1]
+
+
+def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
+    """Paired backprop-vs-PC pretraining over ``--ab_trials`` seeds.
+
+    Every trial pretrains both arms from a fresh initialisation on the same
+    loaders, then scores them with ``evaluate_mlm`` on ``--ab_metric``. Both
+    arms share the same settings; the PC arm's gradients are divided by the
+    mean masked-token count per batch before clipping, so clipping is only
+    approximately matched (see ``pc_grad_scale``). Each PC trial checks its
+    own initialisation with ``warn_weak_pc_gradients`` before training.
+    ``--mode`` is not used.
+    """
+    batches_per_epoch = len(make_loaders(args, train_ids, val_ids, vocab, 0)[0])
+    print_data_summary(train_ids, val_ids, vocab, batches_per_epoch)
+    total_steps = count_training_steps(args.num_epochs, batches_per_epoch)
+
+    def model_factory(key):
+        structure = build_model(args, vocab_size=len(vocab))
+        return initialize_params(structure, key), structure
+
+    train_loader, _ = make_loaders(args, train_ids, val_ids, vocab, args.seed)
+    optimizers = {
+        "backprop": build_optimizer(args, total_steps),
+        "pc": build_optimizer(args, total_steps, pc_grad_scale(train_loader)),
+    }
+
+    def eval_fn(params, structure, loader, config, key):
+        return evaluate_mlm(params, structure, loader, key)
+
+    def pc_train_fn(params, structure, loader, optimizer, config, key, **kwargs):
+        warn_weak_pc_gradients(structure, params, loader, key)
+        return TRAINERS["pc"](
+            params, structure, loader, optimizer, config, key, **kwargs
+        )
+
+    train_fns = {"backprop": TRAINERS["backprop"], "pc": pc_train_fn}
+
+    arm_a, arm_b = (
+        ExperimentArm(
+            name=mode,
+            model_factory=model_factory,
+            train_fn=train_fns[mode],
+            eval_fn=eval_fn,
+            optimizer=optimizers[mode],
+            train_config={"num_epochs": args.num_epochs},
+        )
+        for mode in ("backprop", "pc")
+    )
+    results = ABExperiment(
+        arm_a=arm_a,
+        arm_b=arm_b,
+        metric=args.ab_metric,
+        data_loader_factory=lambda seed: make_loaders(
+            args, train_ids, val_ids, vocab, seed
+        ),
+        n_trials=args.ab_trials,
+        seed_offset=args.seed,
+    ).run()
+    direction = "lower" if args.ab_metric == "masked_loss" else "higher"
+    print(f"{args.ab_metric}: {direction} is better; Diff = backprop - pc")
+    results.print_summary()
+    return results
+
+
+def main(argv: Optional[Sequence[str]] = None):
+    """Pretrain (or compare modes with ``--ab_trials``) and return the results."""
+    args = parse_args(argv)
+    train_ids, val_ids, vocab = load_token_streams(args)
+    if args.ab_trials > 0:
+        return compare_modes(args, train_ids, val_ids, vocab)
+    return pretrain(args, train_ids, val_ids, vocab)
 
 
 if __name__ == "__main__":

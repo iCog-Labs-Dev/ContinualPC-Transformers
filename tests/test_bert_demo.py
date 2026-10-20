@@ -1,9 +1,13 @@
 """Smoke tests for examples/bert_demo.py (MLM pretraining demo)."""
 
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 DEMO_PATH = Path(__file__).resolve().parents[1] / "examples" / "bert_demo.py"
@@ -110,3 +114,187 @@ def test_training_steps_match_the_loop_truncation(demo, num_epochs, expected):
 def test_rejects_epochs_the_loop_cannot_run(demo, num_epochs):
     with pytest.raises(ValueError, match="num_epochs"):
         demo.count_training_steps(num_epochs, batches_per_epoch=3)
+
+
+def test_pc_mode_pretraining_reports_validation_metrics(demo, capsys):
+    metrics = demo.main(SMALL + ["--mode", "pc", "--num_epochs", "1"])
+
+    assert metrics["num_masked_tokens"] > 0
+    out = capsys.readouterr().out
+    assert "epoch 1/1 train_pc_inferred_loss=" in out
+    assert "train_masked_loss=" not in out
+
+
+def test_pc_flags_configure_inference_and_output_energy(demo):
+    args = demo.parse_args(
+        SMALL
+        + ["--mode", "pc", "--pc_infer_steps", "7", "--pc_eta_infer", "0.02"]
+        + ["--pc_max_norm", "3.0", "--pc_output_energy_scale", "2.5"]
+    )
+
+    structure = demo.build_model(args, vocab_size=30)
+
+    inference = structure.config["inference"].config
+    assert inference["infer_steps"] == 7
+    assert inference["eta_infer"] == pytest.approx(0.02)
+    assert inference["max_norm"] == pytest.approx(3.0)
+    head_config = structure.nodes["mlm_head"].node_info.node_config
+    assert head_config["output_energy_scale"] == pytest.approx(2.5)
+    assert demo.TRAINERS[args.mode].func is demo.train_autoregressive
+    assert demo.TRAINERS[args.mode].keywords == {"use_pmap": False}
+
+
+def test_ab_comparison_pretrains_both_modes_per_trial(demo):
+    pytest.importorskip("scipy")
+
+    results = demo.main(SMALL + ["--ab_trials", "2", "--num_epochs", "1"])
+
+    assert (results.arm_a_name, results.arm_b_name) == ("backprop", "pc")
+    assert results.metric == "masked_loss"
+    assert len(results.arm_a_trials) == len(results.arm_b_trials) == 2
+    values_a = [trial.metric_value for trial in results.arm_a_trials]
+    values_b = [trial.metric_value for trial in results.arm_b_trials]
+    assert all(np.isfinite(v) and v > 0 for v in values_a + values_b)
+    assert values_a != values_b
+
+
+def test_ab_comparison_states_metric_direction(demo, capsys):
+    pytest.importorskip("scipy")
+
+    demo.main(SMALL + ["--ab_trials", "2", "--num_epochs", "1"])
+
+    assert "masked_loss: lower is better" in capsys.readouterr().out
+
+
+def test_ab_comparison_fails_before_training_without_scipy(demo, monkeypatch):
+    real_find_spec = demo.importlib.util.find_spec
+    monkeypatch.setattr(
+        demo.importlib.util,
+        "find_spec",
+        lambda name: None if name == "scipy" else real_find_spec(name),
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args(["--ab_trials", "2"])
+
+
+def _pc_setup(demo, extra):
+    args = demo.parse_args(SMALL + ["--mode", "pc"] + extra)
+    train_ids, val_ids, vocab = demo.load_token_streams(args)
+    loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
+    structure = demo.build_model(args, vocab_size=len(vocab))
+    key = demo.jax.random.PRNGKey(0)
+    return structure, demo.initialize_params(structure, key), loader, key
+
+
+def test_flags_noise_level_pc_gradients_as_negligible(demo, capsys):
+    structure, params, loader, key = _pc_setup(demo, ["--pc_infer_steps", "2"])
+    state = loader.state_dict()
+
+    weak = demo.warn_weak_pc_gradients(structure, params, loader, key)
+
+    assert {"token_embeddings", "L0_mha", "L0_mlp1"} <= set(weak["negligible"])
+    assert "mlm_head" not in weak["negligible"] + weak["misaligned"]
+    assert "negligible PC gradient" in capsys.readouterr().err
+    assert loader.state_dict() == state
+
+
+def test_default_pc_inference_gives_no_negligible_gradients(demo):
+    args = demo.parse_args(["--mode", "pc"])
+    train_ids, val_ids, vocab = demo.load_token_streams(args)
+    loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
+    structure = demo.build_model(args, vocab_size=len(vocab))
+    key = demo.jax.random.PRNGKey(0)
+    params = demo.initialize_params(structure, key)
+
+    weak = demo.warn_weak_pc_gradients(structure, params, loader, key)
+
+    assert weak["negligible"] == []
+    assert not {"token_embeddings", "position_embeddings"} & set(weak["misaligned"])
+
+
+def test_pc_grad_scale_is_inverse_mean_masked_count(demo):
+    _, _, loader, _ = _pc_setup(demo, [])
+    state = loader.state_dict()
+    counts = [float(np.sum(batch["loss_mask"])) for batch in loader]
+    loader.load_state_dict(state)
+
+    scale = demo.pc_grad_scale(loader)
+
+    assert scale == pytest.approx(1.0 / np.mean(counts[:50]))
+    assert loader.state_dict() == state
+
+
+@pytest.mark.parametrize("grad_clip, scale_matters", [(1.0, True), (0, False)])
+def test_grad_scale_only_changes_updates_through_clipping(
+    demo, grad_clip, scale_matters
+):
+    import jax.numpy as jnp
+
+    args = SimpleNamespace(
+        lr=1.0, weight_decay=0.0, warmup_fraction=0.0, grad_clip=grad_clip
+    )
+    params = {"w": jnp.zeros(2)}
+    grads = [{"w": jnp.array([3.0, 4.0])}, {"w": jnp.array([0.3, 0.4])}]
+
+    def second_update(grad_scale):
+        optimizer = demo.build_optimizer(args, total_steps=4, grad_scale=grad_scale)
+        state = optimizer.init(params)
+        for grad in grads:
+            updates, state = optimizer.update(grad, state, params)
+        return updates["w"]
+
+    same = bool(jnp.allclose(second_update(1.0), second_update(0.1), rtol=1e-4))
+    assert same != scale_matters
+
+
+@pytest.mark.parametrize("mode", ["backprop", "pc"])
+def test_demo_trains_on_a_two_device_host(mode):
+    """Runs on two forced CPU devices, which must be set before JAX starts."""
+    repo_root = DEMO_PATH.parents[1]
+    env = {
+        **os.environ,
+        "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
+        "JAX_PLATFORMS": "cpu",
+        "PYTHONPATH": os.pathsep.join(
+            p for p in (str(repo_root), os.environ.get("PYTHONPATH")) if p
+        ),
+    }
+    result = subprocess.run(
+        [sys.executable, str(DEMO_PATH), "--mode", mode, "--num_epochs", "0.2"] + SMALL,
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert "val_masked_loss=" in result.stdout
+
+
+def test_ab_checks_each_pc_trial_on_its_own_initialisation(demo, monkeypatch):
+    pytest.importorskip("scipy")
+    checked, trained = [], []
+    real_pc = demo.TRAINERS["pc"]
+
+    def spy_check(structure, params, loader, key):
+        checked.append(params)
+        return {"negligible": [], "misaligned": []}
+
+    def spy_train(params, *args, **kwargs):
+        trained.append(params)
+        return real_pc(params, *args, **kwargs)
+
+    monkeypatch.setattr(demo, "warn_weak_pc_gradients", spy_check)
+    monkeypatch.setitem(demo.TRAINERS, "pc", spy_train)
+
+    demo.main(SMALL + ["--ab_trials", "2", "--num_epochs", "1"])
+
+    assert len(checked) == len(trained) == 2
+    for seen, used in zip(checked, trained):
+        assert seen is used
+    first, second = (
+        demo.jax.tree_util.tree_leaves(p)[0] for p in (trained[0], trained[1])
+    )
+    assert not demo.jnp.array_equal(first, second)

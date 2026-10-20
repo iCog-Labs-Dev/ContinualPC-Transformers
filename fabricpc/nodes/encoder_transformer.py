@@ -179,11 +179,12 @@ class MaskedVocabProjectionNode(NodeBase):
 
     Takes the encoder output on ``in`` and a ``(batch, seq_len)`` MLM mask on
     ``loss_mask``. The prediction is ``softmax(logits)`` with the parameters of
-    ``VocabProjectionNode``. The per-sample energy is the masked cross-entropy,
-    normalised by the number of masked tokens in the batch and scaled by
-    ``output_energy_scale``, so in PC training unmasked positions exert no pull
-    on the latents. The activation and energy are fixed; passing
-    ``activation`` or ``energy`` raises ``ValueError``.
+    ``VocabProjectionNode``. The per-sample energy is the cross-entropy summed
+    over that sample's masked tokens and scaled by ``output_energy_scale``,
+    matching ``CrossEntropyEnergy`` restricted to masked positions, so in PC
+    training unmasked positions exert no pull on the latents. The activation
+    and energy are fixed; passing ``activation`` or ``energy`` raises
+    ``ValueError``.
 
     The energy depends on the ``loss_mask`` input, so ``energy_functional``
     takes it as an extra argument; ``error`` stays the raw
@@ -284,9 +285,8 @@ class MaskedVocabProjectionNode(NodeBase):
             loss_mask = jnp.ones(log_probs.shape[:2])
         mask = jax.lax.stop_gradient(loss_mask.astype(log_probs.dtype))
         per_token_ce = -jnp.sum(state.z_latent * log_probs, axis=-1)
-        masked_count = jnp.maximum(jnp.sum(mask), 1.0)
         scale = node_info.node_config.get("output_energy_scale", 1.0)
-        energy = scale * jnp.sum(per_token_ce * mask, axis=-1) / masked_count
+        energy = scale * jnp.sum(per_token_ce * mask, axis=-1)
         return state._replace(energy=energy)
 
 
@@ -456,8 +456,9 @@ def create_encoder_mlm_model(
     token ids), ``loss_mask`` (1 at masked positions), plus ``attention_mask``
     (1 at real tokens, 0 at padding) when ``use_attention_mask`` is set, and
     ``dropout_*`` mask sources when ``dropout_rate > 0``. Batches must provide
-    ``loss_mask`` and, with ``use_attention_mask``, ``attention_mask``;
-    ``fabricpc.utils.data.MlmTextBatcher`` yields both.
+    ``loss_mask``; the training paths raise without it. An omitted
+    ``attention_mask`` attends to every position, which is only correct for
+    unpadded batches. ``fabricpc.utils.data.MlmTextBatcher`` yields both.
     """
     _validate_encoder_config(
         depth=depth,
