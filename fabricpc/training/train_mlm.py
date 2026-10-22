@@ -253,6 +253,17 @@ def _prepare_pcn_mlm_batch(
     return shared_clamps, free_metrics, free_state, initial_state, clamps
 
 
+def _mean_total_energy(
+    state: GraphState, structure: GraphStructure, batch_size: int
+) -> jax.Array:
+    """Per-sample total energy over every node with inputs, averaged over the batch."""
+    total = jnp.array(0.0)
+    for node_name, node in structure.nodes.items():
+        if node.node_info.in_degree > 0:
+            total = total + jnp.sum(state.nodes[node_name].energy)
+    return total / batch_size
+
+
 def _validate_forward_updates(forward_updates: str) -> None:
     allowed = ("none", *FORWARD_UPDATE_MODES)
     if forward_updates not in allowed:
@@ -339,11 +350,7 @@ def get_graph_param_gradient_pcn_mlm(
             params, initial_state, final_state, structure, forward_updates
         )
     output_energy = jnp.sum(final_state.nodes[output_node].energy) / batch_size
-    total_energy = jnp.array(0.0)
-    for node_name, node in structure.nodes.items():
-        if node.node_info.in_degree > 0:
-            total_energy = total_energy + jnp.sum(final_state.nodes[node_name].energy)
-    total_energy = total_energy / batch_size
+    total_energy = _mean_total_energy(final_state, structure, batch_size)
     metrics = {
         **free_metrics,
         "pc_output_energy": output_energy,
@@ -359,8 +366,8 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     structure: GraphStructure,
     rng_key: jax.Array,
     forward_updates: str = "none",
-) -> tuple[GraphParams, jax.Array, jax.Array, jax.Array]:
-    """Compute lean PC MLM grads, loss totals and inference energy rises."""
+) -> tuple[GraphParams, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Compute lean PC MLM grads, loss totals, energy rises and total energy."""
     grads, metrics, _initial_state, _free_state, _final_state = (
         get_graph_param_gradient_pcn_mlm(
             params,
@@ -372,7 +379,13 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     )
     masked_count = metrics["num_masked_tokens"]
     loss_numerator = metrics["masked_loss"] * masked_count
-    return grads, loss_numerator, masked_count, metrics["pc_energy_rises"]
+    return (
+        grads,
+        loss_numerator,
+        masked_count,
+        metrics["pc_energy_rises"],
+        metrics["pc_total_energy"],
+    )
 
 
 def pc_node_gradient_norms(
@@ -590,6 +603,9 @@ def _train_step_pcn_mlm_incremental_with_state(
     metrics = {
         **free_metrics,
         "pc_energy_rises": rises,
+        "pc_total_energy": _mean_total_energy(
+            final_state, structure, batch["x"].shape[0]
+        ),
         "grad_norm_mean": grad_norm_sum / max(int(infer_steps), 1),
     }
     return params, opt_state, metrics, final_state
@@ -821,6 +837,7 @@ def train_pcn_mlm(
     pending_loss_numerator = jnp.array(0.0)
     pending_masked_count = jnp.array(0.0)
     pending_energy_rises = jnp.array(0, dtype=jnp.int32)
+    pending_energy = jnp.array(0.0)
 
     while step < max_steps:
         progressed = False
@@ -846,9 +863,11 @@ def train_pcn_mlm(
                 )
                 pending_masked_count = step_metrics["num_masked_tokens"]
                 pending_energy_rises = step_metrics["pc_energy_rises"]
+                pending_energy = step_metrics["pc_total_energy"]
+                pending_micro_batches = 1
                 incremental_grad_norm = step_metrics["grad_norm_mean"]
             else:
-                grads, loss_numerator, masked_count, energy_rises = grad_fn(
+                grads, loss_numerator, masked_count, energy_rises, energy = grad_fn(
                     params, batch, step_key
                 )
                 scaled_grads = jax.tree_util.tree_map(
@@ -867,6 +886,7 @@ def train_pcn_mlm(
                 pending_loss_numerator = pending_loss_numerator + loss_numerator
                 pending_masked_count = pending_masked_count + masked_count
                 pending_energy_rises = pending_energy_rises + energy_rises
+                pending_energy = pending_energy + energy
                 pending_micro_batches += 1
                 micro_steps += 1
                 progressed = True
@@ -907,16 +927,18 @@ def train_pcn_mlm(
                     else optax.tree.norm(pending_grads)
                 )
                 logged_rises = int(pending_energy_rises)
+                logged_energy = float(pending_energy) / max(pending_micro_batches, 1)
             pending_grads = None
             pending_micro_batches = 0
             pending_loss_numerator = jnp.array(0.0)
             pending_masked_count = jnp.array(0.0)
             pending_energy_rises = jnp.array(0, dtype=jnp.int32)
+            pending_energy = jnp.array(0.0)
             if should_log:
                 print(
                     f"step={step} masked_loss={loss:.4f} grad_norm={grad_norm:.4e} "
                     f"param_norm={float(optax.tree.norm(params)):.4e} "
-                    f"energy_rises={logged_rises}"
+                    f"energy_rises={logged_rises} energy={logged_energy:.4e}"
                 )
             if checkpoint_path and step % checkpoint_interval == 0:
                 save_mlm_training_checkpoint(

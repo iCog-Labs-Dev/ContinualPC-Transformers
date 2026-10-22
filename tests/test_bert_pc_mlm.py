@@ -1,6 +1,7 @@
 """Tests for BERT-style predictive-coding MLM training support."""
 
 import os
+import re
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -873,6 +874,7 @@ def test_train_mlm_pc_incremental_logs_and_validates(rng_key, capsys):
     assert "step=2 masked_loss=" in out
     assert "grad_norm=" in out
     assert "energy_rises=" in out
+    assert re.search(r"energy_rises=\d+ energy=\S+", out)
     assert "step=1 validation_masked_loss=" in out
     assert tree_any_changed(params, updated_params)
 
@@ -1379,11 +1381,27 @@ def test_pc_bp_probe_uses_forward_update_rule(rng_key):
         assert float(row["pc_norm"]) == pytest.approx(float(expected), rel=1e-5)
 
 
+def test_gradient_step_returns_total_energy_of_final_state(rng_key):
+    structure = _spiking_mlm(eta_infer=0.0, infer_steps=6)
+    params = initialize_params(structure, rng_key)
+    batch = _two_sample_batch()
+
+    *_rest, energy = create_jit_gradient_step_pcn_mlm(structure, "initial")(
+        params, batch, rng_key
+    )
+    _grads, metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
+        params, batch, structure, rng_key, forward_updates="initial"
+    )
+
+    assert float(energy) > 0.0
+    assert np.isclose(float(energy), float(metrics["pc_total_energy"]), rtol=1e-6)
+
+
 def test_spiking_gradient_step_compiles_and_counts_rises(rng_key):
     structure = _spiking_mlm(eta_infer=0.5, spike_eta=3.0, infer_steps=6)
     params = initialize_params(structure, rng_key)
 
-    grads, loss_numerator, count, rises = create_jit_gradient_step_pcn_mlm(
+    grads, loss_numerator, count, rises, energy = create_jit_gradient_step_pcn_mlm(
         structure, "final"
     )(params, _two_sample_batch(), rng_key)
 
