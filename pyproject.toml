@@ -41,6 +41,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+hf = ["transformers>=4.40", "torch>=2.6"]
 dev = [
     "pytest>=7.0.0",
     "hypothesis>=6.0.0",
