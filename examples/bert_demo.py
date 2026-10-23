@@ -33,6 +33,7 @@ from fabricpc.core.inference import (
 from fabricpc.core.types import GraphParams, NodeParams
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import (
+    BERT_LN_EPS,
     copy_encoder_params,
     create_encoder_mlm_model,
     create_encoder_sentiment_classifier,
@@ -282,6 +283,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--mlp_dim", type=int, default=1024)
     parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument(
+        "--architecture",
+        choices=["encoder", "bert"],
+        default="encoder",
+        help="encoder: pre-LN with a final LayerNorm; bert: post-LN Hugging Face "
+        "BERT layout, e.g. for a checkpoint from convert_hf_bert.py",
+    )
+    parser.add_argument(
+        "--ln_eps",
+        type=float,
+        default=None,
+        help="LayerNorm epsilon for --architecture bert (default: the init or "
+        "probe checkpoint's, else 1e-12)",
+    )
+    parser.add_argument(
+        "--bert_residual_identity",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Identity node on each block's residual edge for --architecture bert "
+        "(default on; keeps spike-only PC exact)",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=None)
@@ -766,8 +788,36 @@ def _split_tiny_sentiment_data():
     return positives[:5] + negatives[:5], positives[5:] + negatives[5:]
 
 
-def _model_config(args: argparse.Namespace, vocab_size: int) -> dict[str, int | float]:
+def _resolved_ln_eps(args: argparse.Namespace) -> float | None:
+    if args.architecture != "bert":
+        return None
+    return BERT_LN_EPS if args.ln_eps is None else float(args.ln_eps)
+
+
+def _inherit_checkpoint_ln_eps(args: argparse.Namespace) -> None:
+    """Take ``--ln_eps`` from the init or probe checkpoint when it is not given."""
+    source = args.init_checkpoint or args.probe_checkpoint
+    if args.architecture != "bert" or args.ln_eps is not None or not source:
+        return
+    path = Path(source)
+    if path.exists():
+        args.ln_eps = json.loads(path.read_text()).get("config", {}).get("ln_eps")
+
+
+def _model_config(
+    args: argparse.Namespace, vocab_size: int
+) -> dict[str, int | float | str | None]:
+    architecture = (
+        {
+            "architecture": args.architecture,
+            "ln_eps": _resolved_ln_eps(args),
+            "residual_identity": args.bert_residual_identity is not False,
+        }
+        if args.architecture != "encoder"
+        else {}
+    )
     return {
+        **architecture,
         "depth": args.depth,
         "embed_dim": args.embed_dim,
         "num_heads": args.num_heads,
@@ -1074,17 +1124,44 @@ def _param_shapes(params: GraphParams) -> dict[tuple[str, str, str], tuple]:
 
 
 def load_init_params(
-    path: str, params: GraphParams, vocab: dict[str, int]
+    path: str,
+    params: GraphParams,
+    vocab: dict[str, int],
+    *,
+    architecture: str = "encoder",
+    seq_len: int | None = None,
+    ln_eps: float | None = None,
 ) -> GraphParams:
     """Return checkpoint params to start training from instead of ``params``.
 
-    The checkpoint must share the training vocab and hold every parameter of
-    the freshly built graph with the same shape. Nodes without parameters keep
-    their fresh entries, and the result follows the graph's node order.
+    The checkpoint must share the training vocab, ``architecture`` (``"encoder"``
+    when the checkpoint config has none) and ``seq_len`` when given, and hold
+    every parameter of the freshly built graph with the same shape; a recorded
+    ``ln_eps`` must equal ``ln_eps`` when that is given. Nodes
+    without parameters keep their fresh entries, and the result follows the
+    graph's node order.
     """
     checkpoint = load_checkpoint(path)
     if checkpoint is None:
         raise ValueError(f"Checkpoint not found: {path}")
+    config = checkpoint["config"]
+    checkpoint_architecture = config.get("architecture", "encoder")
+    if checkpoint_architecture != architecture:
+        raise ValueError(
+            f"{path}: checkpoint architecture {checkpoint_architecture!r} does not "
+            f"match --architecture {architecture!r}"
+        )
+    if seq_len is not None and config.get("seq_len", seq_len) != seq_len:
+        raise ValueError(
+            f"{path}: checkpoint seq_len {config['seq_len']} does not match "
+            f"--seq_len {seq_len}"
+        )
+    recorded_ln_eps = config.get("ln_eps")
+    if ln_eps is not None and recorded_ln_eps is not None and recorded_ln_eps != ln_eps:
+        raise ValueError(
+            f"{path}: checkpoint ln_eps {recorded_ln_eps} does not match "
+            f"--ln_eps {ln_eps}"
+        )
     if {str(k): int(v) for k, v in checkpoint["vocab"].items()} != vocab:
         raise ValueError(f"{path}: vocab does not match the training vocab")
     loaded = checkpoint["params"]
@@ -1116,6 +1193,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
     _validate_pc_incremental_args(args)
     _validate_pc_spiking_args(args)
     _validate_validation_sequence_cap(args)
+    _inherit_checkpoint_ln_eps(args)
     validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)
     train_loader, vocab, tokenizer_json = build_mlm_loader(
@@ -1141,15 +1219,27 @@ def run_pretrain(args: argparse.Namespace) -> None:
         position_init_std=args.position_init_std,
         transformer_init_std=args.transformer_init_std,
         pc_output_energy_scale=args.pc_output_energy_scale,
+        architecture=args.architecture,
+        ln_eps=args.ln_eps,
+        residual_identity=args.bert_residual_identity,
     )
     params = initialize_params(structure, rng_key)
+    checkpoint_checks = {
+        "architecture": args.architecture,
+        "seq_len": args.seq_len,
+        "ln_eps": _resolved_ln_eps(args),
+    }
     if args.init_checkpoint:
-        params = load_init_params(args.init_checkpoint, params, vocab)
+        params = load_init_params(
+            args.init_checkpoint, params, vocab, **checkpoint_checks
+        )
     if args.mode == "pc" and args.pc_inference == "spiking":
         report_spike_schedule(structure, args)
     if args.pc_bp_probe:
         if args.probe_checkpoint:
-            params = load_init_params(args.probe_checkpoint, params, vocab)
+            params = load_init_params(
+                args.probe_checkpoint, params, vocab, **checkpoint_checks
+            )
         run_pc_bp_probe(
             structure,
             params,
@@ -1292,6 +1382,8 @@ def run_finetune(args: argparse.Namespace) -> None:
         args.num_heads = checkpoint_config.get("num_heads", args.num_heads)
         args.mlp_dim = checkpoint_config.get("mlp_dim", args.mlp_dim)
         args.depth = checkpoint_config.get("depth", args.depth)
+        args.architecture = checkpoint_config.get("architecture", "encoder")
+        args.ln_eps = checkpoint_config.get("ln_eps")
     else:
         vocab = build_tiny_vocab(text for text, _ in TINY_SENTIMENT_DATASET)
     encode_fn = build_checkpoint_text_encoder(checkpoint, vocab)
@@ -1315,6 +1407,8 @@ def run_finetune(args: argparse.Namespace) -> None:
         embedding_init_std=args.embedding_init_std,
         position_init_std=args.position_init_std,
         transformer_init_std=args.transformer_init_std,
+        architecture=args.architecture,
+        ln_eps=args.ln_eps,
     )
 
     rng_key, scratch_key, transfer_key = jax.random.split(rng_key, 3)

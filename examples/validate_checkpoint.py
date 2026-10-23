@@ -370,6 +370,8 @@ def main():
         inference=InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0),
         use_attention_mask=True,
         dropout_rate=0.0,
+        architecture=config.get("architecture", "encoder"),
+        ln_eps=config.get("ln_eps"),
     )
 
     val_loader = build_val_loader(args, config, int(vocab_size), checkpoint["vocab"])
