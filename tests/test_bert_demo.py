@@ -14,6 +14,8 @@ from examples.bert_demo import (
     compute_gradient_accumulation_steps,
     derive_max_steps,
     deterministic_fraction_split,
+    load_checkpoint,
+    load_init_params,
     normalize_hf_dataset_args,
     parse_args,
     parse_validation_mask_seeds,
@@ -828,3 +830,145 @@ def test_spiking_probe_uses_forward_updates(capsys):
     mlp1 = next(line for line in out.splitlines() if "node=L0_mlp1" in line)
     assert "cosine_mean=1.0000" in head
     assert "cosine_mean=1.0000" in mlp1
+
+
+def _tiny_pretrain_argv(tmp_path, *extra):
+    return [
+        "--stage",
+        "pretrain",
+        "--data_source",
+        "tiny",
+        "--cache_dir",
+        str(tmp_path / "cache"),
+        "--seq_len",
+        "6",
+        "--embed_dim",
+        "16",
+        "--num_heads",
+        "4",
+        "--mlp_dim",
+        "32",
+        "--depth",
+        "1",
+        "--batch_size",
+        "2",
+        "--vocab_size",
+        "128",
+        "--max_steps",
+        "1",
+        "--validation_interval",
+        "0",
+        "--log_interval",
+        "0",
+        *extra,
+    ]
+
+
+def _save_tiny_checkpoint(tmp_path, name="source.json", *extra):
+    checkpoint = tmp_path / name
+    run_pretrain(
+        parse_args(
+            _tiny_pretrain_argv(
+                tmp_path, "--mode", "backprop", "--checkpoint", str(checkpoint), *extra
+            )
+        )
+    )
+    return checkpoint
+
+
+def test_load_init_params_round_trips_checkpoint_params(tmp_path):
+    pytest.importorskip("tokenizers")
+    checkpoint = _save_tiny_checkpoint(tmp_path)
+    saved = load_checkpoint(str(checkpoint))
+
+    loaded = load_init_params(str(checkpoint), saved["params"], saved["vocab"])
+
+    for node_name, node in saved["params"].nodes.items():
+        for name, value in node.weights.items():
+            np.testing.assert_array_equal(loaded.nodes[node_name].weights[name], value)
+
+
+def test_load_init_params_rejects_vocab_mismatch(tmp_path):
+    pytest.importorskip("tokenizers")
+    checkpoint = _save_tiny_checkpoint(tmp_path)
+    saved = load_checkpoint(str(checkpoint))
+    vocab = dict(saved["vocab"])
+    vocab["[EXTRA]"] = len(vocab)
+
+    with pytest.raises(ValueError, match="vocab does not match"):
+        load_init_params(str(checkpoint), saved["params"], vocab)
+
+
+def test_init_checkpoint_rejects_architecture_mismatch(tmp_path):
+    pytest.importorskip("tokenizers")
+    checkpoint = _save_tiny_checkpoint(tmp_path)
+    argv = _tiny_pretrain_argv(
+        tmp_path, "--mode", "backprop", "--init_checkpoint", str(checkpoint)
+    )
+    argv[argv.index("--mlp_dim") + 1] = "64"
+
+    with pytest.raises(ValueError, match="do not match the model"):
+        run_pretrain(parse_args(argv))
+
+
+def test_init_checkpoint_rejects_resume_from(tmp_path):
+    args = parse_args(
+        _tiny_pretrain_argv(
+            tmp_path,
+            "--mode",
+            "backprop",
+            "--init_checkpoint",
+            "a.json",
+            "--resume_from",
+            "b.json",
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        run_pretrain(args)
+
+
+@pytest.mark.parametrize("mode", ["backprop", "pc"])
+def test_pretrain_starts_from_init_checkpoint(tmp_path, capsys, mode):
+    pytest.importorskip("tokenizers")
+    checkpoint = _save_tiny_checkpoint(tmp_path, "source.json", "--seed", "7")
+    expected = summarize_init_diagnostics(load_checkpoint(str(checkpoint))["params"])
+    capsys.readouterr()
+    run_pretrain(parse_args(_tiny_pretrain_argv(tmp_path, "--mode", mode)))
+    assert f"param_std={expected['param_std']:.6f}" not in capsys.readouterr().out
+
+    run_pretrain(
+        parse_args(
+            _tiny_pretrain_argv(
+                tmp_path, "--mode", mode, "--init_checkpoint", str(checkpoint)
+            )
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert f"param_mean={expected['param_mean']:.6f}" in out
+    assert f"param_std={expected['param_std']:.6f}" in out
+
+
+def test_load_init_params_keeps_fresh_parameterless_nodes(tmp_path, monkeypatch):
+    pytest.importorskip("tokenizers")
+    import examples.bert_demo as bert_demo
+
+    checkpoint = _save_tiny_checkpoint(tmp_path)
+    saved = load_checkpoint(str(checkpoint))
+    params = saved["params"]
+    empty = [
+        n for n, node in params.nodes.items() if not node.weights and not node.biases
+    ]
+    assert empty
+    pruned = dict(
+        saved,
+        params=type(params)(
+            nodes={n: node for n, node in params.nodes.items() if n not in empty}
+        ),
+    )
+    monkeypatch.setattr(bert_demo, "load_checkpoint", lambda path: pruned)
+
+    loaded = load_init_params(str(checkpoint), params, saved["vocab"])
+
+    assert list(loaded.nodes) == list(params.nodes)
