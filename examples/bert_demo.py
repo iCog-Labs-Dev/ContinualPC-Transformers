@@ -388,6 +388,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Transfer checkpoint whose params --pc_bp_probe compares instead "
         "of a fresh initialisation",
     )
+    parser.add_argument(
+        "--init_checkpoint",
+        default=None,
+        help="Pretrain checkpoint whose params replace the fresh initialisation "
+        "before training starts; vocab and parameter shapes must match",
+    )
     parser.add_argument("--embedding_init_std", type=float, default=1.0)
     parser.add_argument("--position_init_std", type=float, default=0.02)
     parser.add_argument("--transformer_init_std", type=float, default=0.02)
@@ -1058,6 +1064,42 @@ def report_spike_schedule(structure, args: argparse.Namespace) -> int:
     return needed
 
 
+def _param_shapes(params: GraphParams) -> dict[tuple[str, str, str], tuple]:
+    return {
+        (node_name, collection, name): tuple(value.shape)
+        for node_name, node in params.nodes.items()
+        for collection in ("weights", "biases")
+        for name, value in getattr(node, collection).items()
+    }
+
+
+def load_init_params(
+    path: str, params: GraphParams, vocab: dict[str, int]
+) -> GraphParams:
+    """Return checkpoint params to start training from instead of ``params``.
+
+    The checkpoint must share the training vocab and hold every parameter of
+    the freshly built graph with the same shape. Nodes without parameters keep
+    their fresh entries, and the result follows the graph's node order.
+    """
+    checkpoint = load_checkpoint(path)
+    if checkpoint is None:
+        raise ValueError(f"Checkpoint not found: {path}")
+    if {str(k): int(v) for k, v in checkpoint["vocab"].items()} != vocab:
+        raise ValueError(f"{path}: vocab does not match the training vocab")
+    loaded = checkpoint["params"]
+    if _param_shapes(loaded) != _param_shapes(params):
+        raise ValueError(
+            f"{path}: parameters do not match the model built from the "
+            "current architecture flags"
+        )
+    return GraphParams(
+        nodes={
+            name: loaded.nodes.get(name, node) for name, node in params.nodes.items()
+        }
+    )
+
+
 def run_pretrain(args: argparse.Namespace) -> None:
     if args.pc_bp_probe < 0:
         raise ValueError("--pc_bp_probe must be non-negative")
@@ -1065,6 +1107,10 @@ def run_pretrain(args: argparse.Namespace) -> None:
         raise ValueError("--pc_bp_probe needs --mode pc")
     if args.probe_checkpoint and not args.pc_bp_probe:
         raise ValueError("--probe_checkpoint is only used with --pc_bp_probe")
+    if args.init_checkpoint and (args.resume_from or args.probe_checkpoint):
+        raise ValueError(
+            "--init_checkpoint cannot be combined with --resume_from or --probe_checkpoint"
+        )
     if args.mode == "pc" and args.pc_output_energy_scale <= 0.0:
         raise ValueError("--pc_output_energy_scale must be positive for PC pretraining")
     _validate_pc_incremental_args(args)
@@ -1097,14 +1143,13 @@ def run_pretrain(args: argparse.Namespace) -> None:
         pc_output_energy_scale=args.pc_output_energy_scale,
     )
     params = initialize_params(structure, rng_key)
+    if args.init_checkpoint:
+        params = load_init_params(args.init_checkpoint, params, vocab)
     if args.mode == "pc" and args.pc_inference == "spiking":
         report_spike_schedule(structure, args)
     if args.pc_bp_probe:
         if args.probe_checkpoint:
-            checkpoint = load_checkpoint(args.probe_checkpoint)
-            if checkpoint is None:
-                raise ValueError(f"Checkpoint not found: {args.probe_checkpoint}")
-            params = checkpoint["params"]
+            params = load_init_params(args.probe_checkpoint, params, vocab)
         run_pc_bp_probe(
             structure,
             params,
@@ -1127,6 +1172,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         "configured_embedding_init_std": args.embedding_init_std,
         "configured_position_init_std": args.position_init_std,
         "configured_transformer_init_std": args.transformer_init_std,
+        "init_checkpoint": args.init_checkpoint,
     }
     max_steps = derive_max_steps(args, train_loader)
     gradient_accumulation_steps = compute_gradient_accumulation_steps(args)
