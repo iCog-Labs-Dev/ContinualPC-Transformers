@@ -330,7 +330,9 @@ def load_run(
     path = Path(run_dir)
     run_config = json.loads((path / "run_config.json").read_text())
     values = dict(run_config["config"])
-    values["domains"] = tuple(values["domains"])
+    for key in ("domains", "gate_modules", "gate_source"):
+        if key in values:
+            values[key] = tuple(values[key])
     config = RunConfig(**values, output_dir=str(path))
     if config.training != "sequential":
         raise ValueError(

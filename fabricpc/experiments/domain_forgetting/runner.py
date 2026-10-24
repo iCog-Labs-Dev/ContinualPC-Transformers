@@ -27,6 +27,11 @@ With ``training="joint"`` the run is the multi-task upper bound instead: one
 stage trains on the concatenated domain streams for ``len(domains) *
 tokens_per_domain`` tokens under one schedule, with windows shuffled across
 domains, so each domain is seen for its full budget within one update.
+
+With ``gate`` other than ``"none"`` every stage from 2 on multiplies each
+module's AdamW update by a fixed per-module multiplier (``gates.GatePlan``),
+chained after the optimizer so that a multiplier of 0 freezes the module;
+frozen modules' gradients are also zeroed before the global-norm clip.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ import math
 import platform
 import shutil
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -87,6 +92,7 @@ from fabricpc.experiments.forgetting_benchmark.sequential_trainer import (
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.training.optimizers import build_warmup_cosine_adamw
+from fabricpc.training.plasticity_gates import scale_module_updates
 from fabricpc.training.train import _convert_batch
 from fabricpc.training.train_backprop import (
     _apply_optimizer_update_when_masked,
@@ -110,6 +116,16 @@ BERT_MINI_SHAPE = {
 MODES = ("backprop", "pc")
 TRAINING = ("sequential", "joint")
 JOINT_STAGE = "joint"
+GATES = ("none", "map", "random", "inverse", "type", "oracle", "freeze")
+GATE_SETTINGS = {
+    "none": (),
+    "map": ("gate_beta", "gate_map_windows"),
+    "inverse": ("gate_beta", "gate_map_windows"),
+    "type": ("gate_beta", "gate_map_windows"),
+    "random": ("gate_beta", "gate_map_windows", "gate_seed"),
+    "oracle": ("gate_beta", "gate_source"),
+    "freeze": ("gate_modules",),
+}
 PC_INFERENCE = ("spiking", "standard")
 DEFAULT_FORWARD_UPDATES = {"spiking": "initial", "standard": "none"}
 METRICS = ("masked_ce", "masked_perplexity", "masked_accuracy")
@@ -147,6 +163,7 @@ RUN_ARTIFACT_FILES = (
     "runtime.json",
     "pc_bp_agreement.json",
     "alignment.jsonl",
+    "gates.jsonl",
     *ANALYSIS_FILES,
 )
 RUN_ARTIFACT_PATTERNS = ("stage_*.npz", "training_log_stage_*.jsonl")
@@ -190,6 +207,12 @@ class RunConfig:
     pc_alignment_batches: int = 0
     init_perturbation: float = 0.0
     init_perturbation_seed: int = 0
+    gate: str = "none"
+    gate_beta: float = 1.0
+    gate_modules: tuple[str, ...] = ()
+    gate_source: tuple[str, ...] = ()
+    gate_map_windows: int = 256
+    gate_seed: int = 0
     log_interval: int = 10
 
     def validate(self) -> None:
@@ -231,6 +254,46 @@ class RunConfig:
                 raise ValueError("pc_output_energy_scale must be positive")
             if self.pc_inference == "standard":
                 self._validate_standard()
+        self._validate_gate()
+
+    def _validate_gate(self) -> None:
+        """Each gate takes only its own settings, and gates need sequential runs.
+
+        Freeze module and group names are resolved against the graph when the
+        run starts (``gates.GatePlan``).
+        """
+        if self.gate not in GATES:
+            raise ValueError(f"gate must be one of {GATES}, got {self.gate!r}")
+        used = GATE_SETTINGS[self.gate]
+        unused = [
+            name
+            for name, default in GATE_DEFAULTS.items()
+            if name not in used and _setting(getattr(self, name)) != default
+        ]
+        if unused:
+            raise ValueError(f"{', '.join(unused)} do not apply to gate {self.gate!r}")
+        if self.gate == "none":
+            return
+        if self.training != "sequential":
+            raise ValueError("gates need training 'sequential'")
+        if "gate_beta" in used and not (
+            math.isfinite(self.gate_beta) and self.gate_beta > 0
+        ):
+            raise ValueError("gate_beta must be finite and positive")
+        if "gate_map_windows" in used and self.gate_map_windows < 1:
+            raise ValueError("gate_map_windows must be positive")
+        if self.gate_seed < 0:
+            raise ValueError("gate_seed must be non-negative")
+        if self.gate == "freeze":
+            if not self.gate_modules:
+                raise ValueError("gate 'freeze' needs gate_modules")
+            if len(set(self.gate_modules)) != len(self.gate_modules):
+                raise ValueError("gate_modules has duplicates")
+        if self.gate == "oracle":
+            if not self.gate_source:
+                raise ValueError("gate 'oracle' needs gate_source run directories")
+            if len(set(self.gate_source)) != len(self.gate_source):
+                raise ValueError("gate_source has duplicates")
 
     def _validate_standard(self) -> None:
         """Standard PC needs explicit inference settings and no spike flags."""
@@ -287,16 +350,33 @@ class RunConfig:
     def identity(self) -> dict[str, Any]:
         """The settings that must match for a run to be resumed.
 
-        ``training`` is left out for sequential runs, so their identity is
-        unchanged from before joint training existed.
+        ``training`` is left out for sequential runs and every gate setting
+        for ungated runs, so their identity is unchanged from before joint
+        training and gates existed.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
             values.pop(key)
         if values["training"] == "sequential":
             values.pop("training")
+        if values["gate"] == "none":
+            for key in ("gate", *GATE_DEFAULTS):
+                values.pop(key)
+        else:
+            values["gate_modules"] = list(self.gate_modules)
+            values["gate_source"] = list(self.gate_source)
         values["domains"] = list(self.domains)
         return values
+
+
+GATE_DEFAULTS: dict[str, Any] = {
+    f.name: f.default for f in fields(RunConfig) if f.name.startswith("gate_")
+}
+
+
+def _setting(value: Any) -> Any:
+    """Return lists as tuples so settings compare equal to their defaults."""
+    return tuple(value) if isinstance(value, list) else value
 
 
 @dataclass
@@ -465,12 +545,18 @@ def num_stage_updates(tokens_per_domain: int, batch_size: int, seq_len: int) -> 
 
 
 def build_stage_optimizer(
-    config: RunConfig, num_updates: int
+    config: RunConfig,
+    num_updates: int,
+    multipliers: Mapping[str, float] | None = None,
 ) -> tuple[optax.GradientTransformation, dict[str, Any]]:
     """AdamW with linear warmup then cosine decay to ``min_lr_ratio * lr``.
 
     Mirrors ``build_optimizer`` in ``examples/bert_demo.py`` (global-norm clip
     chained before ``build_warmup_cosine_adamw``) and adds the decay floor.
+    ``multipliers`` chains ``scale_module_updates`` after AdamW, so it scales
+    each module's final update, weight decay included; modules with
+    multiplier 0 also get zero gradients before the clip, so the clip's
+    global norm covers only the trainable modules.
     """
     warmup_steps = min(num_updates, int(round(config.warmup_fraction * num_updates)))
     optimizer = build_warmup_cosine_adamw(
@@ -483,7 +569,7 @@ def build_stage_optimizer(
     )
     if config.clip_norm > 0:
         optimizer = optax.chain(optax.clip_by_global_norm(config.clip_norm), optimizer)
-    return optimizer, {
+    info: dict[str, Any] = {
         "type": "warmup_cosine_adamw",
         "lr": config.lr,
         "min_lr": config.min_lr_ratio * config.lr,
@@ -493,6 +579,13 @@ def build_stage_optimizer(
         "clip_norm": config.clip_norm,
         "adam_eps": config.optimizer_eps,
     }
+    if multipliers is not None:
+        frozen = {name: 0.0 for name, value in multipliers.items() if value == 0.0}
+        optimizer = optax.chain(optimizer, scale_module_updates(multipliers))
+        if frozen:
+            optimizer = optax.chain(scale_module_updates(frozen), optimizer)
+        info["module_multipliers"] = {k: float(v) for k, v in multipliers.items()}
+    return optimizer, info
 
 
 def flatten_params(params: GraphParams) -> dict[str, np.ndarray]:
@@ -830,6 +923,7 @@ def train_stage(
     stage: int,
     special_ids: Mapping[str, int],
     gradient_fn: GradientFn,
+    multipliers: Mapping[str, float] | None = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any], list[dict[str, Any]]]:
     """Train one domain from ``params`` with a fresh optimizer and schedule.
@@ -839,7 +933,9 @@ def train_stage(
     micro-batch gradients (``accumulate_gradients``); the batcher reshuffles
     and restarts when an epoch ends. Batches, MLM masks
     and dropout keys depend only on ``seed`` and ``stage``, so both modes see
-    the same ones. Returns the params, the exposure record and the log.
+    the same ones. ``multipliers`` scales each module's update
+    (``build_stage_optimizer``). Returns the params, the exposure record and
+    the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
     vocab_size = int(structure.nodes[structure.task_map["y"]].node_info.shape[-1])
@@ -862,7 +958,7 @@ def train_stage(
     )
     if len(batcher) == 0:
         raise ValueError("domain stream is too short for one micro-batch")
-    optimizer, optimizer_info = build_stage_optimizer(config, num_updates)
+    optimizer, optimizer_info = build_stage_optimizer(config, num_updates, multipliers)
     opt_state = optimizer.init(params)
     update_fn = jax.jit(
         lambda p, o, g, c: _apply_optimizer_update_when_masked(
@@ -1072,6 +1168,29 @@ def _stage_is_complete(
     return params
 
 
+def _gate_record_matches(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    stage: int,
+    gate: str,
+    parent_sha: str | None,
+    exposure: Mapping[str, Any] | None,
+) -> bool:
+    """True when ``stage`` has one gate record that matches what it trained with.
+
+    The record must start from ``parent_sha`` and its multipliers must be the
+    ``module_multipliers`` of the stage's optimizer (absent when ungated).
+    """
+    found = [r for r in records if int(r["stage"]) == stage]
+    if len(found) != 1 or exposure is None:
+        return False
+    record = found[0]
+    if record.get("gate") != gate or record.get("params_sha256") != parent_sha:
+        return False
+    used = (exposure.get("optimizer") or {}).get("module_multipliers")
+    return used == (record["multipliers"] if record.get("gated") else None)
+
+
 def _matrix(
     records: Mapping[tuple[int, str], Mapping[str, Any]],
     domains: Sequence[str],
@@ -1131,7 +1250,9 @@ def run_domain_forgetting(
     end params on N fixed batches of its domain to ``alignment.jsonl``.
     With ``training="joint"`` there is one trained stage, named ``joint``, on
     all domains mixed; ``forgetting_matrices.json`` is not written and the
-    summary holds ``summarize_joint``'s per-domain scores.
+    summary holds ``summarize_joint``'s per-domain scores. With a ``gate``,
+    every trained stage appends its module multipliers (``GatePlan.record``)
+    to ``gates.jsonl`` and the run config holds ``GatePlan.describe()``.
     """
     config.validate()
     domains = list(config.domains)
@@ -1161,6 +1282,13 @@ def run_domain_forgetting(
         base.params, config.init_perturbation, config.init_perturbation_seed
     )
     initial_params_sha = params_hash(initial_params)
+    gate_plan = None
+    if config.gate != "none":
+        from fabricpc.experiments.domain_forgetting.gates import GatePlan
+
+        gate_plan = GatePlan(
+            config, base, {name: cache.train for name, cache in caches.items()}
+        )
 
     run_config = {
         "config": config.identity(),
@@ -1198,6 +1326,8 @@ def run_domain_forgetting(
             config.stage_tokens, config.batch_size, seq_len
         ),
     }
+    if gate_plan is not None:
+        run_config["gate"] = gate_plan.describe()
     run_config_path = output / "run_config.json"
     previous_config = _read_json(run_config_path) if resume else None
     if previous_config is not None and json.loads(
@@ -1225,6 +1355,8 @@ def run_domain_forgetting(
     previous_runtime = (_read_json(output / "runtime.json") if resume else None) or {}
     previous_exposure = (_read_json(output / "exposure.json") if resume else None) or {}
     previous_alignment = _read_jsonl(output / "alignment.jsonl") if resume else []
+    previous_gates = _read_jsonl(output / "gates.jsonl") if resume else []
+    gate_records: list[dict[str, Any]] = []
 
     gradient_fn = make_gradient_fn(
         config.mode, base.structure, config.pc_forward_updates, config.pc_inference
@@ -1303,6 +1435,15 @@ def run_domain_forgetting(
             if stage == 0 and reused is not None:
                 if params_hash(reused) != initial_params_sha:
                     reused = None
+            if reused is not None and gate_plan is not None and domain is not None:
+                if not _gate_record_matches(
+                    previous_gates,
+                    stage=stage,
+                    gate=config.gate,
+                    parent_sha=parent_sha,
+                    exposure=previous_exposure.get(domain),
+                ):
+                    reused = None
             reusing = reused is not None
         if reused is not None:
             params = reused
@@ -1320,6 +1461,7 @@ def run_domain_forgetting(
             alignment_records.extend(
                 r for r in previous_alignment if int(r["stage"]) == stage
             )
+            gate_records.extend(r for r in previous_gates if int(r["stage"]) == stage)
             if verbose:
                 print(f"stage={stage} reused params_sha256={parent_sha[:12]}")
             continue
@@ -1327,7 +1469,21 @@ def run_domain_forgetting(
         initial_sha = params_hash(params)
         train_seconds = 0.0
         alignment_seconds = 0.0
+        multipliers = None
         if domain is not None:
+            if gate_plan is not None:
+                gate_record = gate_plan.record(
+                    stage, domain, params, caches[domain].train
+                )
+                gate_records.append(gate_record)
+                _write_jsonl(output / "gates.jsonl", gate_records)
+                if gate_record["gated"]:
+                    multipliers = gate_record["multipliers"]
+                    if verbose:
+                        print(
+                            f"stage={stage} gate={config.gate} "
+                            + " ".join(f"{m}={v:.3g}" for m, v in multipliers.items())
+                        )
             if alignment_fn is not None:
                 alignment_seconds = record_alignment(stage, domain, "start", params)
             train_start = time.time()
@@ -1343,6 +1499,7 @@ def run_domain_forgetting(
                 stage=stage,
                 special_ids=base.special_ids,
                 gradient_fn=gradient_fn,
+                multipliers=multipliers,
                 verbose=verbose,
             )
             train_seconds = time.time() - train_start
@@ -1393,6 +1550,8 @@ def run_domain_forgetting(
         }
         if alignment_fn is not None:
             stage_runtime[str(stage)]["alignment_seconds"] = alignment_seconds
+        if gate_plan is not None and domain is not None:
+            stage_runtime[str(stage)]["gate_seconds"] = gate_records[-1]["seconds"]
         atomic_write_json(output / "exposure.json", exposure)
         atomic_write_json(
             manifest_path,
