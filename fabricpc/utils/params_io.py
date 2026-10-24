@@ -3,13 +3,18 @@
 ``save_params("model.npz", params, metadata)`` writes the arrays to
 ``model.npz`` and ``model.json``. The sidecar records the file format and
 version, a schema mapping every ``(node, collection, name)`` parameter to its
-archive key, a SHA-256 digest of the archive and free-form JSON ``metadata``
-such as a vocabulary or model config. Nothing is pickled, so loading never
-executes code from the file.
+archive key and dtype, a SHA-256 digest and free-form JSON ``metadata`` such
+as a vocabulary or model config. The digest covers the archive bytes and the
+schema, not the metadata. Nothing is pickled, so loading never executes code
+from the file.
+
+Each file is replaced atomically, but the pair is not: a crash between the
+two writes leaves a new archive beside the old sidecar, which the digest
+check in ``load_params`` then rejects.
 
 ``load_params(path, structure)`` checks the file against the parameters a
 fresh ``initialize_params(structure, ...)`` would create, so a file only loads
-into a graph with the same parameter names and shapes.
+into a graph with the same parameter names, shapes and dtypes.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from fabricpc.graph_initialization import initialize_params
 PARAMS_FORMAT = "fabricpc-params"
 PARAMS_FORMAT_VERSION = 1
 _COLLECTIONS = ("weights", "biases")
+_SUFFIXES = (".npz", ".json")
 
 PathLike = Union[str, os.PathLike]
 
@@ -39,11 +45,19 @@ PathLike = Union[str, os.PathLike]
 def params_paths(path: PathLike) -> Tuple[Path, Path]:
     """Return the ``(.npz archive, .json sidecar)`` paths for ``path``.
 
-    Any suffix of ``path`` is replaced, so ``model``, ``model.npz`` and
-    ``model.json`` all name the same pair of files.
+    A ``.npz`` or ``.json`` suffix is stripped and any other suffix kept, so
+    ``model``, ``model.npz`` and ``model.json`` name the same pair of files
+    and ``bert.base`` names ``bert.base.npz`` and ``bert.base.json``.
     """
     path = Path(path)
-    return path.with_suffix(".npz"), path.with_suffix(".json")
+    if path.suffix in _SUFFIXES:
+        path = path.with_suffix("")
+    return path.with_name(f"{path.name}.npz"), path.with_name(f"{path.name}.json")
+
+
+def _digest(archive: bytes, schema: Mapping[str, Any]) -> str:
+    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(archive + canonical.encode("utf-8")).hexdigest()
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -70,10 +84,12 @@ def save_params(
 
     Each file is written to a temporary file and renamed into place, so an
     interrupted save never leaves a truncated file. The sidecar's digest lets
-    ``load_params`` reject an archive that does not belong to it.
+    ``load_params`` reject an archive that does not belong to it. Dtypes numpy
+    cannot store natively, such as ``bfloat16``, are recorded in the schema
+    and restored on load.
 
     Args:
-        path: Destination; its suffix is replaced by ``.npz`` and ``.json``.
+        path: Destination; see ``params_paths``.
         params: Parameters to save.
         metadata: JSON-serialisable data stored with the parameters.
 
@@ -81,18 +97,20 @@ def save_params(
         The ``(archive, sidecar)`` paths written.
 
     Raises:
-        TypeError: If ``metadata`` is not JSON-serialisable.
+        TypeError: If ``metadata`` holds a value JSON cannot represent.
+        ValueError: If ``metadata`` holds a NaN or infinite float.
     """
     archive_path, sidecar_path = params_paths(path)
     arrays: List[np.ndarray] = []
-    schema: Dict[str, Dict[str, Dict[str, str]]] = {}
+    schema: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {}
     for node_name, node in params.nodes.items():
-        entry: Dict[str, Dict[str, str]] = {}
+        entry: Dict[str, Dict[str, Dict[str, str]]] = {}
         for collection in _COLLECTIONS:
-            keys: Dict[str, str] = {}
+            keys: Dict[str, Dict[str, str]] = {}
             for name, value in getattr(node, collection).items():
-                keys[name] = f"arr_{len(arrays)}"
-                arrays.append(np.asarray(value))
+                array = np.asarray(value)
+                keys[name] = {"key": f"arr_{len(arrays)}", "dtype": array.dtype.name}
+                arrays.append(array)
             entry[collection] = keys
         schema[node_name] = entry
 
@@ -103,7 +121,7 @@ def save_params(
         "format": PARAMS_FORMAT,
         "version": PARAMS_FORMAT_VERSION,
         "archive": archive_path.name,
-        "archive_sha256": hashlib.sha256(archive).hexdigest(),
+        "sha256": _digest(archive, schema),
         "schema": schema,
         "metadata": dict(metadata or {}),
     }
@@ -133,17 +151,48 @@ def _read_sidecar(sidecar_path: Path) -> Dict[str, Any]:
             f"{sidecar_path}: unsupported {PARAMS_FORMAT} version "
             f"{sidecar.get('version')!r}, expected {PARAMS_FORMAT_VERSION}"
         )
+    problem = _schema_problem(sidecar)
+    if problem:
+        raise ValueError(f"{sidecar_path}: malformed sidecar, {problem}")
     return sidecar
+
+
+def _schema_problem(sidecar: Dict[str, Any]) -> Optional[str]:
+    """Describe the first structural problem of a sidecar, or return None."""
+    if not isinstance(sidecar.get("sha256"), str):
+        return "'sha256' must be a string"
+    if not isinstance(sidecar.get("metadata"), dict):
+        return "'metadata' must be an object"
+    schema = sidecar.get("schema")
+    if not isinstance(schema, dict):
+        return "'schema' must be an object"
+    for node_name, entry in schema.items():
+        if not isinstance(entry, dict):
+            return f"schema entry {node_name!r} must be an object"
+        unknown = sorted(set(entry) - set(_COLLECTIONS))
+        if unknown:
+            return f"{node_name!r} has unknown collections {unknown}"
+        for collection, params in entry.items():
+            if not isinstance(params, dict):
+                return f"{node_name}.{collection} must be an object"
+            for name, spec in params.items():
+                if not (
+                    isinstance(spec, dict)
+                    and isinstance(spec.get("key"), str)
+                    and isinstance(spec.get("dtype"), str)
+                ):
+                    return f"{node_name}.{collection}.{name} needs string 'key' and 'dtype'"
+    return None
 
 
 def _expected_shapes(
     structure: GraphStructure, rng_key: jax.Array
-) -> Dict[str, Dict[str, Dict[str, Tuple[int, ...]]]]:
+) -> Dict[str, Dict[str, Dict[str, jax.ShapeDtypeStruct]]]:
     abstract = jax.eval_shape(lambda key: initialize_params(structure, key), rng_key)
     return {
         node_name: {
             collection: {
-                name: tuple(value.shape)
+                name: value
                 for name, value in getattr(
                     abstract.nodes[node_name], collection
                 ).items()
@@ -154,6 +203,28 @@ def _expected_shapes(
     }
 
 
+def _read_array(
+    stored: Any, spec: Mapping[str, str], reference: jax.ShapeDtypeStruct
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """Return ``(array, None)``, or ``(None, problem)`` if it does not fit."""
+    if spec["key"] not in stored.files:
+        return None, "not in the archive"
+    value = stored[spec["key"]]
+    try:
+        dtype = jnp.dtype(spec["dtype"])
+    except TypeError:
+        return None, f"unknown dtype {spec['dtype']!r}"
+    if value.dtype != dtype:
+        if value.dtype.kind != "V" or value.dtype.itemsize != dtype.itemsize:
+            return None, f"stored as {value.dtype}, schema says {dtype}"
+        value = value.view(dtype)
+    if tuple(value.shape) != tuple(reference.shape):
+        return None, f"shape {tuple(value.shape)}, expected {tuple(reference.shape)}"
+    if value.dtype != reference.dtype:
+        return None, f"dtype {value.dtype}, expected {reference.dtype}"
+    return value, None
+
+
 def load_params(
     path: PathLike,
     structure: GraphStructure,
@@ -162,14 +233,15 @@ def load_params(
     """Load parameters saved by ``save_params`` for ``structure``.
 
     The file must hold exactly the parameters ``initialize_params(structure,
-    rng_key)`` creates, with the same names and shapes. Nodes without
+    rng_key)`` creates, with the same names, shapes and dtypes. Nodes without
     parameters may be absent from the file and get empty entries. The result
     follows the order of ``structure.nodes``.
 
     Args:
         path: The archive, the sidecar, or either without a suffix.
         structure: Graph to load the parameters into.
-        rng_key: Key for the reference initialisation; only shapes are used.
+        rng_key: Key for the reference initialisation; only shapes and dtypes
+            are used.
 
     Returns:
         ``(params, metadata)``.
@@ -177,18 +249,19 @@ def load_params(
     Raises:
         FileNotFoundError: If either file is missing.
         ValueError: If the files are not a matching pair of this format, or
-            any node or parameter is missing, unexpected or mis-shaped.
+            any node or parameter is missing, unexpected, mis-shaped or of
+            another dtype.
     """
     archive_path, sidecar_path = params_paths(path)
     sidecar = _read_sidecar(sidecar_path)
     if not archive_path.exists():
         raise FileNotFoundError(f"params archive not found: {archive_path}")
     archive = archive_path.read_bytes()
-    if hashlib.sha256(archive).hexdigest() != sidecar.get("archive_sha256"):
+    schema: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = sidecar["schema"]
+    if _digest(archive, schema) != sidecar["sha256"]:
         raise ValueError(
             f"{archive_path} does not match the digest recorded in {sidecar_path}"
         )
-    schema: Dict[str, Dict[str, Dict[str, str]]] = sidecar["schema"]
     expected = _expected_shapes(
         structure, jax.random.PRNGKey(0) if rng_key is None else rng_key
     )
@@ -207,28 +280,22 @@ def load_params(
                 continue
             loaded: Dict[str, Dict[str, jnp.ndarray]] = {}
             for collection in _COLLECTIONS:
-                keys = schema[node_name].get(collection, {})
+                specs = schema[node_name].get(collection, {})
                 shapes = node_shapes[collection]
                 where = f"{node_name}.{collection}"
-                missing = sorted(set(shapes) - set(keys))
-                extra = sorted(set(keys) - set(shapes))
+                missing = sorted(set(shapes) - set(specs))
+                extra = sorted(set(specs) - set(shapes))
                 if missing:
                     problems.append(f"{where}: missing {missing}")
                 if extra:
                     problems.append(f"{where}: unexpected {extra}")
                 loaded[collection] = {}
-                for name in shapes:
-                    if name not in keys:
+                for name, reference in shapes.items():
+                    if name not in specs:
                         continue
-                    if keys[name] not in stored.files:
-                        problems.append(f"{where}.{name}: not in the archive")
-                        continue
-                    value = stored[keys[name]]
-                    if tuple(value.shape) != shapes[name]:
-                        problems.append(
-                            f"{where}.{name}: shape {tuple(value.shape)}, "
-                            f"expected {shapes[name]}"
-                        )
+                    value, problem = _read_array(stored, specs[name], reference)
+                    if problem:
+                        problems.append(f"{where}.{name}: {problem}")
                         continue
                     loaded[collection][name] = jnp.asarray(value)
             nodes[node_name] = NodeParams(
