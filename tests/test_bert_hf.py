@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from fabricpc.core.inference import InferenceSGDNormClip
-from fabricpc.core.types import GraphParams
+from fabricpc.core.types import GraphParams, NodeParams
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import (
     AddPositionEmbeddingNode,
@@ -400,11 +400,9 @@ def test_bert_builder_layout_and_argument_checks():
     assert {
         "L1_mlp2->mlm_transform:in",
         "mlm_transform->mlm_head:in",
-        "L0_mha->L0_residual:in",
-        "L0_residual->L0_mlp2:residual",
+        "L0_mha->L0_mlp2:residual",
     } <= set(structure.edges)
-    assert "L0_mha->L0_mlp2:residual" not in structure.edges
-    assert params.nodes["L0_residual"].weights == {}
+    assert not any(name.endswith("_residual") for name in structure.nodes)
     assert all(
         node.node_info.scaling_config is None for node in structure.nodes.values()
     )
@@ -422,14 +420,17 @@ def test_bert_builder_layout_and_argument_checks():
 
 
 def test_bert_residual_identity_is_optional_and_bert_only():
-    with_identity = _tiny_mlm(architecture="bert")
-    direct = _tiny_mlm(architecture="bert", residual_identity=False)
+    with_identity = _tiny_mlm(architecture="bert", residual_identity=True)
+    direct = _tiny_mlm(architecture="bert")
     key = jax.random.PRNGKey(0)
 
     assert {"L0_residual", "L1_residual"} <= set(with_identity.nodes)
-    assert not any(name.endswith("_residual") for name in direct.nodes)
-    assert "L0_mha->L0_mlp2:residual" in direct.edges
+    assert {"L0_mha->L0_residual:in", "L0_residual->L0_mlp2:residual"} <= set(
+        with_identity.edges
+    )
+    assert "L0_mha->L0_mlp2:residual" not in with_identity.edges
     with_params = initialize_params(with_identity, key)
+    assert with_params.nodes["L0_residual"] == NodeParams(weights={}, biases={})
     direct_params = initialize_params(direct, key)
     assert {
         name: layout
@@ -560,6 +561,7 @@ def test_bert_demo_trains_one_step_from_converted_params(
     saved = read_params_metadata(out)
     assert saved["config"]["architecture"] == "bert"
     assert saved["config"]["ln_eps"] == 1e-12
+    assert saved["config"]["residual_identity"] is False
     assert saved["tokenizer_json"] == read_params_metadata(archive)["tokenizer_json"]
     structure = demo.build_model(
         demo.parse_args(DEMO_SMALL + ["--architecture", "bert"]),
@@ -586,9 +588,13 @@ def test_bert_demo_rejects_architecture_and_ln_eps_mismatch(
     sidecar.write_text(json.dumps(data))
     bert_argv = argv + ["--architecture", "bert"]
     assert demo.resolve_ln_eps(demo.parse_args(bert_argv)) == 1e-6
-    with pytest.raises(ValueError, match="ln_eps 1e-06 does not match --ln_eps 1e-12"):
+    with pytest.raises(
+        ValueError, match="ln_eps 1e-06 does not match this run's ln_eps 1e-12"
+    ):
         demo.main(bert_argv + ["--ln_eps", "1e-12"])
-    with pytest.raises(ValueError, match="seq_len 16 does not match --seq_len 8"):
+    with pytest.raises(
+        ValueError, match="seq_len 16 does not match this run's seq_len 8"
+    ):
         demo.main(bert_argv + ["--seq_len", "8"])
 
 
@@ -600,3 +606,23 @@ def test_bert_demo_flag_checks(demo, tmp_path):
     args = demo.parse_args(DEMO_SMALL + ["--architecture", "bert"])
     assert demo.resolve_ln_eps(args) == 1e-12
     assert "mlm_transform" in demo.build_model(args, vocab_size=30).nodes
+
+
+def test_bert_demo_residual_identity_flag(demo, converted_bert, tmp_path):
+    archive, _ = converted_bert
+    with pytest.raises(SystemExit):
+        demo.parse_args(["--residual_identity"])
+    args = demo.parse_args(
+        DEMO_SMALL + ["--architecture", "bert", "--residual_identity"]
+    )
+    assert "L0_residual" in demo.build_model(args, vocab_size=30).nodes
+    out = tmp_path / "trained.npz"
+
+    demo.main(
+        DEMO_SMALL
+        + ["--num_epochs", "0.2", "--architecture", "bert", "--residual_identity"]
+        + ["--init_params", str(archive), "--tokenizer", "checkpoint"]
+        + ["--save_params", str(out)]
+    )
+
+    assert read_params_metadata(out)["config"]["residual_identity"] is True
