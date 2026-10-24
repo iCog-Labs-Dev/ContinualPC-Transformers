@@ -15,6 +15,7 @@ from typing import Dict, Mapping
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from fabricpc.core.types import GraphParams, GraphState, GraphStructure, NodeParams
 
@@ -69,7 +70,7 @@ def surprise_gates(
 
 
 def scale_node_updates(
-    updates: GraphParams, gates: Mapping[str, jax.Array]
+    updates: GraphParams, gates: Mapping[str, jax.Array | float]
 ) -> GraphParams:
     """Multiply every weight and bias leaf of node i by gates[i].
 
@@ -86,6 +87,38 @@ def scale_node_updates(
         gate = gates[name]
         nodes[name] = jax.tree_util.tree_map(lambda x: x * gate, node_updates)
     return GraphParams(nodes=nodes)
+
+
+def scale_module_updates(
+    multipliers: Mapping[str, float],
+) -> optax.GradientTransformation:
+    """Stateless transform multiplying each node's update leaves by its multiplier.
+
+    Nodes absent from ``multipliers`` get 1.0; a multiplier of 0 zeroes the
+    whole update, so chained after AdamW the node is frozen exactly. Names
+    that are not nodes of the params raise at ``init`` and at ``update``.
+    """
+    values = {str(name): float(value) for name, value in multipliers.items()}
+
+    def check(tree: GraphParams) -> None:
+        unknown = sorted(set(values) - set(tree.nodes))
+        if unknown:
+            raise ValueError(f"multipliers for unknown nodes {unknown}")
+
+    def init_fn(params: GraphParams) -> optax.EmptyState:
+        check(params)
+        return optax.EmptyState()
+
+    def update_fn(
+        updates: GraphParams,
+        state: optax.EmptyState,
+        params: GraphParams | None = None,
+    ) -> tuple[GraphParams, optax.EmptyState]:
+        check(updates)
+        gates = {name: values.get(name, 1.0) for name in updates.nodes}
+        return scale_node_updates(updates, gates), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 class GateSchedule:
