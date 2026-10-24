@@ -5,6 +5,9 @@ The encoder reuses the decomposed transformer-v2 blocks from
 and adds the pieces an encoder needs on top of them: learned absolute position
 embeddings, a final LayerNorm, and a masked-language-model (MLM) output head
 whose loss and PC energy only count the masked token positions.
+
+``architecture="bert"`` builds the post-LN layout of Hugging Face
+``BertForMaskedLM`` instead, so converted BERT weights can be loaded.
 """
 
 from __future__ import annotations
@@ -38,12 +41,20 @@ from fabricpc.nodes.transformer_v2 import (
     MhaResidualNode,
     Mlp2ResidualNode,
     VocabProjectionNode,
+    _non_default_options,
 )
 from fabricpc.utils.helpers import layernorm
 
+ARCHITECTURES = ("encoder", "bert")
+BERT_LN_EPS = 1e-12
+
 
 class AddPositionEmbeddingNode(NodeBase):
-    """Add learned absolute position embeddings to token embeddings."""
+    """Add learned absolute position embeddings to token embeddings.
+
+    With ``layer_norm=True`` the sum is normalised, ``LN(x + P, ln_eps)``, as
+    in the BERT embedding layer.
+    """
 
     DEFAULT_ENERGY = GaussianEnergy
     DEFAULT_ACTIVATION = IdentityActivation
@@ -54,6 +65,8 @@ class AddPositionEmbeddingNode(NodeBase):
         name: str,
         seq_len: int,
         embed_dim: int,
+        layer_norm: bool = False,
+        ln_eps: float = 1e-5,
         weight_init: InitializerBase = NormalInitializer(std=0.02),
         latent_init: InitializerBase = NormalInitializer(),
         energy: GaussianEnergy = GaussianEnergy(),
@@ -67,6 +80,9 @@ class AddPositionEmbeddingNode(NodeBase):
             weight_init=weight_init,
             latent_init=latent_init,
             energy=energy,
+            **_non_default_options(
+                layer_norm=(layer_norm, False), ln_eps=(ln_eps, 1e-5)
+            ),
             **kwargs,
         )
 
@@ -85,14 +101,14 @@ class AddPositionEmbeddingNode(NodeBase):
         config = config or {}
         seq_len = config.get("seq_len", node_shape[0])
         embed_dim = config.get("embed_dim", node_shape[-1])
-        return NodeParams(
-            weights={
-                "position_embeddings": initialize(
-                    key, (seq_len, embed_dim), weight_init
-                )
-            },
-            biases={},
-        )
+        weights = {
+            "position_embeddings": initialize(key, (seq_len, embed_dim), weight_init)
+        }
+        biases: Dict[str, jnp.ndarray] = {}
+        if config.get("layer_norm", False):
+            weights["ln_gamma"] = jnp.ones((embed_dim,))
+            biases["ln_beta"] = jnp.zeros((embed_dim,))
+        return NodeParams(weights=weights, biases=biases)
 
     @staticmethod
     def forward(
@@ -104,6 +120,13 @@ class AddPositionEmbeddingNode(NodeBase):
         x = inputs[next(iter(inputs))]
         seq_len = x.shape[1]
         z_mu = x + params.weights["position_embeddings"][:seq_len][None, :, :]
+        if node_info.node_config.get("layer_norm", False):
+            z_mu = layernorm(
+                z_mu,
+                params.weights["ln_gamma"],
+                params.biases["ln_beta"],
+                node_info.node_config.get("ln_eps", 1e-5),
+            )
         error = state.z_latent - z_mu
         state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
@@ -161,6 +184,79 @@ class FinalLayerNormNode(NodeBase):
     ) -> Tuple[jax.Array, NodeState]:
         x = inputs[next(iter(inputs))]
         z_mu = layernorm(x, params.weights["ln_gamma"], params.biases["ln_beta"])
+        error = state.z_latent - z_mu
+        state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
+        state = node_info.node_class.energy_functional(state, node_info)
+        return jnp.sum(state.energy), state
+
+
+class MlmTransformNode(NodeBase):
+    """BERT MLM head transform, ``LN(gelu_erf(W_t x + b_t), ln_eps)``."""
+
+    DEFAULT_ENERGY = GaussianEnergy
+    DEFAULT_ACTIVATION = IdentityActivation
+
+    def __init__(
+        self,
+        shape: Tuple[int, int],
+        name: str,
+        embed_dim: int,
+        ln_eps: float = BERT_LN_EPS,
+        weight_init: InitializerBase = NormalInitializer(std=0.02),
+        latent_init: InitializerBase = NormalInitializer(),
+        energy: GaussianEnergy = GaussianEnergy(),
+        **kwargs,
+    ):
+        super().__init__(
+            shape=shape,
+            name=name,
+            embed_dim=embed_dim,
+            ln_eps=ln_eps,
+            weight_init=weight_init,
+            latent_init=latent_init,
+            energy=energy,
+            **kwargs,
+        )
+
+    @staticmethod
+    def get_slots() -> Dict[str, SlotSpec]:
+        return {"in": SlotSpec("in", is_multi_input=False)}
+
+    @staticmethod
+    def initialize_params(
+        key: jax.Array,
+        node_shape: Tuple[int, ...],
+        input_shapes: Dict[str, Tuple[int, ...]],
+        weight_init: InitializerBase,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> NodeParams:
+        embed_dim = node_shape[-1]
+        return NodeParams(
+            weights={
+                "W_t": initialize(key, (embed_dim, embed_dim), weight_init),
+                "ln_gamma": jnp.ones((embed_dim,)),
+            },
+            biases={
+                "b_t": jnp.zeros((embed_dim,)),
+                "ln_beta": jnp.zeros((embed_dim,)),
+            },
+        )
+
+    @staticmethod
+    def forward(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+    ) -> Tuple[jax.Array, NodeState]:
+        x = inputs[next(iter(inputs))]
+        h = jnp.dot(x, params.weights["W_t"]) + params.biases["b_t"]
+        z_mu = layernorm(
+            jax.nn.gelu(h, approximate=False),
+            params.weights["ln_gamma"],
+            params.biases["ln_beta"],
+            node_info.node_config.get("ln_eps", BERT_LN_EPS),
+        )
         error = state.z_latent - z_mu
         state = state._replace(pre_activation=z_mu, z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
@@ -291,10 +387,14 @@ class MaskedVocabProjectionNode(NodeBase):
 
 
 class EncoderBackbone(NamedTuple):
-    """Nodes, edges and task entries of an encoder up to its final LayerNorm."""
+    """Nodes, edges and task entries of an encoder up to its last encoder node.
+
+    ``output_node`` is the final LayerNorm for ``"encoder"`` and the last
+    block's ``L{i}_mlp2`` for ``"bert"``.
+    """
 
     input_node: IdentityNode
-    output_node: FinalLayerNormNode
+    output_node: NodeBase
     nodes: list
     edges: list
     tasks: Dict[str, NodeBase]
@@ -340,8 +440,22 @@ def _build_encoder_backbone(
     embedding_init_std: float,
     position_init_std: float,
     transformer_init_std: float,
+    architecture: str = "encoder",
+    ln_eps: float = 1e-5,
+    residual_identity: bool = False,
 ) -> EncoderBackbone:
-    """input_ids -> embeddings -> positions -> [MHA -> MLP] x depth -> LayerNorm."""
+    """input_ids -> embeddings -> positions -> [MHA -> MLP] x depth -> LayerNorm.
+
+    ``"encoder"`` is pre-LN with a final LayerNorm node; ``"bert"`` is post-LN
+    with an embedding LayerNorm, erf GELU and no final LayerNorm node. With
+    ``residual_identity`` the attention output reaches ``L{i}_mlp2``'s residual
+    slot through a parameterless identity node ``L{i}_residual``. Under a
+    one-spike-per-node inference schedule the attention node then reads the
+    residual error before ``L{i}_mlp1``'s spike changes it. The node adds a
+    latent and lengthens each block's shortest path to the output by one edge,
+    which changes standard PC inference dynamics.
+    """
+    bert = architecture == "bert"
     weight_init = NormalInitializer(std=transformer_init_std)
     input_node = IdentityNode(shape=(seq_len,), name="input_ids")
     embed = EmbeddingNode(
@@ -356,6 +470,8 @@ def _build_encoder_backbone(
         shape=(seq_len, embed_dim),
         seq_len=seq_len,
         embed_dim=embed_dim,
+        layer_norm=bert,
+        ln_eps=ln_eps,
         weight_init=NormalInitializer(std=position_init_std),
     )
     nodes: list = [input_node, embed, positions]
@@ -392,6 +508,8 @@ def _build_encoder_backbone(
             num_heads=num_heads,
             is_causal=False,
             use_rope=False,
+            norm_position="post" if bert else "pre",
+            ln_eps=ln_eps,
             weight_init=weight_init,
         )
         mlp1 = LnMlp1Node(
@@ -399,6 +517,8 @@ def _build_encoder_backbone(
             shape=(seq_len, mlp_dim),
             embed_dim=embed_dim,
             ff_dim=mlp_dim,
+            pre_ln=not bert,
+            exact_gelu=bert,
             weight_init=weight_init,
         )
         mlp2 = Mlp2ResidualNode(
@@ -406,16 +526,23 @@ def _build_encoder_backbone(
             shape=(seq_len, embed_dim),
             embed_dim=embed_dim,
             ff_dim=mlp_dim,
+            post_ln=bert,
+            ln_eps=ln_eps,
             weight_init=weight_init,
         )
         nodes.extend([mha, mlp1, mlp2])
+        residual: NodeBase = mha
+        if residual_identity:
+            residual = IdentityNode(shape=(seq_len, embed_dim), name=f"L{i}_residual")
+            nodes.append(residual)
+            edges.append(Edge(source=mha, target=residual.slot("in")))
         edges.extend(
             [
                 Edge(source=previous, target=mha.slot("in")),
                 Edge(source=previous, target=mha.slot("skip")),
                 Edge(source=mha, target=mlp1.slot("in")),
                 Edge(source=mlp1, target=mlp2.slot("in")),
-                Edge(source=mha, target=mlp2.slot("residual")),
+                Edge(source=residual, target=mlp2.slot("residual")),
             ]
         )
         if attention_mask_node is not None:
@@ -426,12 +553,36 @@ def _build_encoder_backbone(
         add_dropout_mask(f"dropout_L{i}_mlp2", mlp2)
         previous = mlp2
 
+    if bert:
+        return EncoderBackbone(input_node, previous, nodes, edges, tasks)
     final_ln = FinalLayerNormNode(
         shape=(seq_len, embed_dim), name="final_layernorm", embed_dim=embed_dim
     )
     nodes.append(final_ln)
     edges.append(Edge(source=previous, target=final_ln.slot("in")))
     return EncoderBackbone(input_node, final_ln, nodes, edges, tasks)
+
+
+def _resolve_ln_eps(architecture: str, ln_eps: Optional[float]) -> float:
+    if architecture not in ARCHITECTURES:
+        raise ValueError(
+            f"architecture must be one of {ARCHITECTURES}, got {architecture!r}"
+        )
+    if architecture == "encoder":
+        if ln_eps is not None:
+            raise ValueError("ln_eps is only configurable for architecture='bert'")
+        return 1e-5
+    return BERT_LN_EPS if ln_eps is None else float(ln_eps)
+
+
+def _resolve_residual_identity(
+    architecture: str, residual_identity: Optional[bool]
+) -> bool:
+    if residual_identity is None:
+        return architecture == "bert"
+    if residual_identity and architecture != "bert":
+        raise ValueError("residual_identity is only supported for architecture='bert'")
+    return bool(residual_identity)
 
 
 def create_encoder_mlm_model(
@@ -449,6 +600,9 @@ def create_encoder_mlm_model(
     position_init_std: float = 0.02,
     transformer_init_std: float = 0.02,
     pc_output_energy_scale: float = 1.0,
+    architecture: str = "encoder",
+    ln_eps: Optional[float] = None,
+    residual_identity: Optional[bool] = None,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked-LM pretraining.
 
@@ -459,7 +613,20 @@ def create_encoder_mlm_model(
     ``loss_mask``; the training paths raise without it. An omitted
     ``attention_mask`` attends to every position, which is only correct for
     unpadded batches. ``fabricpc.utils.data.MlmTextBatcher`` yields both.
+
+    ``architecture="encoder"`` is the pre-LN encoder with a final LayerNorm
+    and µPC input scaling. ``architecture="bert"`` matches Hugging Face
+    ``BertForMaskedLM``: post-LN blocks, an embedding LayerNorm, erf GELU, an
+    ``mlm_transform`` node before ``mlm_head``, no µPC scaling and
+    ``ln_eps=1e-12`` unless given. The MLM decoder is untied from the token
+    embeddings, and dropout masks act only on the attention and second
+    feed-forward outputs before their residual adds. ``residual_identity``
+    (default on for ``"bert"``) adds the parameterless ``L{i}_residual`` nodes
+    for one-spike-per-node inference schedules; turn it off for standard PC
+    runs that should keep BERT's direct residual edges.
     """
+    resolved_ln_eps = _resolve_ln_eps(architecture, ln_eps)
+    bert = architecture == "bert"
     _validate_encoder_config(
         depth=depth,
         embed_dim=embed_dim,
@@ -481,7 +648,24 @@ def create_encoder_mlm_model(
         embedding_init_std=embedding_init_std,
         position_init_std=position_init_std,
         transformer_init_std=transformer_init_std,
+        architecture=architecture,
+        ln_eps=resolved_ln_eps,
+        residual_identity=_resolve_residual_identity(architecture, residual_identity),
     )
+    nodes = list(backbone.nodes)
+    edges = list(backbone.edges)
+    hidden = backbone.output_node
+    if bert:
+        transform = MlmTransformNode(
+            shape=(seq_len, embed_dim),
+            name="mlm_transform",
+            embed_dim=embed_dim,
+            ln_eps=resolved_ln_eps,
+            weight_init=NormalInitializer(std=transformer_init_std),
+        )
+        nodes.append(transform)
+        edges.append(Edge(source=hidden, target=transform.slot("in")))
+        hidden = transform
     loss_mask_node = IdentityNode(shape=(seq_len,), name="mlm_loss_mask")
     mlm_head = MaskedVocabProjectionNode(
         shape=(seq_len, vocab_size),
@@ -491,12 +675,12 @@ def create_encoder_mlm_model(
         output_energy_scale=pc_output_energy_scale,
         weight_init=NormalInitializer(std=math.sqrt(1.0 / embed_dim)),
     )
-    edges = backbone.edges + [
-        Edge(source=backbone.output_node, target=mlm_head.slot("in")),
+    edges += [
+        Edge(source=hidden, target=mlm_head.slot("in")),
         Edge(source=loss_mask_node, target=mlm_head.slot("loss_mask")),
     ]
     structure = graph(
-        nodes=backbone.nodes + [loss_mask_node, mlm_head],
+        nodes=nodes + [loss_mask_node, mlm_head],
         edges=edges,
         task_map=TaskMap(
             x=backbone.input_node,
@@ -505,7 +689,7 @@ def create_encoder_mlm_model(
             **backbone.tasks,
         ),
         inference=inference,
-        scaling=MuPCConfig(include_output=False),
+        scaling=None if bert else MuPCConfig(include_output=False),
         graph_state_initializer=FeedforwardStateInit(),
     )
     return structure._replace(
