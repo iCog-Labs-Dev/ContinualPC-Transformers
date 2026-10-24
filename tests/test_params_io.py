@@ -12,9 +12,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.core.inference import InferenceSGD, InferenceSGDNormClip
+from fabricpc.core.topology import Edge
 from fabricpc.core.types import GraphParams, NodeParams
+from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import initialize_params
+from fabricpc.nodes import IdentityNode, Linear
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
 from fabricpc.utils import load_params, read_params_metadata, save_params
 from fabricpc.utils.params_io import params_paths
@@ -210,3 +213,125 @@ def test_loads_in_a_fresh_process(tmp_path):
     assert set(reloaded.files) == set(expected)
     for key, value in expected.items():
         np.testing.assert_array_equal(reloaded[key], value)
+
+
+class _Bfloat16Linear(Linear):
+    @staticmethod
+    def initialize_params(*args, **kwargs):
+        params = Linear.initialize_params(*args, **kwargs)
+        return jax.tree_util.tree_map(lambda a: a.astype(jnp.bfloat16), params)
+
+
+def _linear_graph(node_class):
+    source = IdentityNode(shape=(4,), name="x")
+    target = node_class(shape=(3,), name="h")
+    return graph(
+        nodes=[source, target],
+        edges=[Edge(source=source, target=target.slot("in"))],
+        task_map=TaskMap(x=source, y=target),
+        inference=InferenceSGD(),
+    )
+
+
+def test_bfloat16_params_round_trip(tmp_path):
+    structure = _linear_graph(_Bfloat16Linear)
+    params = initialize_params(structure, jax.random.PRNGKey(0))
+    assert params.nodes["h"].weights
+    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree_util.tree_leaves(params))
+
+    save_params(tmp_path / "bf16", params)
+    loaded, _ = load_params(tmp_path / "bf16", structure)
+
+    _assert_params_equal(loaded, params)
+
+
+def test_dtype_mismatch_raises(tmp_path):
+    bf16 = _linear_graph(_Bfloat16Linear)
+    save_params(tmp_path / "bf16", initialize_params(bf16, jax.random.PRNGKey(0)))
+
+    with pytest.raises(ValueError, match="dtype bfloat16, expected float32"):
+        load_params(tmp_path / "bf16", _linear_graph(Linear))
+
+
+@pytest.mark.parametrize(
+    "given, stem",
+    [
+        ("model", "model"),
+        ("model.npz", "model"),
+        ("model.json", "model"),
+        ("bert.base.uncased", "bert.base.uncased"),
+        ("runs/v1.0", "runs/v1.0"),
+        ("runs/v1.0.npz", "runs/v1.0"),
+    ],
+)
+def test_params_paths_strip_only_their_own_suffixes(tmp_path, given, stem):
+    archive, sidecar = params_paths(tmp_path / given)
+
+    assert archive == tmp_path / f"{stem}.npz"
+    assert sidecar == tmp_path / f"{stem}.json"
+
+
+def test_dotted_names_round_trip(tmp_path):
+    structure = _structure()
+    params = initialize_params(structure, jax.random.PRNGKey(0))
+
+    save_params(tmp_path / "runs" / "v1.0", params)
+
+    assert (tmp_path / "runs" / "v1.0.npz").exists()
+    _assert_params_equal(load_params(tmp_path / "runs" / "v1.0", structure)[0], params)
+
+
+def test_nan_metadata_is_rejected(tmp_path):
+    params = initialize_params(_structure(), jax.random.PRNGKey(0))
+
+    with pytest.raises(ValueError):
+        save_params(tmp_path / "model", params, {"loss": float("nan")})
+
+
+def _rewrite_sidecar(tmp_path, edit):
+    path = tmp_path / "model.json"
+    sidecar = json.loads(path.read_text())
+    edit(sidecar)
+    path.write_text(json.dumps(sidecar))
+
+
+@pytest.mark.parametrize(
+    "edit, message",
+    [
+        (lambda s: s.pop("schema"), "'schema' must be an object"),
+        (lambda s: s.update(metadata=[]), "'metadata' must be an object"),
+        (lambda s: s.pop("sha256"), "'sha256' must be a string"),
+        (lambda s: s["schema"].update(L0_mha=[]), "'L0_mha' must be an object"),
+        (
+            lambda s: s["schema"]["L0_mha"].update(buffers={}),
+            r"unknown collections \['buffers'\]",
+        ),
+        (
+            lambda s: s["schema"]["L0_mha"]["weights"].update(W_q="arr_0"),
+            "L0_mha.weights.W_q needs string 'key' and 'dtype'",
+        ),
+    ],
+)
+def test_malformed_sidecar_raises_value_error(tmp_path, edit, message):
+    save_params(
+        tmp_path / "model", initialize_params(_structure(), jax.random.PRNGKey(0))
+    )
+    _rewrite_sidecar(tmp_path, edit)
+
+    with pytest.raises(ValueError, match=message):
+        load_params(tmp_path / "model", _structure())
+
+
+def test_digest_detects_swapped_schema_keys(tmp_path):
+    save_params(
+        tmp_path / "model", initialize_params(_structure(), jax.random.PRNGKey(0))
+    )
+
+    def swap(sidecar):
+        weights = sidecar["schema"]["L0_mha"]["weights"]
+        weights["W_q"], weights["W_k"] = weights["W_k"], weights["W_q"]
+
+    _rewrite_sidecar(tmp_path, swap)
+
+    with pytest.raises(ValueError, match="digest"):
+        load_params(tmp_path / "model", _structure())
