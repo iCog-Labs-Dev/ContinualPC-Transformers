@@ -348,7 +348,9 @@ def test_init_params_rejects_seq_len_vocab_and_architecture_mismatch(demo, tmp_p
     path = tmp_path / "mlm.npz"
     demo.main(SMALL + ["--num_epochs", "0.2", "--save_params", str(path)])
 
-    with pytest.raises(ValueError, match="seq_len 16 does not match --seq_len 8"):
+    with pytest.raises(
+        ValueError, match="seq_len 16 does not match this run's seq_len 8"
+    ):
         demo.main(SMALL + ["--seq_len", "8", "--init_params", str(path)])
 
     train_file, val_file = tmp_path / "train.txt", tmp_path / "val.txt"

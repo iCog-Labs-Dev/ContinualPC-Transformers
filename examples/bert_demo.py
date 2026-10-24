@@ -366,8 +366,8 @@ def load_init_params(
         saved = config.get(key, "encoder" if key == "architecture" else None)
         if saved is not None and saved != expected[key]:
             raise ValueError(
-                f"{path}: saved {key} {saved!r} does not match --{key} "
-                f"{expected[key]!r}"
+                f"{path}: saved {key} {saved!r} does not match this run's "
+                f"{key} {expected[key]!r}"
             )
     saved_vocab = metadata.get("vocab")
     if saved_vocab is not None and {
