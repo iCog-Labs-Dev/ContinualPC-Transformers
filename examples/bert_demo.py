@@ -13,7 +13,9 @@ the latents toward the targets, which reads lower than a feedforward loss.
 Without arguments it runs on a small built-in corpus with a word-level
 vocabulary (no extra dependencies). Pass text files (one document per line)
 to pretrain on your own data; ``--tokenizer bpe`` needs the ``text`` extra
-(``pip install -e '.[text]'``).
+(``pip install -e '.[text]'``). ``--save_params`` writes the trained weights
+with ``fabricpc.utils.save_params``; ``--init_params`` starts training from
+such a file instead of a fresh initialisation.
 
 Usage:
     PYTHONPATH=. python examples/bert_demo.py
@@ -21,6 +23,8 @@ Usage:
     PYTHONPATH=. python examples/bert_demo.py --ab_trials 5
     PYTHONPATH=. python examples/bert_demo.py --train_file train.txt \\
         --val_file val.txt --tokenizer bpe --vocab_size 4000 --seq_len 64
+    PYTHONPATH=. python examples/bert_demo.py --save_params runs/mlm.npz
+    PYTHONPATH=. python examples/bert_demo.py --init_params runs/mlm.npz
 """
 
 from jax_setup import set_jax_flags_before_importing_jax
@@ -34,7 +38,7 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +46,7 @@ import numpy as np
 import optax
 
 from fabricpc.core.inference import InferenceSGDNormClip
+from fabricpc.core.types import GraphParams, GraphStructure
 from fabricpc.experiments.ab_experiment import ABExperiment, ABResults, ExperimentArm
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
@@ -56,6 +61,7 @@ from fabricpc.training.train_autoregressive import (
 )
 from fabricpc.training.train_backprop import compute_loss_autoregressive
 from fabricpc.utils.data import MLM_SPECIAL_TOKENS, MlmTextBatcher, tokenize_texts_bpe
+from fabricpc.utils.params_io import load_params, read_params_metadata, save_params
 
 TINY_TRAIN_TEXTS = [
     "the cat sat on the warm mat by the door",
@@ -111,12 +117,13 @@ def word_tokenize(
 
 def bpe_tokenize(
     train_texts: Sequence[str], val_texts: Sequence[str], vocab_size: int
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int], str]:
+    """BPE token ids, vocabulary and the trained tokenizer's JSON."""
     train_ids, tokenizer = tokenize_texts_bpe(train_texts, vocab_size=vocab_size)
     val_ids, _ = tokenize_texts_bpe(
         val_texts, vocab_size=vocab_size, tokenizer=tokenizer
     )
-    return train_ids, val_ids, tokenizer.get_vocab()
+    return train_ids, val_ids, tokenizer.get_vocab(), tokenizer.to_str()
 
 
 def make_loader(
@@ -270,9 +277,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--ab_metric", choices=["masked_loss", "masked_accuracy"], default="masked_loss"
     )
+    parser.add_argument(
+        "--save_params",
+        type=Path,
+        default=None,
+        help="Write the trained params to this .npz (plus a .json sidecar)",
+    )
+    parser.add_argument(
+        "--init_params",
+        type=Path,
+        default=None,
+        help="Start training from params saved with --save_params; the vocab, "
+        "--seq_len and architecture must match",
+    )
     args = parser.parse_args(argv)
     if (args.train_file is None) != (args.val_file is None):
         parser.error("--train_file and --val_file must be given together")
+    if args.ab_trials > 0 and (args.save_params or args.init_params):
+        parser.error("--save_params and --init_params are not used with --ab_trials")
     if args.ab_trials > 0 and importlib.util.find_spec("scipy") is None:
         parser.error("--ab_trials needs scipy: pip install -e '.[experiments]'")
     return args
@@ -297,15 +319,62 @@ def build_model(args, vocab_size: int):
     )
 
 
-def load_token_streams(args) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
-    """Tokenize the training and validation texts into token-id streams."""
+def load_token_streams(
+    args,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int], Optional[str]]:
+    """Tokenize the training and validation texts into token-id streams.
+
+    Returns the train and validation ids, the vocabulary and the tokenizer's
+    JSON (``None`` for the word tokenizer, whose vocabulary is enough).
+    """
     if args.train_file is None:
         train_texts, val_texts = TINY_TRAIN_TEXTS, TINY_VAL_TEXTS
     else:
         train_texts, val_texts = read_texts(args.train_file), read_texts(args.val_file)
     if args.tokenizer == "bpe":
         return bpe_tokenize(train_texts, val_texts, args.vocab_size)
-    return word_tokenize(train_texts, val_texts)
+    return (*word_tokenize(train_texts, val_texts), None)
+
+
+def model_config(args, vocab_size: int) -> Dict[str, Any]:
+    """Model settings saved with ``--save_params`` and checked by ``--init_params``."""
+    return {
+        "architecture": "encoder",
+        "depth": args.depth,
+        "embed_dim": args.embed_dim,
+        "num_heads": args.num_heads,
+        "mlp_dim": args.mlp_dim,
+        "seq_len": args.seq_len,
+        "vocab_size": vocab_size,
+        "dropout_rate": args.dropout_rate,
+    }
+
+
+def load_init_params(
+    path: Path, structure: GraphStructure, vocab: Dict[str, int], args
+) -> GraphParams:
+    """Params saved by ``--save_params`` to start training from.
+
+    The file's architecture (``"encoder"`` when it records none), ``seq_len``
+    and vocabulary must match the current run before its parameters are
+    checked against ``structure``.
+    """
+    metadata = read_params_metadata(path)
+    config = metadata.get("config", {})
+    expected = model_config(args, len(vocab))
+    for key in ("architecture", "seq_len"):
+        saved = config.get(key, "encoder" if key == "architecture" else None)
+        if saved is not None and saved != expected[key]:
+            raise ValueError(
+                f"{path}: saved {key} {saved!r} does not match --{key} "
+                f"{expected[key]!r}"
+            )
+    saved_vocab = metadata.get("vocab")
+    if saved_vocab is not None and {
+        str(token): int(idx) for token, idx in saved_vocab.items()
+    } != dict(vocab):
+        raise ValueError(f"{path}: saved vocab does not match the training vocab")
+    return load_params(path, structure)[0]
 
 
 def make_loaders(args, train_ids, val_ids, vocab, seed: int):
@@ -389,13 +458,21 @@ def warn_weak_pc_gradients(structure, params, loader, rng_key) -> Dict[str, List
     return weak
 
 
-def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
-    """Pretrain with ``--mode`` and return the final validation metrics."""
+def pretrain(
+    args, train_ids, val_ids, vocab, tokenizer_json: Optional[str] = None
+) -> Dict[str, float]:
+    """Pretrain with ``--mode`` and return the final validation metrics.
+
+    Starts from ``--init_params`` when given and writes the trained params to
+    ``--save_params`` with the vocab, ``tokenizer_json`` and model config.
+    """
     train_loader, val_loader = make_loaders(args, train_ids, val_ids, vocab, args.seed)
     print_data_summary(train_ids, val_ids, vocab, len(train_loader))
     structure = build_model(args, vocab_size=len(vocab))
     init_key, train_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = initialize_params(structure, init_key)
+    if args.init_params is not None:
+        params = load_init_params(args.init_params, structure, vocab, args)
     if args.mode == "pc":
         warn_weak_pc_gradients(structure, params, train_loader, init_key)
     total_steps = count_training_steps(args.num_epochs, len(train_loader))
@@ -416,7 +493,7 @@ def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
         return metrics
 
     grad_scale = pc_grad_scale(train_loader) if args.mode == "pc" else 1.0
-    _, _, epoch_metrics = TRAINERS[args.mode](
+    trained_params, _, epoch_metrics = TRAINERS[args.mode](
         params,
         structure,
         train_loader,
@@ -426,6 +503,17 @@ def pretrain(args, train_ids, val_ids, vocab) -> Dict[str, float]:
         verbose=False,
         epoch_callback=validate,
     )
+    if args.save_params is not None:
+        archive, _ = save_params(
+            args.save_params,
+            trained_params,
+            {
+                "vocab": dict(vocab),
+                "tokenizer_json": tokenizer_json,
+                "config": model_config(args, len(vocab)),
+            },
+        )
+        print(f"saved params to {archive}")
     return epoch_metrics[-1]
 
 
@@ -495,10 +583,10 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
 def main(argv: Optional[Sequence[str]] = None):
     """Pretrain (or compare modes with ``--ab_trials``) and return the results."""
     args = parse_args(argv)
-    train_ids, val_ids, vocab = load_token_streams(args)
+    train_ids, val_ids, vocab, tokenizer_json = load_token_streams(args)
     if args.ab_trials > 0:
         return compare_modes(args, train_ids, val_ids, vocab)
-    return pretrain(args, train_ids, val_ids, vocab)
+    return pretrain(args, train_ids, val_ids, vocab, tokenizer_json)
 
 
 if __name__ == "__main__":

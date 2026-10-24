@@ -1,6 +1,7 @@
 """Smoke tests for examples/bert_demo.py (MLM pretraining demo)."""
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -180,7 +181,7 @@ def test_ab_comparison_fails_before_training_without_scipy(demo, monkeypatch):
 
 def _pc_setup(demo, extra):
     args = demo.parse_args(SMALL + ["--mode", "pc"] + extra)
-    train_ids, val_ids, vocab = demo.load_token_streams(args)
+    train_ids, val_ids, vocab, _ = demo.load_token_streams(args)
     loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
     structure = demo.build_model(args, vocab_size=len(vocab))
     key = demo.jax.random.PRNGKey(0)
@@ -201,7 +202,7 @@ def test_flags_noise_level_pc_gradients_as_negligible(demo, capsys):
 
 def test_default_pc_inference_gives_no_negligible_gradients(demo):
     args = demo.parse_args(["--mode", "pc"])
-    train_ids, val_ids, vocab = demo.load_token_streams(args)
+    train_ids, val_ids, vocab, _ = demo.load_token_streams(args)
     loader, _ = demo.make_loaders(args, train_ids, val_ids, vocab, seed=0)
     structure = demo.build_model(args, vocab_size=len(vocab))
     key = demo.jax.random.PRNGKey(0)
@@ -298,3 +299,76 @@ def test_ab_checks_each_pc_trial_on_its_own_initialisation(demo, monkeypatch):
         demo.jax.tree_util.tree_leaves(p)[0] for p in (trained[0], trained[1])
     )
     assert not demo.jnp.array_equal(first, second)
+
+
+def _spy_trainer(demo, monkeypatch, mode="backprop"):
+    """Record the starting and trained params of every ``mode`` training run."""
+    real = demo.TRAINERS[mode]
+    runs = []
+
+    def spy(params, *args, **kwargs):
+        result = real(params, *args, **kwargs)
+        runs.append((params, result[0]))
+        return result
+
+    monkeypatch.setitem(demo.TRAINERS, mode, spy)
+    return runs
+
+
+def _leaves(demo, params):
+    return [np.asarray(leaf) for leaf in demo.jax.tree_util.tree_leaves(params)]
+
+
+@pytest.mark.parametrize("mode", ["backprop", "pc"])
+def test_saved_params_restart_training_exactly(demo, monkeypatch, tmp_path, mode):
+    runs = _spy_trainer(demo, monkeypatch, mode)
+    path = tmp_path / "mlm.npz"
+    one_step = SMALL + ["--mode", mode, "--num_epochs", "0.2"]
+
+    demo.main(one_step + ["--save_params", str(path)])
+    demo.main(one_step + ["--seed", "1", "--init_params", str(path)])
+    demo.main(one_step + ["--seed", "1"])
+
+    (_, trained), (restarted, _), (fresh, _) = runs
+    assert list(restarted.nodes) == list(fresh.nodes)
+    for saved, loaded in zip(_leaves(demo, trained), _leaves(demo, restarted)):
+        np.testing.assert_array_equal(saved, loaded)
+    assert any(
+        not np.array_equal(saved, other)
+        for saved, other in zip(_leaves(demo, trained), _leaves(demo, fresh))
+    )
+    metadata = demo.read_params_metadata(path)
+    assert metadata["config"]["architecture"] == "encoder"
+    assert metadata["config"]["seq_len"] == 16
+    assert metadata["tokenizer_json"] is None
+    assert metadata["vocab"]["[MASK]"] == demo.MLM_SPECIAL_TOKENS.index("[MASK]")
+
+
+def test_init_params_rejects_seq_len_vocab_and_architecture_mismatch(demo, tmp_path):
+    path = tmp_path / "mlm.npz"
+    demo.main(SMALL + ["--num_epochs", "0.2", "--save_params", str(path)])
+
+    with pytest.raises(ValueError, match="seq_len 16 does not match --seq_len 8"):
+        demo.main(SMALL + ["--seq_len", "8", "--init_params", str(path)])
+
+    train_file, val_file = tmp_path / "train.txt", tmp_path / "val.txt"
+    train_file.write_text("\n".join(demo.TINY_TRAIN_TEXTS + ["an extra zebra"]))
+    val_file.write_text("\n".join(demo.TINY_VAL_TEXTS))
+    with pytest.raises(ValueError, match="vocab does not match"):
+        demo.main(
+            SMALL
+            + ["--train_file", str(train_file), "--val_file", str(val_file)]
+            + ["--init_params", str(path)]
+        )
+
+    sidecar = tmp_path / "mlm.json"
+    data = json.loads(sidecar.read_text())
+    data["metadata"]["config"]["architecture"] = "bert"
+    sidecar.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="architecture 'bert' does not match"):
+        demo.main(SMALL + ["--init_params", str(path)])
+
+
+def test_params_files_are_not_used_with_ab_trials(demo, tmp_path):
+    with pytest.raises(SystemExit):
+        demo.parse_args(["--ab_trials", "2", "--save_params", str(tmp_path / "p")])
