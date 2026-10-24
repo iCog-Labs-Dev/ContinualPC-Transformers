@@ -444,16 +444,15 @@ def _build_encoder_backbone(
     ln_eps: float = 1e-5,
     residual_identity: bool = False,
 ) -> EncoderBackbone:
-    """input_ids -> embeddings -> positions -> [MHA -> MLP] x depth -> LayerNorm.
+    """input_ids -> embeddings -> positions -> [MHA -> MLP] x depth [-> LayerNorm].
 
-    ``"encoder"`` is pre-LN with a final LayerNorm node; ``"bert"`` is post-LN
-    with an embedding LayerNorm, erf GELU and no final LayerNorm node. With
-    ``residual_identity`` the attention output reaches ``L{i}_mlp2``'s residual
-    slot through a parameterless identity node ``L{i}_residual``. Under a
-    one-spike-per-node inference schedule the attention node then reads the
-    residual error before ``L{i}_mlp1``'s spike changes it. The node adds a
-    latent and lengthens each block's shortest path to the output by one edge,
-    which changes standard PC inference dynamics.
+    ``"encoder"`` is pre-LN and ends in a final LayerNorm node; ``"bert"`` is
+    post-LN with an embedding LayerNorm, erf GELU and no final LayerNorm node.
+    With ``residual_identity`` the attention block's residual sum reaches
+    ``L{i}_mlp2``'s residual slot through a parameterless identity node
+    ``L{i}_residual``. The node adds a latent and lengthens each block's
+    shortest path to the output by one edge, so it changes PC inference but
+    not the feedforward output.
     """
     bert = architecture == "bert"
     weight_init = NormalInitializer(std=transformer_init_std)
@@ -575,16 +574,6 @@ def _resolve_ln_eps(architecture: str, ln_eps: Optional[float]) -> float:
     return BERT_LN_EPS if ln_eps is None else float(ln_eps)
 
 
-def _resolve_residual_identity(
-    architecture: str, residual_identity: Optional[bool]
-) -> bool:
-    if residual_identity is None:
-        return architecture == "bert"
-    if residual_identity and architecture != "bert":
-        raise ValueError("residual_identity is only supported for architecture='bert'")
-    return bool(residual_identity)
-
-
 def create_encoder_mlm_model(
     *,
     depth: int,
@@ -602,7 +591,7 @@ def create_encoder_mlm_model(
     pc_output_energy_scale: float = 1.0,
     architecture: str = "encoder",
     ln_eps: Optional[float] = None,
-    residual_identity: Optional[bool] = None,
+    residual_identity: bool = False,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked-LM pretraining.
 
@@ -621,12 +610,13 @@ def create_encoder_mlm_model(
     ``ln_eps=1e-12`` unless given. The MLM decoder is untied from the token
     embeddings, and dropout masks act only on the attention and second
     feed-forward outputs before their residual adds. ``residual_identity``
-    (default on for ``"bert"``) adds the parameterless ``L{i}_residual`` nodes
-    for one-spike-per-node inference schedules; turn it off for standard PC
-    runs that should keep BERT's direct residual edges.
+    (``"bert"`` only) adds an optional parameterless identity node
+    ``L{i}_residual`` after each block's attention residual sum.
     """
     resolved_ln_eps = _resolve_ln_eps(architecture, ln_eps)
     bert = architecture == "bert"
+    if residual_identity and not bert:
+        raise ValueError("residual_identity is only supported for architecture='bert'")
     _validate_encoder_config(
         depth=depth,
         embed_dim=embed_dim,
@@ -650,7 +640,7 @@ def create_encoder_mlm_model(
         transformer_init_std=transformer_init_std,
         architecture=architecture,
         ln_eps=resolved_ln_eps,
-        residual_identity=_resolve_residual_identity(architecture, residual_identity),
+        residual_identity=residual_identity,
     )
     nodes = list(backbone.nodes)
     edges = list(backbone.edges)
