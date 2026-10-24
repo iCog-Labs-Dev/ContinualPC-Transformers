@@ -39,6 +39,18 @@ from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.inference import InferenceBase
 from fabricpc.core.mupc import MuPCConfig
 
+
+def _non_default_options(**options: Tuple[Any, Any]) -> Dict[str, Any]:
+    """Return the ``name: (value, default)`` options whose value is not the default.
+
+    Default options stay out of the node config, so configs and the training
+    identities built from them are unchanged for existing graphs.
+    """
+    return {
+        name: value for name, (value, default) in options.items() if value != default
+    }
+
+
 def _apply_dropout_mask(
     x: jnp.ndarray,
     inputs: Dict[str, jnp.ndarray],
@@ -54,6 +66,7 @@ def _apply_dropout_mask(
     if mask_key is None:
         return x
     return x * inputs[mask_key]
+
 
 # ==============================================================================
 # EMBEDDING NODE
@@ -166,11 +179,23 @@ class MhaResidualNode(NodeBase):
         rope_theta=10000.0,
         is_causal=True,
         dropout_rate=0.0,
+        norm_position="pre",
+        ln_eps=1e-5,
         weight_init=None,
         latent_init=None,
         energy=None,
         **kwargs,
     ):
+        """Attention block with a residual add.
+
+        ``norm_position="pre"`` computes ``skip + Attn(LN(x))``; ``"post"``
+        computes ``LN(skip + Attn(x))`` as in the original BERT. ``ln_eps`` is
+        the LayerNorm epsilon.
+        """
+        if norm_position not in ("pre", "post"):
+            raise ValueError(
+                f"norm_position must be 'pre' or 'post', got {norm_position!r}"
+            )
         super().__init__(
             shape=shape,
             name=name,
@@ -183,6 +208,9 @@ class MhaResidualNode(NodeBase):
             weight_init=weight_init or XavierInitializer(),
             latent_init=latent_init or NormalInitializer(),
             energy=energy or GaussianEnergy(),
+            **_non_default_options(
+                norm_position=(norm_position, "pre"), ln_eps=(ln_eps, 1e-5)
+            ),
             **kwargs,
         )
 
@@ -233,8 +261,15 @@ class MhaResidualNode(NodeBase):
         B, L, D = x.shape
         num_heads = cfg["num_heads"]
         head_dim = D // num_heads
+        post_ln = cfg.get("norm_position", "pre") == "post"
+        ln_eps = cfg.get("ln_eps", 1e-5)
 
-        x_norm = layernorm(x, params.weights["ln_gamma"], params.biases["ln_beta"])
+        if post_ln:
+            x_norm = x
+        else:
+            x_norm = layernorm(
+                x, params.weights["ln_gamma"], params.biases["ln_beta"], ln_eps
+            )
 
         def proj(h, w_name, b_name):
             return jnp.dot(h, params.weights[w_name]) + params.biases[b_name]
@@ -273,6 +308,10 @@ class MhaResidualNode(NodeBase):
             mha = jnp.where(attention_mask[:, :, None], mha, 0.0)
 
         z_mu = skip + mha
+        if post_ln:
+            z_mu = layernorm(
+                z_mu, params.weights["ln_gamma"], params.biases["ln_beta"], ln_eps
+            )
         error = state.z_latent - z_mu
 
         state = state._replace(z_mu=z_mu, error=error)
@@ -295,12 +334,21 @@ class LnMlp1Node(NodeBase):
         name,
         embed_dim,
         ff_dim,
+        pre_ln=True,
+        exact_gelu=False,
+        ln_eps=1e-5,
         activation=None,
         weight_init=None,
         latent_init=None,
         energy=None,
         **kwargs,
     ):
+        """First feed-forward layer, ``act(W_ff1 LN(x) + b_ff1)``.
+
+        ``pre_ln=False`` drops the input LayerNorm and its parameters.
+        ``exact_gelu=True`` uses the erf GELU in place of the activation object,
+        whose derivative then comes from autodiff.
+        """
         super().__init__(
             shape=shape,
             name=name,
@@ -310,6 +358,11 @@ class LnMlp1Node(NodeBase):
             weight_init=weight_init or KaimingInitializer(),
             latent_init=latent_init or NormalInitializer(),
             energy=energy or GaussianEnergy(),
+            **_non_default_options(
+                pre_ln=(pre_ln, True),
+                exact_gelu=(exact_gelu, False),
+                ln_eps=(ln_eps, 1e-5),
+            ),
             **kwargs,
         )
 
@@ -322,21 +375,31 @@ class LnMlp1Node(NodeBase):
         embed_dim, ff_dim = config["embed_dim"], config["ff_dim"]
         keys = jax.random.split(key, 2)
 
-        weights = {
-            "ln_gamma": jnp.ones((embed_dim,)),
-            "W_ff1": initialize(keys[0], (embed_dim, ff_dim), weight_init),
-        }
-        biases = {"ln_beta": jnp.zeros((embed_dim,)), "b_ff1": jnp.zeros((ff_dim,))}
+        weights = {"W_ff1": initialize(keys[0], (embed_dim, ff_dim), weight_init)}
+        biases = {"b_ff1": jnp.zeros((ff_dim,))}
+        if config.get("pre_ln", True):
+            weights = {"ln_gamma": jnp.ones((embed_dim,)), **weights}
+            biases = {"ln_beta": jnp.zeros((embed_dim,)), **biases}
         return NodeParams(weights, biases)
 
     @staticmethod
     def forward(params, inputs, state, node_info):
+        cfg = node_info.node_config
         x = inputs[list(inputs.keys())[0]]
-        x_norm = layernorm(x, params.weights["ln_gamma"], params.biases["ln_beta"])
-        h = jnp.dot(x_norm, params.weights["W_ff1"]) + params.biases["b_ff1"]
+        if cfg.get("pre_ln", True):
+            x = layernorm(
+                x,
+                params.weights["ln_gamma"],
+                params.biases["ln_beta"],
+                cfg.get("ln_eps", 1e-5),
+            )
+        h = jnp.dot(x, params.weights["W_ff1"]) + params.biases["b_ff1"]
 
-        act_obj = node_info.activation
-        z_mu = type(act_obj).forward(h, act_obj.config)
+        if cfg.get("exact_gelu", False):
+            z_mu = jax.nn.gelu(h, approximate=False)
+        else:
+            act_obj = node_info.activation
+            z_mu = type(act_obj).forward(h, act_obj.config)
 
         error = state.z_latent - z_mu
         state = state._replace(z_mu=z_mu, error=error)
@@ -360,11 +423,18 @@ class Mlp2ResidualNode(NodeBase):
         embed_dim,
         ff_dim,
         dropout_rate=0.0,
+        post_ln=False,
+        ln_eps=1e-5,
         weight_init=None,
         latent_init=None,
         energy=None,
         **kwargs,
     ):
+        """Second feed-forward layer with a residual add.
+
+        ``post_ln=True`` normalises the sum, ``LN(res + W_ff2 in + b_ff2)``, as
+        in the original BERT, with LayerNorm epsilon ``ln_eps``.
+        """
         super().__init__(
             shape=shape,
             name=name,
@@ -374,6 +444,7 @@ class Mlp2ResidualNode(NodeBase):
             weight_init=weight_init or XavierInitializer(),
             latent_init=latent_init or NormalInitializer(),
             energy=energy or GaussianEnergy(),
+            **_non_default_options(post_ln=(post_ln, False), ln_eps=(ln_eps, 1e-5)),
             **kwargs,
         )
 
@@ -391,7 +462,11 @@ class Mlp2ResidualNode(NodeBase):
     def initialize_params(key, node_shape, input_shapes, weight_init, config):
         embed_dim, ff_dim = config["embed_dim"], config["ff_dim"]
         weights = {"W_ff2": initialize(key, (ff_dim, embed_dim), weight_init)}
-        return NodeParams(weights, {"b_ff2": jnp.zeros((embed_dim,))})
+        biases = {"b_ff2": jnp.zeros((embed_dim,))}
+        if config.get("post_ln", False):
+            weights["ln_gamma"] = jnp.ones((embed_dim,))
+            biases["ln_beta"] = jnp.zeros((embed_dim,))
+        return NodeParams(weights, biases)
 
     @staticmethod
     def forward(params, inputs, state, node_info):
@@ -401,6 +476,14 @@ class Mlp2ResidualNode(NodeBase):
         mlp2 = jnp.dot(mlp1_in, params.weights["W_ff2"]) + params.biases["b_ff2"]
         mlp2 = _apply_dropout_mask(mlp2, inputs)
         z_mu = res_in + mlp2
+        cfg = node_info.node_config
+        if cfg.get("post_ln", False):
+            z_mu = layernorm(
+                z_mu,
+                params.weights["ln_gamma"],
+                params.biases["ln_beta"],
+                cfg.get("ln_eps", 1e-5),
+            )
 
         error = state.z_latent - z_mu
         state = state._replace(z_mu=z_mu, error=error)
@@ -617,4 +700,4 @@ def create_deep_transformer(
     )
     return structure._replace(
         config={**structure.config, "dropout_rate": float(dropout_rate)}
-    )   
+    )
