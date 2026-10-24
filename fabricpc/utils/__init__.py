@@ -3,6 +3,7 @@
 import importlib
 
 from fabricpc.utils.helpers import layernorm
+from fabricpc.utils.params_io import load_params, read_params_metadata, save_params
 
 # Submodules
 from fabricpc.utils import data
@@ -18,6 +19,10 @@ def __getattr__(name: str):
 __all__ = [
     # Helpers
     "layernorm",
+    # Parameter files
+    "save_params",
+    "load_params",
+    "read_params_metadata",
     # Submodules
     "data",
     "dashboarding",
