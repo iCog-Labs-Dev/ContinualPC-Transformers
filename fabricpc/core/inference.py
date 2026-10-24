@@ -4,6 +4,8 @@ Core inference dynamics for JAX predictive coding networks.
 This module provides:
 - InferenceBase: Abstract base class for inference algorithms
 - InferenceSGD: Default SGD-based inference (z -= eta * grad)
+- InferenceSGDNormClip: SGD inference with per-node gradient norm clipping
+- InferencePCALM: Augmented Lagrangian PC with per-node dual ascent
 - run_inference: Convenience function wrapping the class-based API
 
 Inference algorithms control how latent states are updated during the
@@ -19,7 +21,7 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Tuple
 import types
 
 import jax
@@ -37,7 +39,7 @@ from fabricpc.core.types import (
     NodeInfo,
     NodeState,
 )
-from fabricpc.core.state_ops import update_node_in_state
+from fabricpc.core.state_ops import drop_duals, update_node_in_state
 
 # =============================================================================
 # Utility Functions
@@ -78,7 +80,12 @@ class InferenceBase(ABC):
     Custom inference algorithms extend this class:
 
     All computation methods are static for JAX compatibility (pure functions, no state).
+
+    Set ``uses_dual = True`` in algorithms that carry a ``NodeState.dual``;
+    ``initialize_graph_state`` then allocates it as zeros.
     """
+
+    uses_dual: bool = False
 
     def __init__(self, **config):
         self.config = types.MappingProxyType(config)  # Immutable dictionary
@@ -110,6 +117,28 @@ class InferenceBase(ABC):
         state = cls.update_latents(params, state, clamps, structure, config)
 
         return state
+
+    @staticmethod
+    def prepare_state(state: GraphState, structure: GraphStructure) -> GraphState:
+        """
+        Prepare the state once before the inference loop.
+
+        Drops any ``dual`` so leftover multipliers cannot enter the energy of
+        an algorithm without duals. Dual-carrying algorithms override this.
+        """
+        return drop_duals(state)
+
+    @staticmethod
+    def final_inference_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Last step of the inference loop; ``inference_step`` by default."""
+        cls = type(structure.config["inference"])
+        return cls.inference_step(params, state, clamps, structure, config)
 
     @staticmethod
     def zero_grads(
@@ -253,21 +282,32 @@ class InferenceBase(ABC):
         Outer inference loop using lax.fori_loop.
 
         Override for scan-based tracking, adaptive stopping, etc.
-        infer_steps is read from self.config['infer_steps'].
+        infer_steps is read from self.config['infer_steps']. Runs
+        ``prepare_state``, ``infer_steps - 1`` calls of ``inference_step``,
+        then ``final_inference_step``.
         """
         inference_obj = structure.config["inference"]
         inference_cls = type(inference_obj)
         config = inference_obj.config
         infer_steps = config["infer_steps"]
 
+        state = inference_cls.prepare_state(initial_state, structure)
+        if infer_steps < 1:
+            return state
+
         def body_fn(t, state):
             return inference_cls.inference_step(
                 params, state, clamps, structure, config
             )
 
-        # Use lax.fori_loop for efficiency
-        final_state = jax.lax.fori_loop(0, infer_steps, body_fn, initial_state)
-        return final_state
+        # A single fori_loop keeps the compiled program unchanged for algorithms
+        # without a distinct final step.
+        if inference_cls.final_inference_step is InferenceBase.final_inference_step:
+            return jax.lax.fori_loop(0, infer_steps, body_fn, state)
+        state = jax.lax.fori_loop(0, infer_steps - 1, body_fn, state)
+        return inference_cls.final_inference_step(
+            params, state, clamps, structure, config
+        )
 
 
 # =============================================================================

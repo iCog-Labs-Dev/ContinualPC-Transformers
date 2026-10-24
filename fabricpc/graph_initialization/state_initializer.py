@@ -33,7 +33,7 @@ from fabricpc.core.types import (
     GraphParams,
     NodeState,
 )
-from fabricpc.core.state_ops import set_latents_to_clamps
+from fabricpc.core.state_ops import set_latents_to_clamps, zero_duals
 
 # =============================================================================
 # State Initializer Base Class
@@ -369,7 +369,8 @@ def initialize_graph_state(
         params: GraphParams (required for feedforward init)
 
     Returns:
-        Initialized GraphState
+        Initialized GraphState. When the structure's inference algorithm
+        ``uses_dual``, every node's ``dual`` is zeros; otherwise it is None.
 
     Example:
         state = initialize_graph_state(
@@ -384,6 +385,9 @@ def initialize_graph_state(
     if state_init is None:
         state_init = structure.config["graph_state_initializer"]
 
-    return type(state_init).initialize_state(
+    state = type(state_init).initialize_state(
         structure, batch_size, rng_key, clamps, state_init.config, params
     )
+    if getattr(structure.config.get("inference"), "uses_dual", False):
+        state = zero_duals(state)
+    return state
