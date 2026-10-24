@@ -28,6 +28,16 @@ Usage:
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --training joint \\
         --output_dir results/domain_forgetting/joint_seed0
 
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
+        --gate map --gate_beta 1 --gate_map_windows 256 \\
+        --output_dir results/domain_forgetting/map_gate_b1_seed0
+
+    Gates (stage 2 on, per-module multipliers after AdamW, in gates.jsonl):
+    map / random / inverse / type (module-type means) from the onset error
+    map, oracle from --gate_source runs' rollback.json (ungated runs of the
+    other domain order), freeze for --gate_modules (module or group names:
+    embeddings, blocks_0-1, blocks_2-3, blocks, head, mlp).
+
     Standard PC on BERT-Mini diverges at --pc_eta_infer >= 0.02 and, below
     that, its error barely reaches the lower blocks; calibrate with ``probe``
     before any long run.
@@ -64,6 +74,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     DEFAULT_FORWARD_UPDATES,
     MODES,
     PC_INFERENCE,
+    GATES,
     TRAINING,
     RunConfig,
     compare_runs,
@@ -162,6 +173,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="PC vs BP gradient alignment on N fixed batches at each stage's "
         "start and end, written to alignment.jsonl; 0 = off",
     )
+    parser.add_argument(
+        "--gate",
+        choices=GATES,
+        default=defaults.gate,
+        help="Per-module update gate from stage 2 on; none = ungated",
+    )
+    parser.add_argument("--gate_beta", type=float, default=defaults.gate_beta)
+    parser.add_argument(
+        "--gate_modules",
+        nargs="*",
+        default=list(defaults.gate_modules),
+        metavar="NAME",
+        help="Modules or groups to freeze (--gate freeze)",
+    )
+    parser.add_argument(
+        "--gate_source",
+        nargs="*",
+        default=list(defaults.gate_source),
+        metavar="RUN_DIR",
+        help="Run directories whose rollback.json gives the oracle scores",
+    )
+    parser.add_argument(
+        "--gate_map_windows", type=int, default=defaults.gate_map_windows
+    )
+    parser.add_argument("--gate_seed", type=int, default=defaults.gate_seed)
     parser.add_argument("--log_interval", type=int, default=defaults.log_interval)
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume", action="store_true")
@@ -301,6 +337,12 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         pc_alignment_batches=args.pc_alignment_batches,
         init_perturbation=args.init_perturbation,
         init_perturbation_seed=args.init_perturbation_seed,
+        gate=args.gate,
+        gate_beta=args.gate_beta,
+        gate_modules=tuple(args.gate_modules),
+        gate_source=tuple(str(Path(p).resolve()) for p in args.gate_source),
+        gate_map_windows=args.gate_map_windows,
+        gate_seed=args.gate_seed,
         log_interval=args.log_interval,
     )
 
