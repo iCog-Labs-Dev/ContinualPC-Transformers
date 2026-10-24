@@ -242,8 +242,39 @@ def test_graph_params_for_rejects_params_of_another_graph(convert):
         convert.bert_model_config({**TINY_HF_CONFIG, "num_hidden_layers": 1}, 8)
     )
 
-    with pytest.raises(ValueError, match="do not match"):
+    with pytest.raises(ValueError, match=r"nodes not in the graph: \['L1_mha'"):
         convert.graph_params_for(params, other)
+
+    head = params.nodes["mlm_head"]
+    nodes = dict(params.nodes)
+    nodes["mlm_head"] = NodeParams(
+        weights={"W_out": head.weights["W_out"][:, :-1]},
+        biases={"b_extra": head.biases["b_out"]},
+    )
+    structure = convert.build_bert_structure(
+        convert.bert_model_config(TINY_HF_CONFIG, 8)
+    )
+    with pytest.raises(ValueError) as error:
+        convert.graph_params_for(GraphParams(nodes=nodes), structure)
+    message = str(error.value)
+    assert "mlm_head.weights.W_out: shape (16, 49), expected (16, 50)" in message
+    assert "missing mlm_head.biases.b_out" in message
+    assert "unexpected mlm_head.biases.b_extra" in message
+
+
+def test_source_revision_falls_back_offline_and_on_hub_errors(convert, monkeypatch):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+
+    def fail(*args, **kwargs):
+        raise OSError("no network")
+
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", fail)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    assert convert._resolve_source_revision("org/bert", "v1") == "v1"
+    assert convert._resolve_source_revision("org/bert", None) is None
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(huggingface_hub, "HfApi", None)
+    assert convert._resolve_source_revision("org/bert", "v2") == "v2"
 
 
 def test_check_loading_info_rejects_weights_hugging_face_would_initialise(convert):
@@ -293,6 +324,29 @@ def test_wordpiece_tokenizer_matches_bert_tokenizer_fast(convert, tmp_path):
         expected = reference(sentence, add_special_tokens=False)["input_ids"]
         assert ours.encode(sentence).ids == expected, sentence
     assert ours.get_vocab() == reference.get_vocab()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"do_lower_case": True, "strip_accents": False},
+        {"do_lower_case": False},
+        {"do_lower_case": True, "tokenize_chinese_chars": False},
+    ],
+)
+def test_wordpiece_tokenizer_follows_repo_tokenizer_config(convert, tmp_path, config):
+    transformers = pytest.importorskip("transformers")
+    words = ["the", "café", "cafe", "The", "Café", "中", "中文", "is", "!"]
+    _write_vocab(convert, tmp_path / "vocab.txt", words)
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps(config))
+    sentence = "The Café is 中文 the cafe!"
+
+    settings = convert.tokenizer_settings(str(tmp_path))
+    ours = convert.build_wordpiece_tokenizer(tmp_path / "vocab.txt", **settings)
+    reference = transformers.BertTokenizerFast.from_pretrained(str(tmp_path))
+
+    expected = reference(sentence, add_special_tokens=False)["input_ids"]
+    assert ours.encode(sentence).ids == expected
 
 
 def _tiny_mlm(**kwargs):
