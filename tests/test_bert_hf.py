@@ -452,18 +452,31 @@ def test_bert_residual_identity_is_optional_and_bert_only():
         _tiny_mlm(residual_identity=True)
 
 
-def test_bert_pc_head_gradient_sums_what_backprop_averages():
-    structure = create_encoder_mlm_model(
+def _bert_for_pc(eta_infer: float, infer_steps: int):
+    return create_encoder_mlm_model(
         depth=2,
         embed_dim=16,
         num_heads=4,
         mlp_dim=32,
         seq_len=6,
         vocab_size=20,
-        inference=InferenceSGDNormClip(eta_infer=0.0, infer_steps=2, max_norm=5.0),
+        inference=InferenceSGDNormClip(
+            eta_infer=eta_infer, infer_steps=infer_steps, max_norm=5.0
+        ),
         use_attention_mask=True,
         architecture="bert",
     )
+
+
+def test_bert_pc_head_gradient_sums_what_backprop_averages():
+    """PC's head gradient is the batch's masked-token count times backprop's.
+
+    The head energy sums cross-entropy over masked tokens while the backprop
+    loss averages it; with ``eta_infer=0`` the latents stay feedforward, so
+    the relation is exact. The demo's ``pc_grad_scale`` divides by the
+    expected masked count over batches, so its match is only approximate.
+    """
+    structure = _bert_for_pc(eta_infer=0.0, infer_steps=2)
     key = jax.random.PRNGKey(0)
     params = initialize_params(structure, key)
     batch = _tiny_batch()
@@ -483,8 +496,21 @@ def test_bert_pc_head_gradient_sums_what_backprop_averages():
             rtol=1e-4,
             atol=1e-7,
         )
-    hidden = jax.tree_util.tree_leaves(pc_grads.nodes["mlm_transform"])
-    assert all(float(jnp.max(jnp.abs(leaf))) == 0.0 for leaf in hidden)
+
+
+def test_bert_pc_inference_reaches_hidden_nodes():
+    structure = _bert_for_pc(eta_infer=0.1, infer_steps=5)
+    key = jax.random.PRNGKey(0)
+    params = initialize_params(structure, key)
+
+    pc_grads, *_ = get_graph_param_gradient_autoregressive(
+        params, _tiny_batch(), structure, key
+    )
+
+    for name in ("mlm_transform", "L1_mlp2", "L1_mha"):
+        leaves = jax.tree_util.tree_leaves(pc_grads.nodes[name])
+        assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves)
+        assert max(float(jnp.max(jnp.abs(leaf))) for leaf in leaves) > 0.0, name
 
 
 @pytest.fixture
