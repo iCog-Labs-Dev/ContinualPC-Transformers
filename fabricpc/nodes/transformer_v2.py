@@ -144,6 +144,8 @@ class EmbeddingNode(NodeBase):
         self_grad = type(energy_obj).grad_latent(
             new_state.z_latent, new_state.z_mu, energy_obj.config
         )
+        if new_state.dual is not None:
+            self_grad = self_grad + new_state.dual
         return new_state, input_grads, self_grad
 
 

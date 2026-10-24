@@ -30,7 +30,7 @@ from fabricpc.core.topology import Edge
 from fabricpc.core.types import GraphStructure, NodeInfo, NodeParams, NodeState
 from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import FeedforwardStateInit
-from fabricpc.nodes.base import NodeBase, SlotSpec
+from fabricpc.nodes.base import NodeBase, SlotSpec, add_dual_energy
 from fabricpc.nodes.identity import IdentityNode
 from fabricpc.nodes.transformer_v2 import (
     EmbeddingNode,
@@ -287,7 +287,7 @@ class MaskedVocabProjectionNode(NodeBase):
         per_token_ce = -jnp.sum(state.z_latent * log_probs, axis=-1)
         scale = node_info.node_config.get("output_energy_scale", 1.0)
         energy = scale * jnp.sum(per_token_ce * mask, axis=-1)
-        return state._replace(energy=energy)
+        return state._replace(energy=add_dual_energy(energy, state))
 
 
 class EncoderBackbone(NamedTuple):
