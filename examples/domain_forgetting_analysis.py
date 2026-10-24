@@ -11,6 +11,9 @@ refuses any computed from other stage snapshots, and writes
 ``run_config.json`` and ``summary.json`` of the ``--run_dirs`` (default:
 every run under ``--results_dir``) and writes ``frontier.json``,
 ``frontier.pdf`` and ``frontier.png``; ``all`` leaves it out.
+``architecture`` reads the predictor tables of the ``--run_dirs``, groups
+them by domain order and writes ``architecture_baseline.json`` (the
+leave-one-order-out test of onset energy beyond type + depth).
 
 Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py drift \\
@@ -28,6 +31,10 @@ Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py frontier \\
         --results_dir results/domain_forgetting \\
         --output_dir results/domain_forgetting/frontier
+    PYTHONPATH=. python examples/domain_forgetting_analysis.py architecture \\
+        --run_dirs results/domain_forgetting/g8_rev_bp_seed{0,1,2} ... \\
+        --development_orders news,reviews,wiki wiki,reviews,news \\
+        --output_dir results/domain_forgetting/architecture
     PYTHONPATH=. python examples/domain_forgetting_analysis.py all \\
         --run_dir results/domain_forgetting/bp_seed0
 """
@@ -44,6 +51,7 @@ from jax_setup import set_jax_flags_before_importing_jax
 
 set_jax_flags_before_importing_jax()
 
+from fabricpc.experiments.domain_forgetting import architecture_baseline
 from fabricpc.experiments.domain_forgetting.artifacts import atomic_write_json
 from fabricpc.experiments.domain_forgetting.error_maps import (
     SETTINGS,
@@ -72,8 +80,9 @@ from fabricpc.experiments.domain_forgetting.localization import (
     run_provenance,
 )
 
+DEVELOPMENT = architecture_baseline.DEVELOPMENT_ORDERS
 RUN_COMMANDS = ("drift", "rollback", "error_maps", "predictors", "correlations")
-COMMANDS = (*RUN_COMMANDS, "frontier", "all")
+COMMANDS = (*RUN_COMMANDS, "frontier", "architecture", "all")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,7 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run_dirs",
         nargs="+",
-        help="run directories (seeds) for correlations, or runs for frontier",
+        help="run directories (seeds) for correlations, or runs for frontier "
+        "and architecture",
     )
     parser.add_argument(
         "--results_dir",
@@ -114,7 +124,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictor_windows", type=int, default=256)
     parser.add_argument("--predictor_batch_size", type=int, default=8)
     parser.add_argument("--bootstrap", type=int, default=BOOTSTRAP_RESAMPLES)
-    parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
+    parser.add_argument(
+        "--permutations",
+        type=int,
+        help=f"default {PERMUTATIONS} (correlations) or "
+        f"{architecture_baseline.PERMUTATIONS} (architecture)",
+    )
+    parser.add_argument(
+        "--development_orders",
+        nargs="+",
+        default=[architecture_baseline.order_key(o) for o in DEVELOPMENT],
+        help="architecture: development orders as comma-joined domains",
+    )
+    parser.add_argument(
+        "--held_out_orders",
+        nargs="+",
+        help="architecture: held-out orders (default: all non-development orders)",
+    )
     parser.add_argument("--no_figure", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -141,7 +167,7 @@ def run_correlations(args: argparse.Namespace) -> dict[str, Any]:
     result = compute_correlations(
         run_dirs,
         resamples=args.bootstrap,
-        permutations=args.permutations,
+        permutations=PERMUTATIONS if args.permutations is None else args.permutations,
         seed=args.seed,
     )
     if not args.no_figure:
@@ -170,6 +196,32 @@ def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def run_architecture(args: argparse.Namespace) -> dict[str, Any]:
+    """Test whether onset energy predicts recovery beyond type + depth."""
+    if not args.run_dirs:
+        raise SystemExit("architecture needs --run_dirs")
+    output = Path(args.output_dir or Path(args.results_dir) / "architecture")
+    output.mkdir(parents=True, exist_ok=True)
+    parse = architecture_baseline.parse_order
+    result = architecture_baseline.run_architecture_baseline(
+        args.run_dirs,
+        development=[parse(o) for o in args.development_orders],
+        held_out=(
+            [parse(o) for o in args.held_out_orders] if args.held_out_orders else None
+        ),
+        permutations=(
+            architecture_baseline.PERMUTATIONS
+            if args.permutations is None
+            else args.permutations
+        ),
+        seed=args.seed,
+    )
+    atomic_write_json(output / "architecture_baseline.json", result)
+    if not args.quiet:
+        print(architecture_baseline.format_table(result))
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     """Run one analysis command, or ``all`` of them in order."""
     args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
@@ -183,6 +235,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             results[command] = run_correlations(args)
         elif command == "frontier":
             results[command] = run_frontier(args)
+        elif command == "architecture":
+            results[command] = run_architecture(args)
         else:
             context = context or _context(args)
             output = Path(args.run_dir)
