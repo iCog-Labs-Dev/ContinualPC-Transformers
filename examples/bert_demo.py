@@ -15,7 +15,9 @@ vocabulary (no extra dependencies). Pass text files (one document per line)
 to pretrain on your own data; ``--tokenizer bpe`` needs the ``text`` extra
 (``pip install -e '.[text]'``). ``--save_params`` writes the trained weights
 with ``fabricpc.utils.save_params``; ``--init_params`` starts training from
-such a file instead of a fresh initialisation.
+such a file instead of a fresh initialisation. ``--architecture bert`` builds
+the Hugging Face BERT layout; with ``--tokenizer checkpoint`` it trains from a
+file written by ``examples/convert_hf_bert.py`` using that file's tokenizer.
 
 Usage:
     PYTHONPATH=. python examples/bert_demo.py
@@ -25,6 +27,9 @@ Usage:
         --val_file val.txt --tokenizer bpe --vocab_size 4000 --seq_len 64
     PYTHONPATH=. python examples/bert_demo.py --save_params runs/mlm.npz
     PYTHONPATH=. python examples/bert_demo.py --init_params runs/mlm.npz
+    PYTHONPATH=. python examples/bert_demo.py --architecture bert \\
+        --init_params checkpoints/bert_mini_128.npz --tokenizer checkpoint \\
+        --seq_len 128 --depth 4 --embed_dim 256 --num_heads 4 --mlp_dim 1024
 """
 
 from jax_setup import set_jax_flags_before_importing_jax
@@ -49,7 +54,7 @@ from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.types import GraphParams, GraphStructure
 from fabricpc.experiments.ab_experiment import ABExperiment, ABResults, ExperimentArm
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
+from fabricpc.nodes.encoder_transformer import BERT_LN_EPS, create_encoder_mlm_model
 from fabricpc.training import (
     count_training_batches,
     evaluate_mlm,
@@ -124,6 +129,21 @@ def bpe_tokenize(
         val_texts, vocab_size=vocab_size, tokenizer=tokenizer
     )
     return train_ids, val_ids, tokenizer.get_vocab(), tokenizer.to_str()
+
+
+def checkpoint_tokenize(
+    train_texts: Sequence[str], val_texts: Sequence[str], path: Path
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int], str]:
+    """Token ids from the tokenizer saved with the params at ``path``."""
+    tokenizer_json = read_params_metadata(path).get("tokenizer_json")
+    if tokenizer_json is None:
+        raise ValueError(f"{path} holds no tokenizer_json for --tokenizer checkpoint")
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_str(tokenizer_json)
+    train_ids, _ = tokenize_texts_bpe(train_texts, vocab_size=0, tokenizer=tokenizer)
+    val_ids, _ = tokenize_texts_bpe(val_texts, vocab_size=0, tokenizer=tokenizer)
+    return train_ids, val_ids, tokenizer.get_vocab(), tokenizer_json
 
 
 def make_loader(
@@ -233,9 +253,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--val_file", type=Path, default=None)
     parser.add_argument(
         "--tokenizer",
-        choices=["word", "bpe"],
+        choices=["word", "bpe", "checkpoint"],
         default="word",
-        help="word: ASCII words, no extra deps; bpe: needs the text extra",
+        help="word: ASCII words, no extra deps; bpe: needs the text extra; "
+        "checkpoint: the tokenizer saved with --init_params",
     )
     parser.add_argument("--vocab_size", type=int, default=4000, help="BPE only")
     parser.add_argument("--seq_len", type=int, default=16)
@@ -244,6 +265,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--embed_dim", type=int, default=32)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--mlp_dim", type=int, default=64)
+    parser.add_argument(
+        "--architecture",
+        choices=["encoder", "bert"],
+        default="encoder",
+        help="encoder: pre-LN with a final LayerNorm; bert: post-LN Hugging Face "
+        "BERT layout, e.g. for params from convert_hf_bert.py",
+    )
+    parser.add_argument(
+        "--ln_eps",
+        type=float,
+        default=None,
+        help="LayerNorm epsilon for --architecture bert (default: the "
+        "--init_params file's, else 1e-12)",
+    )
     parser.add_argument("--dropout_rate", type=float, default=0.0)
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--num_epochs", type=float, default=10)
@@ -295,6 +330,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--train_file and --val_file must be given together")
     if args.ab_trials > 0 and (args.save_params or args.init_params):
         parser.error("--save_params and --init_params are not used with --ab_trials")
+    if args.tokenizer == "checkpoint" and args.init_params is None:
+        parser.error("--tokenizer checkpoint needs --init_params")
+    if args.ln_eps is not None and args.architecture != "bert":
+        parser.error("--ln_eps is only used with --architecture bert")
     if args.ab_trials > 0 and importlib.util.find_spec("scipy") is None:
         parser.error("--ab_trials needs scipy: pip install -e '.[experiments]'")
     return args
@@ -311,6 +350,8 @@ def build_model(args, vocab_size: int):
         vocab_size=vocab_size,
         dropout_rate=args.dropout_rate,
         pc_output_energy_scale=args.pc_output_energy_scale,
+        architecture=args.architecture,
+        ln_eps=args.ln_eps,
         inference=InferenceSGDNormClip(
             eta_infer=args.pc_eta_infer,
             infer_steps=args.pc_infer_steps,
@@ -333,13 +374,37 @@ def load_token_streams(
         train_texts, val_texts = read_texts(args.train_file), read_texts(args.val_file)
     if args.tokenizer == "bpe":
         return bpe_tokenize(train_texts, val_texts, args.vocab_size)
+    if args.tokenizer == "checkpoint":
+        return checkpoint_tokenize(train_texts, val_texts, args.init_params)
     return (*word_tokenize(train_texts, val_texts), None)
+
+
+def resolve_ln_eps(args) -> Optional[float]:
+    """LayerNorm epsilon for ``--architecture bert``; ``None`` for the encoder.
+
+    An unset ``--ln_eps`` takes the value recorded with ``--init_params``, else
+    BERT's ``1e-12``.
+    """
+    if args.architecture != "bert":
+        return None
+    if args.ln_eps is not None:
+        return float(args.ln_eps)
+    if args.init_params is not None:
+        saved = read_params_metadata(args.init_params).get("config", {}).get("ln_eps")
+        if saved is not None:
+            return float(saved)
+    return BERT_LN_EPS
 
 
 def model_config(args, vocab_size: int) -> Dict[str, Any]:
     """Model settings saved with ``--save_params`` and checked by ``--init_params``."""
+    architecture = {"architecture": args.architecture}
+    if args.architecture == "bert":
+        architecture["ln_eps"] = (
+            BERT_LN_EPS if args.ln_eps is None else float(args.ln_eps)
+        )
     return {
-        "architecture": "encoder",
+        **architecture,
         "depth": args.depth,
         "embed_dim": args.embed_dim,
         "num_heads": args.num_heads,
@@ -355,16 +420,16 @@ def load_init_params(
 ) -> GraphParams:
     """Params saved by ``--save_params`` to start training from.
 
-    The file's architecture (``"encoder"`` when it records none), ``seq_len``
-    and vocabulary must match the current run before its parameters are
-    checked against ``structure``.
+    The file's architecture (``"encoder"`` when it records none), ``seq_len``,
+    ``ln_eps`` (when both record one) and vocabulary must match the current run
+    before its parameters are checked against ``structure``.
     """
     metadata = read_params_metadata(path)
     config = metadata.get("config", {})
     expected = model_config(args, len(vocab))
-    for key in ("architecture", "seq_len"):
+    for key in ("architecture", "seq_len", "ln_eps"):
         saved = config.get(key, "encoder" if key == "architecture" else None)
-        if saved is not None and saved != expected[key]:
+        if saved is not None and key in expected and saved != expected[key]:
             raise ValueError(
                 f"{path}: saved {key} {saved!r} does not match this run's "
                 f"{key} {expected[key]!r}"
@@ -583,6 +648,7 @@ def compare_modes(args, train_ids, val_ids, vocab) -> ABResults:
 def main(argv: Optional[Sequence[str]] = None):
     """Pretrain (or compare modes with ``--ab_trials``) and return the results."""
     args = parse_args(argv)
+    args.ln_eps = resolve_ln_eps(args)
     train_ids, val_ids, vocab, tokenizer_json = load_token_streams(args)
     if args.ab_trials > 0:
         return compare_modes(args, train_ids, val_ids, vocab)
