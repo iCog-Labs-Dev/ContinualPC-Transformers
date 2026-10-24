@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Sequential MLM domain-forgetting runner (backprop or spike-only PC).
+"""Sequential MLM domain-forgetting runner (backprop, spike-only or standard PC).
 
 S0 loads the checkpoint; stage s trains on the s-th domain with a fresh
 optimizer and schedule, and every stage evaluates all domains on their fixed
 validation sets. ``compare`` checks a run (spike-only PC, or BP from a
 perturbed initialisation for the float32 noise floor) against a BP run of
-the same setup.
+the same setup. ``probe`` prints per-module PC vs backprop gradient cosines
+and norm ratios on fixed batches of one domain, for one or a grid of PC
+inference settings.
 
 Usage:
     PYTHONPATH=. python examples/mlm_domain_forgetting.py \\
@@ -18,6 +20,18 @@ Usage:
         --pc_inference spiking --pc_eta_infer 0 --pc_spike_eta 1 \\
         --pc_spike_depth longest --pc_forward_updates initial \\
         --output_dir results/domain_forgetting/pc_seed0
+
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode pc \\
+        --pc_inference standard --pc_eta_infer 0.01 --pc_infer_steps 50 \\
+        --pc_alignment_batches 4 --output_dir results/domain_forgetting/spc_seed0
+
+    Standard PC on BERT-Mini diverges at --pc_eta_infer >= 0.02 and, below
+    that, its error barely reaches the lower blocks; calibrate with ``probe``
+    before any long run.
+
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py probe \\
+        --checkpoint checkpoints/bert_mini_128.json --domain news \\
+        --pc_inference standard --grid "0.005:50,0.01:20,0.01:50" --batches 4
 
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
         --init_perturbation 1e-7 --output_dir results/domain_forgetting/bp_pert
@@ -41,9 +55,12 @@ set_jax_flags_before_importing_jax()
 
 from fabricpc.experiments.domain_forgetting.artifacts import atomic_write_json
 from fabricpc.experiments.domain_forgetting.data import DOMAIN_REGISTRY
+from fabricpc.experiments.domain_forgetting.probe import parse_grid, probe_alignment
 from fabricpc.experiments.domain_forgetting.runner import (
     BERT_MINI_SHAPE,
+    DEFAULT_FORWARD_UPDATES,
     MODES,
+    PC_INFERENCE,
     RunConfig,
     compare_runs,
     run_domain_forgetting,
@@ -90,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Do not require the BERT-Mini shape {BERT_MINI_SHAPE}",
     )
     parser.add_argument(
-        "--pc_inference", choices=("spiking",), default=defaults.pc_inference
+        "--pc_inference", choices=PC_INFERENCE, default=defaults.pc_inference
     )
     parser.add_argument("--pc_eta_infer", type=float, default=defaults.pc_eta_infer)
     parser.add_argument("--pc_spike_eta", type=float, default=defaults.pc_spike_eta)
@@ -102,13 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pc_forward_updates",
         choices=("none", "initial", "final"),
-        default=defaults.pc_forward_updates,
+        default=None,
+        help="Default: 'initial' for spiking, 'none' for standard",
     )
     parser.add_argument(
         "--pc_infer_steps",
         type=int,
         default=None,
-        help="Default: the longest free depth of the graph",
+        help="Spiking default: the longest free depth; required for standard",
     )
     parser.add_argument("--pc_max_norm", type=float, default=defaults.pc_max_norm)
     parser.add_argument(
@@ -125,6 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--init_perturbation_seed", type=int, default=defaults.init_perturbation_seed
+    )
+    parser.add_argument(
+        "--pc_alignment_batches",
+        type=int,
+        default=defaults.pc_alignment_batches,
+        metavar="N",
+        help="PC vs BP gradient alignment on N fixed batches at each stage's "
+        "start and end, written to alignment.jsonl; 0 = off",
     )
     parser.add_argument("--log_interval", type=int, default=defaults.log_interval)
     resume = parser.add_mutually_exclusive_group()
@@ -148,6 +174,84 @@ def build_compare_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="Default: <pc_dir>/pc_bp_agreement.json"
     )
     return parser
+
+
+def build_probe_parser() -> argparse.ArgumentParser:
+    """Return the parser of the ``probe`` command."""
+    defaults = RunConfig(checkpoint="", data_dir="", domains=(), output_dir="")
+    parser = argparse.ArgumentParser(
+        prog="mlm_domain_forgetting.py probe",
+        description=(
+            "Per-module PC vs backprop gradient cosine and norm ratio on fixed "
+            "training batches of one domain."
+        ),
+    )
+    parser.add_argument("--checkpoint", default=None, help="Default: the run's")
+    parser.add_argument("--run_dir", default=None)
+    parser.add_argument(
+        "--stage", type=int, default=None, help="Probe stage_<s>.npz of --run_dir"
+    )
+    parser.add_argument("--data_dir", default=None, help="Default: the run's")
+    parser.add_argument("--domain", required=True, choices=list(DOMAIN_REGISTRY))
+    parser.add_argument("--batches", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--pc_inference", choices=PC_INFERENCE, default="spiking")
+    parser.add_argument("--pc_eta_infer", type=float, default=None)
+    parser.add_argument("--pc_infer_steps", type=int, default=None)
+    parser.add_argument("--pc_max_norm", type=float, default=None)
+    parser.add_argument("--pc_output_energy_scale", type=float, default=None)
+    parser.add_argument(
+        "--pc_forward_updates", choices=("none", "initial", "final"), default=None
+    )
+    parser.add_argument(
+        "--grid",
+        default=None,
+        metavar="ETA:STEPS,...",
+        help="Probe each eta:steps setting instead of --pc_eta_infer/--pc_infer_steps",
+    )
+    parser.add_argument("--dropout_rate", type=float, default=0.0)
+    parser.add_argument("--mask_prob", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--skip_shape_check",
+        action="store_true",
+        help=f"Do not require the BERT-Mini shape {BERT_MINI_SHAPE}",
+    )
+    parser.add_argument("--out", default=None, help="Also write the JSON here")
+    return parser
+
+
+def run_probe(argv: Sequence[str]) -> dict[str, Any]:
+    """Probe PC vs backprop gradient alignment and print one line per module."""
+    args = build_probe_parser().parse_args(argv)
+    if args.grid is not None:
+        if args.pc_eta_infer is not None or args.pc_infer_steps is not None:
+            raise ValueError("--grid replaces --pc_eta_infer and --pc_infer_steps")
+        settings = parse_grid(args.grid)
+    else:
+        eta = 0.0 if args.pc_eta_infer is None else args.pc_eta_infer
+        settings = [(eta, args.pc_infer_steps)]
+    report = probe_alignment(
+        domain=args.domain,
+        checkpoint=args.checkpoint,
+        data_dir=args.data_dir,
+        run_dir=args.run_dir,
+        stage=args.stage,
+        num_batches=args.batches,
+        batch_size=args.batch_size,
+        pc_inference=args.pc_inference,
+        settings=settings,
+        max_norm=args.pc_max_norm,
+        output_energy_scale=args.pc_output_energy_scale,
+        forward_updates=args.pc_forward_updates,
+        dropout_rate=args.dropout_rate,
+        mask_prob=args.mask_prob,
+        seed=args.seed,
+        expected_shape=None if args.skip_shape_check else dict(BERT_MINI_SHAPE),
+    )
+    if args.out:
+        atomic_write_json(Path(args.out), report)
+    return report
 
 
 def config_from_args(args: argparse.Namespace) -> RunConfig:
@@ -177,10 +281,13 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         pc_eta_infer=args.pc_eta_infer,
         pc_spike_eta=args.pc_spike_eta,
         pc_spike_depth=args.pc_spike_depth,
-        pc_forward_updates=args.pc_forward_updates,
+        pc_forward_updates=(
+            args.pc_forward_updates or DEFAULT_FORWARD_UPDATES[args.pc_inference]
+        ),
         pc_infer_steps=args.pc_infer_steps,
         pc_max_norm=args.pc_max_norm,
         pc_output_energy_scale=args.pc_output_energy_scale,
+        pc_alignment_batches=args.pc_alignment_batches,
         init_perturbation=args.init_perturbation,
         init_perturbation_seed=args.init_perturbation_seed,
         log_interval=args.log_interval,
@@ -202,10 +309,12 @@ def run_compare(argv: Sequence[str]) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
-    """Run the benchmark, or ``compare`` two finished runs."""
+    """Run the benchmark, ``compare`` two finished runs, or ``probe`` alignment."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["compare"]:
         return run_compare(argv[1:])
+    if argv[:1] == ["probe"]:
+        return run_probe(argv[1:])
     args = build_parser().parse_args(argv)
     result = run_domain_forgetting(
         config_from_args(args), resume=args.resume, overwrite=args.overwrite

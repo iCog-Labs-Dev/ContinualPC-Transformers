@@ -1,4 +1,4 @@
-"""Sequential MLM domain-forgetting runner for backprop and spike-only PC.
+"""Sequential MLM domain-forgetting runner for backprop, spike-only and standard PC.
 
 Stage S0 is the loaded checkpoint; stage ``s`` trains on the ``s``-th domain
 from stage ``s - 1``'s parameters with a fresh optimizer and schedule. After
@@ -11,6 +11,13 @@ clip is ``grad_clip * pc_output_energy_scale`` and Adam's ``eps`` is
 ``adam_eps * pc_output_energy_scale``. Adam is invariant to a common
 gradient scale once ``eps`` scales with it, so the PC update equals
 backprop's at any scale.
+
+Standard PC (``pc_inference="standard"``) runs ``pc_infer_steps`` steps of
+norm-clipped SGD inference at rate ``pc_eta_infer`` and takes the weight
+update from the final inference state (``pc_forward_updates="none"``). Its
+gradient is not equal to backprop's, so the scaled clip and ``eps`` are kept
+as conventions that match spike-only PC, not as an equivalence; the scale
+relation to backprop is only approximate.
 
 Each update averages its micro-batch gradients weighted by their masked-token
 counts (``Σ_k g_k n_k / Σ_k n_k``), so it equals the gradient of the mean
@@ -40,8 +47,14 @@ from examples.bert_forgetting_benchmark import (
     ensure_output_dir,
 )
 from fabricpc.core.depth import node_output_depths
-from fabricpc.core.inference import InferenceSGDNormClip, InferenceSpikingPrecision
-from fabricpc.core.types import GraphParams, GraphStructure, NodeParams
+from fabricpc.core.inference import (
+    InferenceSGDNormClip,
+    InferenceSGDNormClipDecay,
+    InferenceSpikingPrecision,
+    gather_inputs,
+)
+from fabricpc.core.scaling import scale_inputs
+from fabricpc.core.types import GraphParams, GraphState, GraphStructure, NodeParams
 from fabricpc.experiments.domain_forgetting.artifacts import (
     atomic_save_npz,
     atomic_write_json,
@@ -74,7 +87,11 @@ from fabricpc.training.train_backprop import (
     _apply_optimizer_update_when_masked,
     _loss_and_grad_backprop_mlm_no_update,
 )
-from fabricpc.training.train_mlm import create_jit_gradient_step_pcn_mlm
+from fabricpc.training.train_mlm import (
+    create_jit_gradient_step_pcn_mlm,
+    create_pc_bp_gradient_comparison,
+    get_graph_param_gradient_pcn_mlm,
+)
 from fabricpc.utils.data.dataloader import MlmTextBatcher
 
 BERT_MINI_SHAPE = {
@@ -86,13 +103,15 @@ BERT_MINI_SHAPE = {
     "vocab_size": 30522,
 }
 MODES = ("backprop", "pc")
+PC_INFERENCE = ("spiking", "standard")
+DEFAULT_FORWARD_UPDATES = {"spiking": "initial", "standard": "none"}
 METRICS = ("masked_ce", "masked_perplexity", "masked_accuracy")
 MATRIX_FILES = {
     "masked_ce": "masked_ce_matrix.json",
     "masked_perplexity": "masked_perplexity_matrix.json",
     "masked_accuracy": "masked_accuracy_matrix.json",
 }
-RESUME_IGNORED_KEYS = ("log_interval", "output_dir")
+RESUME_IGNORED_KEYS = ("log_interval", "output_dir", "pc_alignment_batches")
 COMPARE_IGNORED_KEYS = (
     "mode",
     "output_dir",
@@ -120,6 +139,7 @@ RUN_ARTIFACT_FILES = (
     "exposure.json",
     "runtime.json",
     "pc_bp_agreement.json",
+    "alignment.jsonl",
     *ANALYSIS_FILES,
 )
 RUN_ARTIFACT_PATTERNS = ("stage_*.npz", "training_log_stage_*.jsonl")
@@ -159,6 +179,7 @@ class RunConfig:
     pc_infer_steps: int | None = None
     pc_max_norm: float = 5.0
     pc_output_energy_scale: float = 1.0
+    pc_alignment_batches: int = 0
     init_perturbation: float = 0.0
     init_perturbation_seed: int = 0
     log_interval: int = 10
@@ -179,11 +200,46 @@ class RunConfig:
             raise ValueError("min_lr_ratio must be in [0, 1]")
         if not (math.isfinite(self.init_perturbation) and self.init_perturbation >= 0):
             raise ValueError("init_perturbation must be finite and non-negative")
+        if self.pc_alignment_batches < 0:
+            raise ValueError("pc_alignment_batches must be non-negative")
+        if self.mode != "pc" and self.pc_alignment_batches:
+            raise ValueError("pc_alignment_batches needs mode 'pc'")
         if self.mode == "pc":
-            if self.pc_inference != "spiking":
-                raise ValueError("only --pc_inference spiking is supported")
+            if self.pc_inference not in PC_INFERENCE:
+                raise ValueError(
+                    f"pc_inference must be 'spiking' or 'standard', "
+                    f"got {self.pc_inference!r}"
+                )
             if self.pc_output_energy_scale <= 0.0:
                 raise ValueError("pc_output_energy_scale must be positive")
+            if self.pc_inference == "standard":
+                self._validate_standard()
+
+    def _validate_standard(self) -> None:
+        """Standard PC needs explicit inference settings and no spike flags."""
+        if not self.pc_eta_infer > 0.0:
+            raise ValueError("standard PC needs pc_eta_infer > 0")
+        if self.pc_infer_steps is None or self.pc_infer_steps < 1:
+            raise ValueError(
+                "standard PC needs pc_infer_steps >= 1 (there is no depth default)"
+            )
+        if self.pc_forward_updates != "none":
+            raise ValueError(
+                "standard PC needs pc_forward_updates 'none' (weight update from "
+                f"the final inference state), got {self.pc_forward_updates!r}"
+            )
+        spike_flags = [
+            name
+            for name, value, default in (
+                ("pc_spike_eta", self.pc_spike_eta, 1.0),
+                ("pc_spike_depth", self.pc_spike_depth, "longest"),
+            )
+            if value != default
+        ]
+        if spike_flags:
+            raise ValueError(
+                f"{', '.join(spike_flags)} only apply to spiking PC, not standard"
+            )
 
     @property
     def clip_norm(self) -> float:
@@ -256,6 +312,7 @@ def build_structure(
 
 
 def _spiking_inference(config: RunConfig, infer_steps: int) -> Any:
+    """Spike-only PC inference with ``infer_steps`` steps."""
     return InferenceSpikingPrecision(
         eta_infer=config.pc_eta_infer,
         infer_steps=infer_steps,
@@ -265,14 +322,51 @@ def _spiking_inference(config: RunConfig, infer_steps: int) -> Any:
     )
 
 
+def _standard_inference(config: RunConfig) -> Any:
+    """Standard PC inference that also counts per-sample energy rises.
+
+    ``rise_decay=1`` keeps every update identical to ``InferenceSGDNormClip``;
+    the guarded step only adds the rise count used to detect divergence.
+    """
+    return InferenceSGDNormClipDecay(
+        eta_infer=config.pc_eta_infer,
+        infer_steps=config.pc_infer_steps,
+        max_norm=config.pc_max_norm,
+        rise_decay=1.0,
+    )
+
+
+def build_inference(
+    config: RunConfig, model_config: Mapping[str, Any]
+) -> tuple[Any, int | None]:
+    """Return the run's inference object and its PC inference step count.
+
+    Spike-only PC defaults ``pc_infer_steps`` to the longest free depth and
+    rejects fewer steps; standard PC uses ``pc_infer_steps`` as given.
+    Backprop gets a placeholder inference object and ``None``.
+    """
+    if config.mode != "pc":
+        return InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0), None
+    if config.pc_inference == "standard":
+        return _standard_inference(config), int(config.pc_infer_steps)
+    probe = build_structure(model_config, config, _spiking_inference(config, 1))
+    needed = max_free_depth(probe, config.pc_spike_depth)
+    infer_steps = config.pc_infer_steps or needed
+    if infer_steps < needed:
+        raise ValueError(
+            f"pc_infer_steps {infer_steps} < longest free depth {needed}; "
+            "the deepest nodes would never spike"
+        )
+    return _spiking_inference(config, infer_steps), infer_steps
+
+
 def load_base_model(config: RunConfig) -> BaseModel:
     """Validate the source checkpoint and load its parameters into memory.
 
     Checks ``architecture == "bert"``, the expected shape, that the tokenizer
     vocabulary equals the checkpoint vocabulary, and (through
     ``load_init_params``) architecture, ``seq_len``, ``ln_eps`` and every
-    parameter shape. In PC mode ``pc_infer_steps`` defaults to the longest
-    free depth and may not be smaller.
+    parameter shape. The inference object comes from ``build_inference``.
     """
     from tokenizers import Tokenizer
 
@@ -299,19 +393,7 @@ def load_base_model(config: RunConfig) -> BaseModel:
     if tokenizer.get_vocab() != vocab or len(vocab) != model_config["vocab_size"]:
         raise ValueError(f"{path}: tokenizer vocab does not match the checkpoint")
 
-    infer_steps = None
-    if config.mode == "pc":
-        probe = build_structure(model_config, config, _spiking_inference(config, 1))
-        needed = max_free_depth(probe, config.pc_spike_depth)
-        infer_steps = config.pc_infer_steps or needed
-        if infer_steps < needed:
-            raise ValueError(
-                f"pc_infer_steps {infer_steps} < longest free depth {needed}; "
-                "the deepest nodes would never spike"
-            )
-        inference = _spiking_inference(config, infer_steps)
-    else:
-        inference = InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0)
+    inference, infer_steps = build_inference(config, model_config)
     structure = build_structure(model_config, config, inference)
     params = load_init_params(
         str(path),
@@ -459,13 +541,46 @@ GradientFn = Callable[
 ]
 
 
+def state_total_energy(
+    params: GraphParams, state: GraphState, structure: GraphStructure
+) -> jax.Array:
+    """Batch-mean total energy of ``state`` over every node with inputs.
+
+    Each node's prediction is recomputed from the current latents of its
+    inputs, so the energy is that of ``state`` itself.
+    """
+    total = jnp.array(0.0)
+    batch_size = None
+    for name in structure.node_order:
+        node_info = structure.nodes[name].node_info
+        if node_info.in_degree == 0:
+            continue
+        inputs = scale_inputs(
+            gather_inputs(node_info, structure, state), node_info.scaling_config
+        )
+        _, projected = node_info.node_class.forward(
+            params.nodes[name], inputs, state.nodes[name], node_info
+        )
+        batch_size = projected.energy.shape[0]
+        total = total + jnp.sum(projected.energy)
+    return total / (batch_size or 1)
+
+
 def make_gradient_fn(
-    mode: str, structure: GraphStructure, forward_updates: str = "initial"
+    mode: str,
+    structure: GraphStructure,
+    forward_updates: str = "initial",
+    pc_inference: str = "spiking",
 ) -> GradientFn:
     """Return a jitted ``(params, batch, key) -> (grads, loss_sum, count, extras)``.
 
     ``loss_sum`` is the masked CE summed over the batch's masked tokens.
-    Both modes draw dropout masks from ``key`` the same way.
+    Both modes draw dropout masks from ``key`` the same way. Standard PC
+    extras add ``pc_energy_start`` (the target-clamped feedforward state) and
+    ``pc_energy_end`` (the final inference state the weight update uses).
+    ``pc_total_energy`` sums the energies stored in the final state, which
+    were computed before the last latent update, so it is the energy of step
+    ``T - 1``, not ``pc_energy_end``.
     """
     if mode == "backprop":
 
@@ -477,6 +592,27 @@ def make_gradient_fn(
             return grads, loss * count, count, {}
 
         return backprop
+    if pc_inference == "standard":
+
+        @jax.jit
+        def standard(params, batch, key):
+            grads, metrics, initial, _free, final = get_graph_param_gradient_pcn_mlm(
+                params, batch, structure, key, forward_updates
+            )
+            count = metrics["num_masked_tokens"]
+            return (
+                grads,
+                metrics["masked_loss"] * count,
+                count,
+                {
+                    "pc_energy_rises": metrics["pc_energy_rises"],
+                    "pc_total_energy": metrics["pc_total_energy"],
+                    "pc_energy_start": state_total_energy(params, initial, structure),
+                    "pc_energy_end": state_total_energy(params, final, structure),
+                },
+            )
+
+        return standard
     pc_step = create_jit_gradient_step_pcn_mlm(structure, forward_updates)
 
     def pc(params, batch, key):
@@ -531,6 +667,123 @@ def accumulate_gradients(
         count,
         extras,
     )
+
+
+AlignmentFn = Callable[
+    [GraphParams, dict[str, jax.Array], jax.Array], dict[str, dict[str, jax.Array]]
+]
+
+
+def make_alignment_fn(
+    structure: GraphStructure, forward_updates: str = "none"
+) -> AlignmentFn:
+    """Return the jitted per-module PC vs backprop gradient comparison."""
+    return create_pc_bp_gradient_comparison(structure, forward_updates)
+
+
+def fixed_mlm_batches(
+    stream: np.ndarray,
+    structure: GraphStructure,
+    special_ids: Mapping[str, int],
+    *,
+    num_batches: int,
+    batch_size: int,
+    mask_prob: float,
+    seed: int,
+) -> tuple[list[dict[str, jax.Array]], list[jax.Array]]:
+    """Return the first ``num_batches`` unshuffled MLM batches and their keys.
+
+    Masks come from ``seed`` and the dropout keys from ``PRNGKey(seed)``,
+    so the batches are the same on every call.
+    """
+    seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
+    vocab_size = int(structure.nodes[structure.task_map["y"]].node_info.shape[-1])
+    batcher = MlmTextBatcher(
+        token_ids=np.asarray(stream, dtype=np.int32),
+        seq_len=seq_len,
+        batch_size=batch_size,
+        pad_token_id=special_ids["[PAD]"],
+        mask_token_id=special_ids["[MASK]"],
+        vocab_size=vocab_size,
+        special_token_ids=set(special_ids.values()),
+        cls_token_id=special_ids["[CLS]"],
+        seed=seed,
+        mask_prob=mask_prob,
+        shuffle=False,
+        token_unit="subword",
+    )
+    batches = []
+    for batch_data in batcher:
+        if len(batches) >= num_batches:
+            break
+        batches.append(_convert_batch(batch_data))
+    if len(batches) < num_batches:
+        raise ValueError(
+            f"domain stream has {len(batches)} batches, {num_batches} requested"
+        )
+    keys = list(jax.random.split(jax.random.PRNGKey(seed), num_batches))
+    return batches, keys
+
+
+def gradient_alignment(
+    alignment_fn: AlignmentFn,
+    params: GraphParams,
+    batches: Sequence[Mapping[str, jax.Array]],
+    keys: Sequence[jax.Array],
+    structure: GraphStructure,
+) -> dict[str, Any]:
+    """Average the per-module PC vs backprop comparison over ``batches``.
+
+    A module is one parameterised graph node, in graph order. Per module:
+    the mean and minimum cosine, the mean norms and ``norm_ratio`` (mean of
+    ``pc_norm / bp_norm`` over batches with a non-zero BP gradient, else
+    ``None``); ``rel_norm_ratio`` divides it by the ``mlm_head`` ratio.
+    PC gradients carry the output-energy scale ``s`` and backprop gradients do
+    not, so ``norm_ratio`` includes ``s``; ``rel_norm_ratio`` cancels it.
+    ``mean_cosine`` includes the head, whose cosine is always about 1;
+    ``mean_cosine_hidden`` leaves it out. ``module_order`` lists the modules
+    in graph order.
+    """
+    per_batch = [
+        jax.tree_util.tree_map(float, alignment_fn(params, batch, key))
+        for batch, key in zip(batches, keys, strict=True)
+    ]
+    if not per_batch:
+        raise ValueError("gradient alignment needs at least one batch")
+    modules: dict[str, dict[str, Any]] = {}
+    for name in [n for n in structure.node_order if n in per_batch[0]]:
+        pc = np.array([b[name]["pc_norm"] for b in per_batch])
+        bp = np.array([b[name]["bp_norm"] for b in per_batch])
+        cosine = np.array([b[name]["cosine"] for b in per_batch])
+        nonzero = bp > 0
+        modules[name] = {
+            "cosine": float(cosine.mean()),
+            "cosine_min": float(cosine.min()),
+            "pc_norm": float(pc.mean()),
+            "bp_norm": float(bp.mean()),
+            "norm_ratio": (
+                float(np.mean(pc[nonzero] / bp[nonzero])) if nonzero.any() else None
+            ),
+        }
+    head = modules.get(structure.task_map["y"], {}).get("norm_ratio")
+    for row in modules.values():
+        row["rel_norm_ratio"] = (
+            row["norm_ratio"] / head if head and row["norm_ratio"] is not None else None
+        )
+    cosines = [row["cosine"] for row in modules.values()]
+    hidden = [
+        row["cosine"]
+        for name, row in modules.items()
+        if name != structure.task_map["y"]
+    ]
+    return {
+        "num_batches": len(per_batch),
+        "mean_cosine": float(np.mean(cosines)),
+        "mean_cosine_hidden": float(np.mean(hidden)) if hidden else None,
+        "min_cosine": float(np.min(cosines)),
+        "module_order": list(modules),
+        "modules": modules,
+    }
 
 
 def train_stage(
@@ -592,6 +845,7 @@ def train_stage(
         "micro_batches": 0,
     }
     log: list[dict[str, Any]] = []
+    energy_warned = False
     pending_batches: list[dict[str, jax.Array]] = []
     pending_keys: list[jax.Array] = []
     updates = 0
@@ -628,6 +882,26 @@ def train_stage(
                 entry["pc_energy_rises"] = int(
                     sum(int(e["pc_energy_rises"]) for e in pending_extras)
                 )
+                if config.pc_inference == "standard":
+                    start = float(
+                        np.mean([float(e["pc_energy_start"]) for e in pending_extras])
+                    )
+                    end = float(
+                        np.mean([float(e["pc_energy_end"]) for e in pending_extras])
+                    )
+                    entry["pc_energy_start"] = start
+                    entry["pc_energy_end"] = end
+                    entry["pc_energy_rel_decrease"] = (
+                        (start - end) / start if start > 0 else 0.0
+                    )
+                    entry["pc_energy_increased"] = end > start
+                    if end > start and not energy_warned:
+                        energy_warned = True
+                        print(
+                            f"WARNING stage={stage} update={updates}: standard PC "
+                            f"inference raised the energy ({start:.4g} -> {end:.4g}); "
+                            "inference is diverging, lower --pc_eta_infer"
+                        )
             log.append(entry)
             if verbose and config.log_interval and updates % config.log_interval == 0:
                 print(
@@ -795,7 +1069,9 @@ def run_domain_forgetting(
     the previous snapshot. With ``overwrite``, every known run and analysis
     artifact is deleted first (``remove_run_artifacts``). With
     ``init_perturbation`` > 0, S0 is the checkpoint perturbed by
-    ``perturb_params``.
+    ``perturb_params``. With ``pc_alignment_batches`` N > 0, every trained
+    stage appends the PC vs backprop ``gradient_alignment`` of its start and
+    end params on N fixed batches of its domain to ``alignment.jsonl``.
     """
     config.validate()
     domains = list(config.domains)
@@ -888,10 +1164,56 @@ def run_domain_forgetting(
     }
     previous_runtime = (_read_json(output / "runtime.json") if resume else None) or {}
     previous_exposure = (_read_json(output / "exposure.json") if resume else None) or {}
+    previous_alignment = _read_jsonl(output / "alignment.jsonl") if resume else []
 
     gradient_fn = make_gradient_fn(
-        config.mode, base.structure, config.pc_forward_updates
+        config.mode, base.structure, config.pc_forward_updates, config.pc_inference
     )
+    alignment_fn = (
+        make_alignment_fn(base.structure, config.pc_forward_updates)
+        if config.pc_alignment_batches
+        else None
+    )
+    alignment_records: list[dict[str, Any]] = []
+
+    def record_alignment(
+        stage: int, domain: str, when: str, stage_params: GraphParams
+    ) -> float:
+        """Append one alignment record and return the seconds it took."""
+        started = time.time()
+        batches, keys = fixed_mlm_batches(
+            caches[domain].train,
+            base.structure,
+            base.special_ids,
+            num_batches=config.pc_alignment_batches,
+            batch_size=config.micro_batch_size or config.batch_size,
+            mask_prob=config.mask_prob,
+            seed=config.seed + stage,
+        )
+        alignment_records.append(
+            {
+                "stage": stage,
+                "domain": domain,
+                "when": when,
+                "params_sha256": params_hash(stage_params),
+                "pc_inference": config.pc_inference,
+                "output_energy_scale": config.pc_output_energy_scale,
+                "batch_size": config.micro_batch_size or config.batch_size,
+                "seed": config.seed + stage,
+                **gradient_alignment(
+                    alignment_fn, stage_params, batches, keys, base.structure
+                ),
+            }
+        )
+        if verbose:
+            last = alignment_records[-1]
+            print(
+                f"stage={stage} alignment {when} "
+                f"mean_cosine={last['mean_cosine']:.4f} "
+                f"min_cosine={last['min_cosine']:.4f}"
+            )
+        return time.time() - started
+
     params = initial_params
     evaluator = MultiDomainEvaluator(base.structure, valid_sets, config.eval_batch_size)
     stages: list[dict[str, Any]] = []
@@ -933,13 +1255,20 @@ def run_domain_forgetting(
                 "reused": True,
             }
             parent_sha = entry["params_sha256"]
+            alignment_records.extend(
+                r for r in previous_alignment if int(r["stage"]) == stage
+            )
             if verbose:
                 print(f"stage={stage} reused params_sha256={parent_sha[:12]}")
             continue
 
         initial_sha = params_hash(params)
         train_seconds = 0.0
+        alignment_seconds = 0.0
         if domain is not None:
+            if alignment_fn is not None:
+                alignment_seconds = record_alignment(stage, domain, "start", params)
+            train_start = time.time()
             params, stage_exposure, log = train_stage(
                 params,
                 base.structure,
@@ -950,9 +1279,12 @@ def run_domain_forgetting(
                 gradient_fn=gradient_fn,
                 verbose=verbose,
             )
-            train_seconds = time.time() - stage_start
+            train_seconds = time.time() - train_start
             exposure[domain] = stage_exposure
             _write_jsonl(output / f"training_log_stage_{stage}.jsonl", log)
+            if alignment_fn is not None:
+                alignment_seconds += record_alignment(stage, domain, "end", params)
+                _write_jsonl(output / "alignment.jsonl", alignment_records)
         snapshot = save_stage_snapshot(output / f"stage_{stage}.npz", params)
         eval_start = time.time()
         results = evaluate_domains(
@@ -993,6 +1325,8 @@ def run_domain_forgetting(
             "eval_seconds": time.time() - eval_start,
             "reused": False,
         }
+        if alignment_fn is not None:
+            stage_runtime[str(stage)]["alignment_seconds"] = alignment_seconds
         atomic_write_json(output / "exposure.json", exposure)
         atomic_write_json(
             manifest_path,
