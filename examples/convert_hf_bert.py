@@ -24,7 +24,10 @@ set_jax_flags_before_importing_jax()
 
 import argparse
 import json
+import os
 import re
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -291,8 +294,9 @@ def build_bert_structure(
 def graph_params_for(converted: GraphParams, structure: GraphStructure) -> GraphParams:
     """Return params for every node of ``structure`` with ``converted`` filled in.
 
-    Raises ``ValueError`` unless ``converted`` holds exactly the graph's
-    parameters with the graph's shapes.
+    Raises ``ValueError`` listing every extra node and every missing,
+    unexpected or mis-shaped parameter unless ``converted`` holds exactly the
+    graph's parameters with the graph's shapes.
     """
     fresh = initialize_params(structure, jax.random.PRNGKey(0))
     params = GraphParams(
@@ -300,18 +304,40 @@ def graph_params_for(converted: GraphParams, structure: GraphStructure) -> Graph
             name: converted.nodes.get(name, node) for name, node in fresh.nodes.items()
         }
     )
-    if set(converted.nodes) - set(fresh.nodes) or _param_shapes(
-        params
-    ) != _param_shapes(fresh):
-        raise ValueError("converted parameters do not match the FabricPC BERT graph")
+    expected, got = _param_shapes(fresh), _param_shapes(params)
+    problems = []
+    extra_nodes = sorted(set(converted.nodes) - set(fresh.nodes))
+    if extra_nodes:
+        problems.append(f"nodes not in the graph: {extra_nodes}")
+    for key in sorted(set(expected) - set(got)):
+        problems.append(f"missing {'.'.join(key)}")
+    for key in sorted(set(got) - set(expected)):
+        problems.append(f"unexpected {'.'.join(key)}")
+    for key in sorted(set(got) & set(expected)):
+        if got[key] != expected[key]:
+            problems.append(
+                f"{'.'.join(key)}: shape {got[key]}, expected {expected[key]}"
+            )
+    if problems:
+        raise ValueError(
+            "converted parameters do not match the FabricPC BERT graph:\n  "
+            + "\n  ".join(problems)
+        )
     return params
 
 
-def build_wordpiece_tokenizer(vocab_path: str | Path, lowercase: bool = True):
+def build_wordpiece_tokenizer(
+    vocab_path: str | Path,
+    lowercase: bool = True,
+    strip_accents: bool | None = None,
+    tokenize_chinese_chars: bool = True,
+):
     """Build a ``tokenizers.Tokenizer`` matching ``BertTokenizerFast`` for ``vocab.txt``.
 
-    No post-processor is set: the FabricPC loaders insert ``[CLS]`` and
-    ``[SEP]`` themselves.
+    The options mirror ``BertTokenizerFast``'s ``do_lower_case``,
+    ``strip_accents`` (``None`` follows ``lowercase``) and
+    ``tokenize_chinese_chars``, with the same defaults. No post-processor is
+    set: the FabricPC loaders insert ``[CLS]`` and ``[SEP]`` themselves.
     """
     from tokenizers import Tokenizer, decoders, normalizers, pre_tokenizers
     from tokenizers.models import WordPiece
@@ -319,8 +345,8 @@ def build_wordpiece_tokenizer(vocab_path: str | Path, lowercase: bool = True):
     tokenizer = Tokenizer(WordPiece.from_file(str(vocab_path), unk_token="[UNK]"))
     tokenizer.normalizer = normalizers.BertNormalizer(
         clean_text=True,
-        handle_chinese_chars=True,
-        strip_accents=None,
+        handle_chinese_chars=tokenize_chinese_chars,
+        strip_accents=strip_accents,
         lowercase=lowercase,
     )
     tokenizer.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
@@ -358,8 +384,22 @@ def write_bert_params(
             "config": dict(model_config),
         },
     )
-    archive.with_name(f"{archive.stem}.tokenizer.json").write_text(tokenizer_json)
+    _write_text_atomic(
+        archive.with_name(f"{archive.stem}.tokenizer.json"), tokenizer_json
+    )
     return archive
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _resolve_vocab_file(model: str, revision: str | None) -> Path:
@@ -372,18 +412,31 @@ def _resolve_vocab_file(model: str, revision: str | None) -> Path:
 
 
 def _resolve_source_revision(model: str, revision: str | None) -> str | None:
-    """Return the Hub commit sha the weights came from, or None for a local dir."""
-    if Path(model).is_dir():
+    """Return the Hub commit sha the weights came from, else ``revision``.
+
+    A local dir, ``HF_HUB_OFFLINE`` or a failed Hub query falls back to the
+    given ``revision`` (``None`` when unset).
+    """
+    offline = os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes", "on")
+    if offline or Path(model).is_dir():
         return revision
     from huggingface_hub import HfApi
 
-    return HfApi().model_info(model, revision=revision).sha
+    try:
+        return HfApi().model_info(model, revision=revision).sha
+    except Exception as error:
+        print(
+            f"warning: could not query the Hub revision of {model}: {error}",
+            file=sys.stderr,
+        )
+        return revision
 
 
-def _resolve_lowercase(model: str, revision: str | None) -> bool:
-    """Return ``do_lower_case`` from the repo's ``tokenizer_config.json``, else True.
+def tokenizer_settings(model: str, revision: str | None = None) -> dict[str, Any]:
+    """Return ``build_wordpiece_tokenizer`` options from ``tokenizer_config.json``.
 
-    True is ``BertTokenizerFast``'s default when the repo has no tokenizer config.
+    Options the repo does not set, or all of them when it has no tokenizer
+    config, keep ``BertTokenizerFast``'s defaults.
     """
     local = Path(model) / "tokenizer_config.json"
     if Path(model).is_dir():
@@ -400,9 +453,12 @@ def _resolve_lowercase(model: str, revision: str | None) -> bool:
             )
         except EntryNotFoundError:
             path = None
-    if path is None:
-        return True
-    return bool(json.loads(path.read_text()).get("do_lower_case", True))
+    config = {} if path is None else json.loads(path.read_text())
+    return {
+        "lowercase": bool(config.get("do_lower_case", True)),
+        "strip_accents": config.get("strip_accents"),
+        "tokenize_chinese_chars": bool(config.get("tokenize_chinese_chars", True)),
+    }
 
 
 def check_loading_info(loading_info: Mapping[str, Any]) -> None:
@@ -474,11 +530,11 @@ def main(argv: list[str] | None = None) -> None:
         "source_revision": _resolve_source_revision(args.model, args.revision),
     }
     params = graph_params_for(converted, build_bert_structure(model_config))
-    lowercase = args.lowercase
-    if lowercase is None:
-        lowercase = _resolve_lowercase(args.model, args.revision)
+    settings = tokenizer_settings(args.model, args.revision)
+    if args.lowercase is not None:
+        settings["lowercase"] = args.lowercase
     tokenizer = build_wordpiece_tokenizer(
-        _resolve_vocab_file(args.model, args.revision), lowercase=lowercase
+        _resolve_vocab_file(args.model, args.revision), **settings
     )
     archive = write_bert_params(args.out, params, tokenizer, model_config)
     print(f"ignored_keys={ignored}")
