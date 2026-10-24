@@ -279,6 +279,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="LayerNorm epsilon for --architecture bert (default: the "
         "--init_params file's, else 1e-12)",
     )
+    parser.add_argument(
+        "--residual_identity",
+        action="store_true",
+        help="--architecture bert only: route each block's attention residual "
+        "sum to its second feed-forward node through an identity node",
+    )
     parser.add_argument("--dropout_rate", type=float, default=0.0)
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--num_epochs", type=float, default=10)
@@ -332,8 +338,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--save_params and --init_params are not used with --ab_trials")
     if args.tokenizer == "checkpoint" and args.init_params is None:
         parser.error("--tokenizer checkpoint needs --init_params")
-    if args.ln_eps is not None and args.architecture != "bert":
-        parser.error("--ln_eps is only used with --architecture bert")
+    if args.architecture != "bert" and (
+        args.ln_eps is not None or args.residual_identity
+    ):
+        parser.error("--ln_eps and --residual_identity need --architecture bert")
     if args.ab_trials > 0 and importlib.util.find_spec("scipy") is None:
         parser.error("--ab_trials needs scipy: pip install -e '.[experiments]'")
     return args
@@ -352,6 +360,7 @@ def build_model(args, vocab_size: int):
         pc_output_energy_scale=args.pc_output_energy_scale,
         architecture=args.architecture,
         ln_eps=args.ln_eps,
+        residual_identity=args.residual_identity,
         inference=InferenceSGDNormClip(
             eta_infer=args.pc_eta_infer,
             infer_steps=args.pc_infer_steps,
@@ -403,6 +412,7 @@ def model_config(args, vocab_size: int) -> Dict[str, Any]:
         architecture["ln_eps"] = (
             BERT_LN_EPS if args.ln_eps is None else float(args.ln_eps)
         )
+        architecture["residual_identity"] = bool(args.residual_identity)
     return {
         **architecture,
         "depth": args.depth,

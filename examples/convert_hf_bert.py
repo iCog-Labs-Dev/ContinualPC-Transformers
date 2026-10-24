@@ -263,9 +263,15 @@ def bert_model_config(config: Mapping[str, Any], seq_len: int) -> dict[str, Any]
 
 
 def build_bert_structure(
-    model_config: Mapping[str, Any], dropout_rate: float = 0.0
+    model_config: Mapping[str, Any],
+    dropout_rate: float = 0.0,
+    residual_identity: bool = False,
 ) -> GraphStructure:
-    """Build the FabricPC ``architecture="bert"`` MLM graph for ``model_config``."""
+    """Build the FabricPC ``architecture="bert"`` MLM graph for ``model_config``.
+
+    ``residual_identity`` adds parameterless nodes only, so the converted
+    params load into the graph either way.
+    """
     return create_encoder_mlm_model(
         depth=model_config["depth"],
         embed_dim=model_config["embed_dim"],
@@ -278,6 +284,7 @@ def build_bert_structure(
         dropout_rate=dropout_rate,
         architecture="bert",
         ln_eps=model_config["ln_eps"],
+        residual_identity=residual_identity,
     )
 
 
