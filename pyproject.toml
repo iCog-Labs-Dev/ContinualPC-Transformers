@@ -64,6 +64,11 @@ text = [
 experiments = [
     "scipy>=1.10.0",
 ]
+hf = [
+    # Converting Hugging Face BERT weights (examples/convert_hf_bert.py)
+    "transformers>=4.40",
+    "torch>=2.6",
+]
 viz = [
     "plotly>=5.0.0",
     "kaleido>=0.2.1",
