@@ -7,7 +7,10 @@ retrains. Every JSON records the stage ``params_sha256`` values and
 validation SHA-256s it used. ``correlations`` reads ``rollback.json``,
 ``predictors.json`` and ``error_maps.json`` of one or more runs (seeds),
 refuses any computed from other stage snapshots, and writes
-``correlations.json`` and ``correlations.png``.
+``correlations.json`` and ``correlations.png``. ``frontier`` reads only
+``run_config.json`` and ``summary.json`` of the ``--run_dirs`` (default:
+every run under ``--results_dir``) and writes ``frontier.json``,
+``frontier.pdf`` and ``frontier.png``; ``all`` leaves it out.
 
 Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py drift \\
@@ -22,6 +25,9 @@ Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py correlations \\
         --run_dirs results/domain_forgetting/bp_seed{0,1,2} \\
         --output_dir results/domain_forgetting/correlations
+    PYTHONPATH=. python examples/domain_forgetting_analysis.py frontier \\
+        --results_dir results/domain_forgetting \\
+        --output_dir results/domain_forgetting/frontier
     PYTHONPATH=. python examples/domain_forgetting_analysis.py all \\
         --run_dir results/domain_forgetting/bp_seed0
 """
@@ -51,6 +57,13 @@ from fabricpc.experiments.domain_forgetting.correlations import (
     compute_predictors,
     plot_correlations,
 )
+from fabricpc.experiments.domain_forgetting.frontier import (
+    SEQ_LR,
+    collect_runs,
+    compute_frontier,
+    format_table,
+    plot_frontier,
+)
 from fabricpc.experiments.domain_forgetting.localization import (
     RANDOM_DRAWS,
     compute_drift,
@@ -59,7 +72,8 @@ from fabricpc.experiments.domain_forgetting.localization import (
     run_provenance,
 )
 
-COMMANDS = ("drift", "rollback", "error_maps", "predictors", "correlations", "all")
+RUN_COMMANDS = ("drift", "rollback", "error_maps", "predictors", "correlations")
+COMMANDS = (*RUN_COMMANDS, "frontier", "all")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,11 +82,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--run_dir", help="run directory (all but correlations)")
     parser.add_argument(
-        "--run_dirs", nargs="+", help="run directories (seeds) for correlations"
+        "--run_dirs",
+        nargs="+",
+        help="run directories (seeds) for correlations, or runs for frontier",
     )
     parser.add_argument(
+        "--results_dir",
+        default="results/domain_forgetting",
+        help="frontier reads every run under it when --run_dirs is not given",
+    )
+    parser.add_argument("--seq_lr", type=float, default=SEQ_LR)
+    parser.add_argument(
         "--output_dir",
-        help="where correlations writes (default: the first run directory)",
+        help="where correlations (default: the first run directory) or "
+        "frontier (default: <results_dir>/frontier) writes",
     )
     parser.add_argument("--checkpoint", help="override the run's checkpoint path")
     parser.add_argument("--data_dir", help="override the run's data directory")
@@ -128,17 +151,38 @@ def run_correlations(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
+    """Place every run against the uniform-lr frontier of its order and seed."""
+    if args.run_dirs:
+        run_dirs = [Path(p) for p in args.run_dirs]
+    else:
+        root = Path(args.results_dir)
+        run_dirs = sorted(p for p in root.iterdir() if (p / "run_config.json").exists())
+    output = Path(args.output_dir or Path(args.results_dir) / "frontier")
+    output.mkdir(parents=True, exist_ok=True)
+    result = compute_frontier(collect_runs(run_dirs), seq_lr=args.seq_lr)
+    if not args.no_figure:
+        figures = plot_frontier(result, output / "frontier.pdf")
+        result["figures"] = [str(f) for f in figures] if figures else None
+    atomic_write_json(output / "frontier.json", result)
+    if not args.quiet:
+        print(format_table(result))
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     """Run one analysis command, or ``all`` of them in order."""
     args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
     verbose = not args.quiet
-    commands = COMMANDS[:-1] if args.command == "all" else (args.command,)
+    commands = RUN_COMMANDS if args.command == "all" else (args.command,)
     results: dict[str, Any] = {}
     context = None
     for command in commands:
         started = time.time()
         if command == "correlations":
             results[command] = run_correlations(args)
+        elif command == "frontier":
+            results[command] = run_frontier(args)
         else:
             context = context or _context(args)
             output = Path(args.run_dir)
