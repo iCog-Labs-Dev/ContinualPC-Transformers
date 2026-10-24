@@ -25,6 +25,9 @@ Usage:
         --pc_inference standard --pc_eta_infer 0.01 --pc_infer_steps 50 \\
         --pc_alignment_batches 4 --output_dir results/domain_forgetting/spc_seed0
 
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --training joint \\
+        --output_dir results/domain_forgetting/joint_seed0
+
     Standard PC on BERT-Mini diverges at --pc_eta_infer >= 0.02 and, below
     that, its error barely reaches the lower blocks; calibrate with ``probe``
     before any long run.
@@ -61,6 +64,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     DEFAULT_FORWARD_UPDATES,
     MODES,
     PC_INFERENCE,
+    TRAINING,
     RunConfig,
     compare_runs,
     run_domain_forgetting,
@@ -78,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--mode", choices=MODES, default=defaults.mode)
+    parser.add_argument(
+        "--training",
+        choices=TRAINING,
+        default=defaults.training,
+        help="sequential stages, or one joint stage on all domains mixed",
+    )
     parser.add_argument(
         "--tokens_per_domain", type=int, default=defaults.tokens_per_domain
     )
@@ -262,6 +272,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         domains=tuple(args.domains),
         output_dir=args.output_dir,
         mode=args.mode,
+        training=args.training,
         tokens_per_domain=args.tokens_per_domain,
         lr=args.lr,
         batch_size=args.batch_size,

@@ -332,6 +332,10 @@ def load_run(
     values = dict(run_config["config"])
     values["domains"] = tuple(values["domains"])
     config = RunConfig(**values, output_dir=str(path))
+    if config.training != "sequential":
+        raise ValueError(
+            f"{path}: analyses need a sequential run, not {config.training}"
+        )
     overrides: dict[str, Any] = {}
     if checkpoint is not None:
         overrides["checkpoint"] = checkpoint

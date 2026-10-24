@@ -22,6 +22,11 @@ relation to backprop is only approximate.
 Each update averages its micro-batch gradients weighted by their masked-token
 counts (``Σ_k g_k n_k / Σ_k n_k``), so it equals the gradient of the mean
 masked CE over the whole batch.
+
+With ``training="joint"`` the run is the multi-task upper bound instead: one
+stage trains on the concatenated domain streams for ``len(domains) *
+tokens_per_domain`` tokens under one schedule, with windows shuffled across
+domains, so each domain is seen for its full budget within one update.
 """
 
 from __future__ import annotations
@@ -103,6 +108,8 @@ BERT_MINI_SHAPE = {
     "vocab_size": 30522,
 }
 MODES = ("backprop", "pc")
+TRAINING = ("sequential", "joint")
+JOINT_STAGE = "joint"
 PC_INFERENCE = ("spiking", "standard")
 DEFAULT_FORWARD_UPDATES = {"spiking": "initial", "standard": "none"}
 METRICS = ("masked_ce", "masked_perplexity", "masked_accuracy")
@@ -154,6 +161,7 @@ class RunConfig:
     domains: tuple[str, ...]
     output_dir: str
     mode: str = "backprop"
+    training: str = "sequential"
     tokens_per_domain: int = 5_000_000
     lr: float = 1e-4
     batch_size: int = 64
@@ -188,6 +196,15 @@ class RunConfig:
         validate_domain_names(self.domains)
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+        if self.training not in TRAINING:
+            raise ValueError(
+                f"training must be one of {TRAINING}, got {self.training!r}"
+            )
+        if self.training == "joint":
+            if len(self.domains) < 2:
+                raise ValueError("joint training needs at least two domains")
+            if self.pc_alignment_batches:
+                raise ValueError("pc_alignment_batches needs training 'sequential'")
         for name in ("tokens_per_domain", "batch_size", "eval_batch_size"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
@@ -255,11 +272,29 @@ class RunConfig:
             return self.adam_eps * self.pc_output_energy_scale
         return self.adam_eps
 
+    @property
+    def stage_domains(self) -> tuple[str, ...]:
+        """The domain trained at each stage ``1..n``; joint training has one stage."""
+        return (JOINT_STAGE,) if self.training == "joint" else tuple(self.domains)
+
+    @property
+    def stage_tokens(self) -> int:
+        """Stream tokens per trained stage."""
+        if self.training == "joint":
+            return self.tokens_per_domain * len(self.domains)
+        return self.tokens_per_domain
+
     def identity(self) -> dict[str, Any]:
-        """The settings that must match for a run to be resumed."""
+        """The settings that must match for a run to be resumed.
+
+        ``training`` is left out for sequential runs, so their identity is
+        unchanged from before joint training existed.
+        """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
             values.pop(key)
+        if values["training"] == "sequential":
+            values.pop("training")
         values["domains"] = list(self.domains)
         return values
 
@@ -810,9 +845,7 @@ def train_stage(
     vocab_size = int(structure.nodes[structure.task_map["y"]].node_info.shape[-1])
     micro = config.micro_batch_size or config.batch_size
     accumulation = config.batch_size // micro
-    num_updates = num_stage_updates(
-        config.tokens_per_domain, config.batch_size, seq_len
-    )
+    num_updates = num_stage_updates(config.stage_tokens, config.batch_size, seq_len)
     batcher = MlmTextBatcher(
         token_ids=np.asarray(stream, dtype=np.int32),
         seq_len=seq_len,
@@ -922,10 +955,11 @@ def train_stage(
         "gradient_accumulation_steps": accumulation,
         "micro_batch_size": micro,
         "tokens_per_domain": config.tokens_per_domain,
+        "stage_tokens": config.stage_tokens,
         "max_stream_tokens_per_update": tokens_per_update,
         **counts,
-        "exposure_minus_budget": counts["stream_tokens"] - config.tokens_per_domain,
-        "within_one_update": abs(counts["stream_tokens"] - config.tokens_per_domain)
+        "exposure_minus_budget": counts["stream_tokens"] - config.stage_tokens,
+        "within_one_update": abs(counts["stream_tokens"] - config.stage_tokens)
         <= tokens_per_update,
         "epochs_started": int(batcher.state_dict()["epoch"]),
         "optimizer": optimizer_info,
@@ -1042,11 +1076,34 @@ def _matrix(
     records: Mapping[tuple[int, str], Mapping[str, Any]],
     domains: Sequence[str],
     metric: str,
+    num_stages: int,
 ) -> list[list[float]]:
     return [
         [float(records[(stage, name)][metric]) for name in domains]
-        for stage in range(len(domains) + 1)
+        for stage in range(num_stages)
     ]
+
+
+def summarize_joint(
+    domains: Sequence[str], ce: Any, ppl: Any, acc: Any
+) -> dict[str, Any]:
+    """Per-domain scores of a joint run: S0, the jointly trained S1, and the gain."""
+    ce_array, ppl_array, acc_array = (
+        np.asarray(m, dtype=np.float64) for m in (ce, ppl, acc)
+    )
+    if ce_array.shape != (2, len(domains)):
+        raise ValueError("a joint run has stages S0 and S1 for every domain")
+    return {
+        "domains": list(domains),
+        "initial_ce": dict(zip(domains, ce_array[0].tolist())),
+        "final_ce": dict(zip(domains, ce_array[1].tolist())),
+        "final_perplexity": dict(zip(domains, ppl_array[1].tolist())),
+        "final_accuracy": dict(zip(domains, acc_array[1].tolist())),
+        "learning_gain_ce": dict(zip(domains, (ce_array[0] - ce_array[1]).tolist())),
+        "sign_conventions": {
+            "learning_gain_ce": "CE[S0, d] - CE[S1, d]; positive = learned",
+        },
+    }
 
 
 def run_domain_forgetting(
@@ -1072,6 +1129,9 @@ def run_domain_forgetting(
     ``perturb_params``. With ``pc_alignment_batches`` N > 0, every trained
     stage appends the PC vs backprop ``gradient_alignment`` of its start and
     end params on N fixed batches of its domain to ``alignment.jsonl``.
+    With ``training="joint"`` there is one trained stage, named ``joint``, on
+    all domains mixed; ``forgetting_matrices.json`` is not written and the
+    summary holds ``summarize_joint``'s per-domain scores.
     """
     config.validate()
     domains = list(config.domains)
@@ -1135,7 +1195,7 @@ def run_domain_forgetting(
             for name, cache in caches.items()
         },
         "updates_per_stage": num_stage_updates(
-            config.tokens_per_domain, config.batch_size, seq_len
+            config.stage_tokens, config.batch_size, seq_len
         ),
     }
     run_config_path = output / "run_config.json"
@@ -1222,8 +1282,10 @@ def run_domain_forgetting(
     stage_runtime: dict[str, Any] = {}
     reusing = resume
     parent_sha: str | None = None
-    for stage in range(len(domains) + 1):
-        domain = None if stage == 0 else domains[stage - 1]
+    stage_domains = list(config.stage_domains)
+    num_stages = len(stage_domains) + 1
+    for stage in range(num_stages):
+        domain = None if stage == 0 else stage_domains[stage - 1]
         stage_start = time.time()
         reused = None
         if reusing:
@@ -1272,7 +1334,11 @@ def run_domain_forgetting(
             params, stage_exposure, log = train_stage(
                 params,
                 base.structure,
-                caches[domain].train,
+                (
+                    np.concatenate([caches[name].train for name in domains])
+                    if domain == JOINT_STAGE
+                    else caches[domain].train
+                ),
                 config=config,
                 stage=stage,
                 special_ids=base.special_ids,
@@ -1339,26 +1405,33 @@ def run_domain_forgetting(
         )
         parent_sha = snapshot["params_sha256"]
 
-    matrices = {metric: _matrix(evaluations, domains, metric) for metric in METRICS}
+    matrices = {
+        metric: _matrix(evaluations, domains, metric, num_stages) for metric in METRICS
+    }
     for metric, filename in MATRIX_FILES.items():
         atomic_write_json(
             output / filename,
             {
                 "metric": metric,
                 "domains": domains,
-                "stages": [f"S{s}" for s in range(len(domains) + 1)],
+                "stages": [f"S{s}" for s in range(num_stages)],
                 "rows": "stage",
                 "columns": "domain in training order",
                 "matrix": matrices[metric],
             },
         )
     ce, ppl, acc = (matrices[m] for m in METRICS)
-    atomic_write_json(
-        output / "forgetting_matrices.json",
-        {"domains": domains, **forgetting_matrices(ce, ppl, acc)},
-    )
+    if config.training == "joint":
+        scores = summarize_joint(domains, ce, ppl, acc)
+    else:
+        atomic_write_json(
+            output / "forgetting_matrices.json",
+            {"domains": domains, **forgetting_matrices(ce, ppl, acc)},
+        )
+        scores = summarize_matrices(domains, ce, ppl, acc)
     summary = {
-        **summarize_matrices(domains, ce, ppl, acc),
+        **scores,
+        "training": config.training,
         "mode": config.mode,
         "seed": config.seed,
         "tokens_per_domain": config.tokens_per_domain,
