@@ -134,6 +134,8 @@ class StorkeyHopfield(NodeBase):
         latent_init: Initializer for latent states (default: NormalInitializer()).
     """
 
+    ENERGY_FROM_FORWARD = True
+
     def __init__(
         self,
         shape: Tuple[int, ...],

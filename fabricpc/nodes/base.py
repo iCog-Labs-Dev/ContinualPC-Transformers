@@ -164,7 +164,12 @@ class NodeBase(ABC):
 
     Subclasses set concrete default instances for activation, energy, latent_init,
     and weight_init in their ``__init__`` parameter defaults.
+
+    ``ENERGY_FROM_FORWARD`` is set by nodes whose ``forward`` adds energy
+    terms beyond ``energy_functional`` (see ``forward_from_error``).
     """
+
+    ENERGY_FROM_FORWARD: bool = False
 
     def __init__(
         self,
@@ -487,6 +492,64 @@ class NodeBase(ABC):
             )(inputs, state.z_latent)
 
         return new_state, input_grads, self_grad
+
+    @staticmethod
+    def forward_from_error(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+        is_clamped: bool,
+    ) -> NodeState:
+        """
+        ePC state derivation: ``state.error`` is the relaxed variable ε and
+        the latent is derived as z_latent := z_mu + ε, with z_mu predicted by
+        ``forward`` from the (already derived) input latents. Runs inside
+        ``EPCInference``'s global ``jax.value_and_grad`` and is
+        differentiable w.r.t. inputs and ``state.error``. Leaves
+        ``latent_grad`` unchanged except on an unclamped readout, where it is
+        zeroed as in ``forward_and_latent_grads``.
+
+        The branches mirror the primal state of the base
+        ``forward_and_latent_grads`` so derived energies equal the
+        state-based path's at the same latents:
+        - Source (in_degree == 0): a clamp is returned unchanged; a free
+          source keeps its z_mu and takes z_latent := z_mu + ε.
+        - Clamped with inputs: ``forward`` at the clamp (error and energy
+          derived, e.g. the masked MLM cross-entropy).
+        - Unclamped readout (out_degree == 0): z_latent := z_mu, zero error
+          and energy.
+        - Otherwise: z_latent := z_mu + ε, error := ε, energy from
+          ``energy_functional``. Nodes whose ``forward`` adds energy terms
+          beyond ``energy_functional`` set ``ENERGY_FROM_FORWARD = True``;
+          their energy is then recomputed by a second ``forward`` at the
+          derived latent.
+
+        Nodes that override ``forward_and_latent_grads`` must keep the
+        source and readout conventions above for the two paths to agree.
+        """
+        node_class = node_info.node_class
+        if node_info.in_degree == 0:
+            if is_clamped:
+                return state
+            return state._replace(z_latent=state.z_mu + state.error)
+        if is_clamped:
+            _, new_state = node_class.forward(params, inputs, state, node_info)
+            return new_state
+        _, new_state = node_class.forward(params, inputs, state, node_info)
+        if node_info.out_degree == 0:
+            return new_state._replace(
+                z_latent=new_state.z_mu,
+                error=jnp.zeros_like(new_state.error),
+                energy=jnp.zeros_like(new_state.energy),
+                latent_grad=jnp.zeros_like(new_state.latent_grad),
+            )
+        eps = state.error
+        new_state = new_state._replace(z_latent=new_state.z_mu + eps, error=eps)
+        if node_class.ENERGY_FROM_FORWARD:
+            _, new_state = node_class.forward(params, inputs, new_state, node_info)
+            return new_state._replace(error=eps)
+        return node_class.energy_functional(new_state, node_info)
 
     @staticmethod
     def forward_and_weight_grads(
