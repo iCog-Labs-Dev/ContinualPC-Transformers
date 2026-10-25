@@ -16,6 +16,7 @@ from fabricpc.core.inference import (
     InferenceSpikingPrecision,
     run_inference,
 )
+from fabricpc.core.inference_epc import EPCInference
 from fabricpc.core.learning import (
     FORWARD_UPDATE_MODES,
     compute_local_weight_gradients,
@@ -272,14 +273,34 @@ def _validate_forward_updates(forward_updates: str) -> None:
         )
 
 
+def validate_epc_forward_updates(
+    structure: GraphStructure, forward_updates: str
+) -> None:
+    """Reject forward updates with ``EPCInference``.
+
+    ePC's weight rule is the local gradient at the final derived latents
+    (``forward_updates="none"``); ``z_T - mu_0`` would add the upstream
+    derivation shifts to every node's error.
+    """
+    if isinstance(structure.config["inference"], EPCInference) and (
+        forward_updates != "none"
+    ):
+        raise ValueError(
+            "EPCInference supports only pc_forward_updates 'none', got "
+            f"{forward_updates!r}"
+        )
+
+
 def _validate_feedforward_start(
     structure: GraphStructure, forward_updates: str
 ) -> None:
     """Require feedforward state init for forward updates and spiking inference.
 
     Forward updates read the feedforward prediction from the initial state and
-    the spike schedule assumes zero hidden errors at the start.
+    the spike schedule assumes zero hidden errors at the start. Forward
+    updates are rejected with ``EPCInference``.
     """
+    validate_epc_forward_updates(structure, forward_updates)
     spiking = isinstance(structure.config["inference"], InferenceSpikingPrecision)
     if forward_updates == "none" and not spiking:
         return
@@ -498,6 +519,7 @@ def create_jit_gradient_step_pcn_mlm(
 ):
     """Create a JIT-compiled PC MLM gradient step for accumulation."""
     _validate_forward_updates(forward_updates)
+    validate_epc_forward_updates(structure, forward_updates)
     return jax.jit(
         lambda p, b, k: get_graph_param_gradient_pcn_mlm_accumulation(
             p, b, structure, k, forward_updates
@@ -518,6 +540,15 @@ def create_jit_update_step_pcn_mlm(optimizer: optax.GradientTransformation):
     )
 
 
+def _reject_incremental_epc(structure: GraphStructure) -> None:
+    """Incremental PC steps ``inference_step`` without ePC's segment hooks."""
+    if isinstance(structure.config["inference"], EPCInference):
+        raise NotImplementedError(
+            "incremental PC does not support EPCInference: it steps "
+            "inference_step without begin_segment/finalize_state"
+        )
+
+
 def _train_step_pcn_mlm_incremental_with_state(
     params: GraphParams,
     opt_state: optax.OptState,
@@ -530,6 +561,7 @@ def _train_step_pcn_mlm_incremental_with_state(
     _shared_clamps, free_metrics, _free_state, initial_state, clamps = (
         _prepare_pcn_mlm_batch(params, batch, structure, rng_key)
     )
+    _reject_incremental_epc(structure)
     inference_obj = structure.config["inference"]
     inference_cls = type(inference_obj)
     config = inference_obj.config
@@ -746,6 +778,8 @@ def train_pcn_mlm(
             "incremental PC MLM training does not support pc_forward_updates; "
             f"got {forward_updates!r}"
         )
+    if pc_incremental:
+        _reject_incremental_epc(structure)
     if pc_incremental and gradient_accumulation_steps > 1:
         raise ValueError(
             "incremental PC MLM training does not support gradient accumulation; "

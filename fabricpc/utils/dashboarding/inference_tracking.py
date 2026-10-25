@@ -16,17 +16,24 @@ from fabricpc.core.types import (
     NodeState,
 )
 from fabricpc.core.inference import InferenceSpikingPrecision
+from fabricpc.core.inference_epc import EPCInference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 
 
 # TODO clarify collect_every refers to either batches or inference steps
 def _reject_step_indexed_inference(inference_obj) -> None:
-    """Raise for inference whose steps depend on the step index."""
+    """Raise for inference whose steps depend on the step index or on segment
+    hooks around the step loop."""
     if isinstance(inference_obj, InferenceSpikingPrecision):
         raise NotImplementedError(
             "inference history tracking does not support InferenceSpikingPrecision; "
             "its spike steps need the step index"
+        )
+    if isinstance(inference_obj, EPCInference):
+        raise NotImplementedError(
+            "inference history tracking does not support EPCInference; it steps "
+            "inference_step without begin_segment/finalize_state"
         )
 
 

@@ -102,6 +102,7 @@ from fabricpc.training.train_mlm import (
     create_jit_gradient_step_pcn_mlm,
     create_pc_bp_gradient_comparison,
     get_graph_param_gradient_pcn_mlm,
+    validate_epc_forward_updates,
 )
 from fabricpc.utils.data.dataloader import MlmTextBatcher
 
@@ -720,6 +721,7 @@ def make_gradient_fn(
             return grads, loss * count, count, {}
 
         return backprop
+    validate_epc_forward_updates(structure, forward_updates)
     if pc_inference == "standard":
 
         @jax.jit
