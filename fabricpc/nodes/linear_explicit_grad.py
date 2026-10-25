@@ -6,7 +6,7 @@ from fabricpc.core.types import NodeParams, NodeState, NodeInfo
 from fabricpc.core.activations import IdentityActivation
 from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.initializers import NormalInitializer
-from fabricpc.nodes.base import FlattenInputMixin
+from fabricpc.nodes.base import FlattenInputMixin, NodeBase
 from fabricpc.core.activations import ActivationBase
 from fabricpc.core.energy import EnergyFunctional
 from fabricpc.core.initializers import InitializerBase
@@ -60,6 +60,10 @@ class LinearExplicitGrad(Linear):
         activation.derivative(). muPC scaling and accumulation into
         ``state.latent_grad`` are handled by the callsite.
         """
+        if node_info.in_degree == 0 or (node_info.out_degree == 0 and not is_clamped):
+            return NodeBase.forward_and_latent_grads(
+                params, inputs, state, node_info, is_clamped
+            )
         node_class = node_info.node_class
 
         # Forward pass to get new state

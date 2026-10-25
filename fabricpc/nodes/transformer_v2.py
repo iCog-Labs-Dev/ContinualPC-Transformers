@@ -146,6 +146,10 @@ class EmbeddingNode(NodeBase):
 
     @staticmethod
     def forward_and_latent_grads(params, inputs, state, node_info, is_clamped=False):
+        if node_info.out_degree == 0 and not is_clamped:
+            return NodeBase.forward_and_latent_grads(
+                params, inputs, state, node_info, is_clamped
+            )
         _, new_state = node_info.node_class.forward(params, inputs, state, node_info)
         # Discrete indices: no gradient flows back through the input edge.
         input_grads = {
