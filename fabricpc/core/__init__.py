@@ -50,6 +50,13 @@ from fabricpc.core.inference import (
     run_inference,
 )
 
+from fabricpc.core.inference_epc import EPCInference, Regime
+from fabricpc.core.epsilon_spectrum import (
+    EpsilonSpectrum,
+    epsilon_spectrum,
+    make_epsilon_spectrum,
+)
+
 from fabricpc.core.depth import node_output_depths
 
 # Initializers
@@ -102,6 +109,11 @@ __all__ = [
     "InferenceSGDNormClip",
     "InferenceSGDNormClipDecay",
     "InferenceSpikingPrecision",
+    "EPCInference",
+    "Regime",
+    "EpsilonSpectrum",
+    "epsilon_spectrum",
+    "make_epsilon_spectrum",
     "node_output_depths",
     "gather_inputs",
     "run_inference",
