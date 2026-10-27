@@ -19,7 +19,12 @@ Usage:
         --run_dir results/domain_forgetting/bp_seed0 --random_draws 3
     PYTHONPATH=. python examples/domain_forgetting_analysis.py error_maps \\
         --run_dir results/domain_forgetting/bp_seed0 \\
-        --pc_infer_steps 120 --pc_eta_infer 0.1
+        --pc_infer_steps 120 --pc_eta_infer $ETA
+
+    The standard_pc maps need --pc_eta_infer: the MLM head energy sums the
+    masked-token CE, so the rate scales with the masked tokens per map batch
+    and must be calibrated for --map_batch_size (mlm_domain_forgetting.py
+    probe); --settings spike_only needs none.
     PYTHONPATH=. python examples/domain_forgetting_analysis.py predictors \\
         --run_dir results/domain_forgetting/bp_seed0
     PYTHONPATH=. python examples/domain_forgetting_analysis.py correlations \\
@@ -108,7 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map_batch_size", type=int, default=8)
     parser.add_argument("--settings", nargs="+", choices=SETTINGS, default=SETTINGS)
     parser.add_argument("--pc_infer_steps", type=int, default=120)
-    parser.add_argument("--pc_eta_infer", type=float, default=0.1)
+    parser.add_argument(
+        "--pc_eta_infer",
+        type=float,
+        default=None,
+        help="Standard-PC map inference rate (required with the standard_pc "
+        "setting; calibrate for --map_batch_size)",
+    )
     parser.add_argument("--pc_max_norm", type=float, default=5.0)
     parser.add_argument("--output_energy_scale", type=float, default=1.0)
     parser.add_argument("--predictor_windows", type=int, default=256)

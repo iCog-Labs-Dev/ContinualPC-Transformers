@@ -354,7 +354,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dropout_rate", type=float, default=0.0)
     parser.add_argument("--pc_infer_steps", type=int, default=10)
-    parser.add_argument("--pc_eta_infer", type=float, default=0.01)
+    parser.add_argument(
+        "--pc_eta_infer",
+        type=float,
+        default=None,
+        help="Inference rate, required for PC pretraining. The MLM head energy "
+        "is s * sum(masked CE), so latent gradients grow with the masked tokens "
+        "per micro-batch; calibrate the rate for the batch shape (e.g. with "
+        "examples/mlm_domain_forgetting.py probe) rather than reusing a value",
+    )
     parser.add_argument("--pc_max_norm", type=float, default=5.0)
     parser.add_argument("--pc_output_energy_scale", type=float, default=1.0)
     parser.add_argument(
@@ -958,6 +966,8 @@ def build_pretrain_inference(args: argparse.Namespace) -> InferenceSGDNormClip:
         return InferenceSGDNormClip(
             eta_infer=0.05, infer_steps=5, max_norm=args.pc_max_norm
         )
+    if args.pc_eta_infer is None:
+        raise ValueError("--pc_eta_infer is required for PC pretraining")
     if args.pc_inference == "spiking":
         return InferenceSpikingPrecision(
             eta_infer=args.pc_eta_infer,
@@ -1065,7 +1075,7 @@ def _validate_pc_spiking_args(args: argparse.Namespace) -> None:
             "--pc_inference spiking with --pc_incremental needs "
             "--pc_spike_depth longest"
         )
-    if spiking and args.pc_incremental and args.pc_eta_infer <= 0.0:
+    if spiking and args.pc_incremental and not (args.pc_eta_infer or 0.0) > 0.0:
         raise ValueError(
             "--pc_inference spiking with --pc_incremental needs --pc_eta_infer > 0"
         )
@@ -1193,6 +1203,11 @@ def run_pretrain(args: argparse.Namespace) -> None:
     _validate_pc_incremental_args(args)
     _validate_pc_spiking_args(args)
     _validate_validation_sequence_cap(args)
+    if args.mode == "pc" and args.pc_eta_infer is None:
+        raise ValueError(
+            "--pc_eta_infer is required for PC pretraining; calibrate it for the "
+            "micro-batch shape (the head energy sums the masked-token CE)"
+        )
     _inherit_checkpoint_ln_eps(args)
     validation_mask_seeds = parse_validation_mask_seeds(args.validation_mask_seeds)
     rng_key = jax.random.PRNGKey(args.seed)

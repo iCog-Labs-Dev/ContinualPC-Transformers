@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential MLM domain-forgetting runner (backprop, spike-only or standard PC).
+"""Sequential MLM domain-forgetting runner (backprop, spike-only, standard PC, ePC).
 
 S0 loads the checkpoint; stage s trains on the s-th domain with a fresh
 optimizer and schedule, and every stage evaluates all domains on their fixed
@@ -7,7 +7,8 @@ validation sets. ``compare`` checks a run (spike-only PC, or BP from a
 perturbed initialisation for the float32 noise floor) against a BP run of
 the same setup. ``probe`` prints per-module PC vs backprop gradient cosines
 and norm ratios on fixed batches of one domain, for one or a grid of PC
-inference settings.
+inference settings; for ePC it also measures the ε-spectrum and prints the
+regime verdict of each setting.
 
 Usage:
     PYTHONPATH=. python examples/mlm_domain_forgetting.py \\
@@ -22,8 +23,12 @@ Usage:
         --output_dir results/domain_forgetting/pc_seed0
 
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode pc \\
-        --pc_inference standard --pc_eta_infer 0.01 --pc_infer_steps 50 \\
+        --pc_inference standard --pc_eta_infer $ETA --pc_infer_steps 50 \\
         --pc_alignment_batches 4 --output_dir results/domain_forgetting/spc_seed0
+
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode pc \\
+        --pc_inference epc --pc_eta_infer $ETA --pc_infer_steps 5 \\
+        --pc_regime_interval 50 --output_dir results/domain_forgetting/epc_seed0
 
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --training joint \\
         --output_dir results/domain_forgetting/joint_seed0
@@ -38,13 +43,28 @@ Usage:
     other domain order), freeze for --gate_modules (module or group names:
     embeddings, blocks_0-1, blocks_2-3, blocks, head, mlp).
 
-    Standard PC on BERT-Mini diverges at --pc_eta_infer >= 0.02 and, below
-    that, its error barely reaches the lower blocks; calibrate with ``probe``
-    before any long run.
+    $ETA has no default worth reusing. The MLM head energy is
+    s * sum(masked CE) (a fixed per-token precision), so latent gradients, and
+    the stable inference rate, scale with the number of masked tokens per
+    micro-batch (about 1,200 at 64 x 128 x 0.15). Rates tuned under the
+    earlier s * mean(masked CE) head are about that many times too large.
+    Calibrate standard PC and ePC with ``probe`` at the run's micro-batch size
+    (alignment for both; regime verdict and spectrum for ePC), over grids that
+    span several decades:
 
     PYTHONPATH=. python examples/mlm_domain_forgetting.py probe \\
         --checkpoint checkpoints/bert_mini_128.json --domain news \\
-        --pc_inference standard --grid "0.005:50,0.01:20,0.01:50" --batches 4
+        --pc_inference standard --batch_size 64 --batches 4 \\
+        --grid "1e-6:50,1e-5:50,1e-4:50,1e-3:50"
+
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py probe \\
+        --checkpoint checkpoints/bert_mini_128.json --domain news \\
+        --pc_inference epc --batch_size 64 --batches 4 --lanczos_iters 20 \\
+        --grid "1e-6:5,1e-5:5,1e-4:5,1e-3:5,1e-4:50" --final_spectrum
+
+    Backprop or any PC run can log the ε-spectrum and regime verdict of an
+    ePC setting during training (regime.jsonl): --pc_regime_interval K
+    --pc_regime_eta ETA --pc_regime_steps T (ePC runs default to their own).
 
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
         --init_perturbation 1e-7 --output_dir results/domain_forgetting/bp_pert
@@ -130,7 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pc_inference", choices=PC_INFERENCE, default=defaults.pc_inference
     )
-    parser.add_argument("--pc_eta_infer", type=float, default=defaults.pc_eta_infer)
+    parser.add_argument(
+        "--pc_eta_infer",
+        type=float,
+        default=defaults.pc_eta_infer,
+        help="Standard PC / ePC rate; latent gradients scale with the masked "
+        "tokens per micro-batch (summed head energy), so calibrate it with probe",
+    )
     parser.add_argument("--pc_spike_eta", type=float, default=defaults.pc_spike_eta)
     parser.add_argument(
         "--pc_spike_depth",
@@ -141,13 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--pc_forward_updates",
         choices=("none", "initial", "final"),
         default=None,
-        help="Default: 'initial' for spiking, 'none' for standard",
+        help="Default: 'initial' for spiking, 'none' for standard and epc",
     )
     parser.add_argument(
         "--pc_infer_steps",
         type=int,
         default=None,
-        help="Spiking default: the longest free depth; required for standard",
+        help="Spiking default: the longest free depth; required for standard/epc",
     )
     parser.add_argument("--pc_max_norm", type=float, default=defaults.pc_max_norm)
     parser.add_argument(
@@ -172,6 +198,28 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="PC vs BP gradient alignment on N fixed batches at each stage's "
         "start and end, written to alignment.jsonl; 0 = off",
+    )
+    parser.add_argument(
+        "--pc_regime_interval",
+        type=int,
+        default=defaults.pc_regime_interval,
+        metavar="K",
+        help="Log the eps-spectrum and ePC regime verdict at each stage's start, "
+        "every K updates and its end, to regime.jsonl; 0 = off",
+    )
+    parser.add_argument("--pc_regime_eta", type=float, default=None)
+    parser.add_argument("--pc_regime_steps", type=int, default=None)
+    parser.add_argument(
+        "--pc_regime_iters",
+        type=int,
+        default=defaults.pc_regime_iters,
+        help="Lanczos steps per probe; each is one Hessian-vector product, so "
+        "a probe costs about as much as tens of training micro-batch gradients",
+    )
+    parser.add_argument(
+        "--pc_regime_final",
+        action="store_true",
+        help="Also measure the spectrum after pc_regime_steps ePC steps",
     )
     parser.add_argument(
         "--gate",
@@ -259,6 +307,18 @@ def build_probe_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask_prob", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--lanczos_iters",
+        type=int,
+        default=20,
+        help="Lanczos steps of the eps-spectrum (--pc_inference epc)",
+    )
+    parser.add_argument(
+        "--final_spectrum",
+        action="store_true",
+        help="Also measure the eps-spectrum at each setting's relaxed errors "
+        "(the regime verdict is a statement about eps = 0)",
+    )
+    parser.add_argument(
         "--skip_shape_check",
         action="store_true",
         help=f"Do not require the BERT-Mini shape {BERT_MINI_SHAPE}",
@@ -294,6 +354,8 @@ def run_probe(argv: Sequence[str]) -> dict[str, Any]:
         mask_prob=args.mask_prob,
         seed=args.seed,
         expected_shape=None if args.skip_shape_check else dict(BERT_MINI_SHAPE),
+        lanczos_iters=args.lanczos_iters,
+        final_spectrum=args.final_spectrum,
     )
     if args.out:
         atomic_write_json(Path(args.out), report)
@@ -335,6 +397,11 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         pc_max_norm=args.pc_max_norm,
         pc_output_energy_scale=args.pc_output_energy_scale,
         pc_alignment_batches=args.pc_alignment_batches,
+        pc_regime_interval=args.pc_regime_interval,
+        pc_regime_eta=args.pc_regime_eta,
+        pc_regime_steps=args.pc_regime_steps,
+        pc_regime_iters=args.pc_regime_iters,
+        pc_regime_final=args.pc_regime_final,
         init_perturbation=args.init_perturbation,
         init_perturbation_seed=args.init_perturbation_seed,
         gate=args.gate,
