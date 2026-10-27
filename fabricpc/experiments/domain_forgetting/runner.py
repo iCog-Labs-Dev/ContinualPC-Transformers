@@ -17,11 +17,17 @@ norm-clipped SGD inference at rate ``pc_eta_infer`` and takes the weight
 update from the final inference state (``pc_forward_updates="none"``). Its
 gradient is not equal to backprop's, so the scaled clip and ``eps`` are kept
 as conventions that match spike-only PC, not as an equivalence; the scale
-relation to backprop is only approximate.
+relation to backprop is only approximate. ePC (``pc_inference="epc"``)
+runs ``pc_infer_steps`` steps of error-parameterized inference
+(``EPCInference``) at rate ``pc_eta_infer`` with the same weight rule and
+energy statistics; its regime (backprop-like to PC equilibrium) is read from
+the ε-spectrum (``pc_regime_interval``, or the ``probe`` command).
 
-Each update averages its micro-batch gradients weighted by their masked-token
-counts (``Σ_k g_k n_k / Σ_k n_k``), so it equals the gradient of the mean
-masked CE over the whole batch.
+Each update is the gradient of the mean masked CE over the whole batch: the
+backprop micro-batch gradients are weighted by their masked-token counts
+(``Σ_k g_k n_k / Σ_k n_k``); PC micro-batch gradients are token sums, since
+the MLM head energy is ``s · Σ_masked CE`` (a fixed per-token precision), and
+are added and divided once by ``Σ_k n_k``.
 
 With ``training="joint"`` the run is the multi-task upper bound instead: one
 stage trains on the concatenated domain streams for ``len(domains) *
@@ -41,7 +47,7 @@ import math
 import platform
 import shutil
 import time
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -63,6 +69,8 @@ from fabricpc.core.inference import (
     InferenceSpikingPrecision,
     gather_inputs,
 )
+from fabricpc.core.epsilon_spectrum import EpsilonSpectrum, make_epsilon_spectrum
+from fabricpc.core.inference_epc import EPCInference
 from fabricpc.core.scaling import scale_inputs
 from fabricpc.core.types import GraphParams, GraphState, GraphStructure, NodeParams
 from fabricpc.experiments.domain_forgetting.artifacts import (
@@ -99,6 +107,7 @@ from fabricpc.training.train_backprop import (
     _loss_and_grad_backprop_mlm_no_update,
 )
 from fabricpc.training.train_mlm import (
+    _prepare_pcn_mlm_batch,
     create_jit_gradient_step_pcn_mlm,
     create_pc_bp_gradient_comparison,
     get_graph_param_gradient_pcn_mlm,
@@ -127,15 +136,29 @@ GATE_SETTINGS = {
     "oracle": ("gate_beta", "gate_source"),
     "freeze": ("gate_modules",),
 }
-PC_INFERENCE = ("spiking", "standard")
-DEFAULT_FORWARD_UPDATES = {"spiking": "initial", "standard": "none"}
+PC_INFERENCE = ("spiking", "standard", "epc")
+ITERATIVE_PC = ("standard", "epc")
+DEFAULT_FORWARD_UPDATES = {"spiking": "initial", "standard": "none", "epc": "none"}
+HEAD_ENERGY = "sum_masked_ce"
 METRICS = ("masked_ce", "masked_perplexity", "masked_accuracy")
 MATRIX_FILES = {
     "masked_ce": "masked_ce_matrix.json",
     "masked_perplexity": "masked_perplexity_matrix.json",
     "masked_accuracy": "masked_accuracy_matrix.json",
 }
-RESUME_IGNORED_KEYS = ("log_interval", "output_dir", "pc_alignment_batches")
+REGIME_DEFAULTS: dict[str, Any] = {
+    "pc_regime_interval": 0,
+    "pc_regime_eta": None,
+    "pc_regime_steps": None,
+    "pc_regime_iters": 20,
+    "pc_regime_final": False,
+}
+RESUME_IGNORED_KEYS = (
+    "log_interval",
+    "output_dir",
+    "pc_alignment_batches",
+    *REGIME_DEFAULTS,
+)
 COMPARE_IGNORED_KEYS = (
     "mode",
     "output_dir",
@@ -164,6 +187,7 @@ RUN_ARTIFACT_FILES = (
     "runtime.json",
     "pc_bp_agreement.json",
     "alignment.jsonl",
+    "regime.jsonl",
     "gates.jsonl",
     *ANALYSIS_FILES,
 )
@@ -172,7 +196,14 @@ RUN_ARTIFACT_PATTERNS = ("stage_*.npz", "training_log_stage_*.jsonl")
 
 @dataclass(frozen=True)
 class RunConfig:
-    """Every setting that determines a run's results."""
+    """Every setting that determines a run's results.
+
+    The regime probe (``pc_regime_*``) only reads the params. Each probe runs
+    ``pc_regime_iters`` Lanczos steps, one Hessian-vector product (a forward
+    and a double backward pass through the ε-energy) each, about as much as
+    tens of training micro-batch gradients; ``pc_regime_final`` adds
+    ``pc_regime_steps`` ePC steps and a second spectrum at the relaxed errors.
+    """
 
     checkpoint: str
     data_dir: str
@@ -206,6 +237,11 @@ class RunConfig:
     pc_max_norm: float = 5.0
     pc_output_energy_scale: float = 1.0
     pc_alignment_batches: int = 0
+    pc_regime_interval: int = 0
+    pc_regime_eta: float | None = None
+    pc_regime_steps: int | None = None
+    pc_regime_iters: int = 20
+    pc_regime_final: bool = False
     init_perturbation: float = 0.0
     init_perturbation_seed: int = 0
     gate: str = "none"
@@ -245,17 +281,60 @@ class RunConfig:
             raise ValueError("pc_alignment_batches must be non-negative")
         if self.mode != "pc" and self.pc_alignment_batches:
             raise ValueError("pc_alignment_batches needs mode 'pc'")
+        self._validate_regime()
         if self.mode == "pc":
             if self.pc_inference not in PC_INFERENCE:
                 raise ValueError(
-                    f"pc_inference must be 'spiking' or 'standard', "
+                    f"pc_inference must be one of {PC_INFERENCE}, "
                     f"got {self.pc_inference!r}"
                 )
             if self.pc_output_energy_scale <= 0.0:
                 raise ValueError("pc_output_energy_scale must be positive")
-            if self.pc_inference == "standard":
-                self._validate_standard()
+            if self.pc_inference in ITERATIVE_PC:
+                self._validate_iterative()
         self._validate_gate()
+
+    def _validate_regime(self) -> None:
+        """The regime probe's settings apply only when its interval is set.
+
+        Any mode may probe (backprop is the control). ``pc_regime_eta`` and
+        ``pc_regime_steps`` default to the run's ePC settings and are
+        required otherwise.
+        """
+        if self.pc_regime_interval < 0:
+            raise ValueError("pc_regime_interval must be non-negative")
+        if self.pc_regime_interval == 0:
+            unused = [
+                name
+                for name, default in REGIME_DEFAULTS.items()
+                if getattr(self, name) != default
+            ]
+            if unused:
+                raise ValueError(f"{', '.join(unused)} need pc_regime_interval > 0")
+            return
+        eta, steps = self.regime_setting
+        if eta is None or steps is None:
+            raise ValueError(
+                "pc_regime_interval needs pc_regime_eta and pc_regime_steps "
+                "unless the run is ePC"
+            )
+        if not (math.isfinite(eta) and eta > 0):
+            raise ValueError("pc_regime_eta must be finite and positive")
+        if steps < 1:
+            raise ValueError("pc_regime_steps must be >= 1")
+        if self.pc_regime_iters < 1:
+            raise ValueError("pc_regime_iters must be >= 1")
+
+    @property
+    def regime_setting(self) -> tuple[float | None, int | None]:
+        """The (eta, steps) the regime probe judges, defaulting to the run's ePC."""
+        epc = self.mode == "pc" and self.pc_inference == "epc"
+        eta = self.pc_regime_eta
+        steps = self.pc_regime_steps
+        if epc:
+            eta = self.pc_eta_infer if eta is None else eta
+            steps = self.pc_infer_steps if steps is None else steps
+        return eta, steps
 
     def _validate_gate(self) -> None:
         """Each gate takes only its own settings, and gates need sequential runs.
@@ -296,18 +375,24 @@ class RunConfig:
             if len(set(self.gate_source)) != len(self.gate_source):
                 raise ValueError("gate_source has duplicates")
 
-    def _validate_standard(self) -> None:
-        """Standard PC needs explicit inference settings and no spike flags."""
+    def _validate_iterative(self) -> None:
+        """Standard PC and ePC need explicit inference settings, no spike flags."""
+        name = "standard PC" if self.pc_inference == "standard" else "ePC"
         if not self.pc_eta_infer > 0.0:
-            raise ValueError("standard PC needs pc_eta_infer > 0")
+            raise ValueError(f"{name} needs pc_eta_infer > 0")
         if self.pc_infer_steps is None or self.pc_infer_steps < 1:
             raise ValueError(
-                "standard PC needs pc_infer_steps >= 1 (there is no depth default)"
+                f"{name} needs pc_infer_steps >= 1 (there is no depth default)"
             )
         if self.pc_forward_updates != "none":
             raise ValueError(
-                "standard PC needs pc_forward_updates 'none' (weight update from "
+                f"{name} needs pc_forward_updates 'none' (weight update from "
                 f"the final inference state), got {self.pc_forward_updates!r}"
+            )
+        default_max_norm = type(self).__dataclass_fields__["pc_max_norm"].default
+        if self.pc_inference == "epc" and self.pc_max_norm != default_max_norm:
+            raise ValueError(
+                "pc_max_norm does not apply to ePC (no latent-gradient clip)"
             )
         spike_flags = [
             name
@@ -319,7 +404,8 @@ class RunConfig:
         ]
         if spike_flags:
             raise ValueError(
-                f"{', '.join(spike_flags)} only apply to spiking PC, not standard"
+                f"{', '.join(spike_flags)} only apply to spiking PC, "
+                f"not {self.pc_inference}"
             )
 
     @property
@@ -458,13 +544,22 @@ def build_inference(
     """Return the run's inference object and its PC inference step count.
 
     Spike-only PC defaults ``pc_infer_steps`` to the longest free depth and
-    rejects fewer steps; standard PC uses ``pc_infer_steps`` as given.
+    rejects fewer steps; standard PC and ePC use ``pc_infer_steps`` as given.
     Backprop gets a placeholder inference object and ``None``.
     """
     if config.mode != "pc":
         return InferenceSGDNormClip(eta_infer=0.05, infer_steps=5, max_norm=5.0), None
     if config.pc_inference == "standard":
         return _standard_inference(config), int(config.pc_infer_steps)
+    if config.pc_inference == "epc":
+        return (
+            EPCInference(
+                eta_infer=config.pc_eta_infer,
+                infer_steps=int(config.pc_infer_steps),
+                latent_decay=0.0,
+            ),
+            int(config.pc_infer_steps),
+        )
     probe = build_structure(model_config, config, _spiking_inference(config, 1))
     needed = max_free_depth(probe, config.pc_spike_depth)
     infer_steps = config.pc_infer_steps or needed
@@ -703,13 +798,24 @@ def make_gradient_fn(
 ) -> GradientFn:
     """Return a jitted ``(params, batch, key) -> (grads, loss_sum, count, extras)``.
 
+    Backprop ``grads`` are the gradient of the batch's mean masked CE; PC
+    ``grads`` are summed over its masked tokens (the head energy is
+    ``s · Σ_masked CE``), so ``accumulate_gradients`` needs ``summed=True``.
     ``loss_sum`` is the masked CE summed over the batch's masked tokens.
-    Both modes draw dropout masks from ``key`` the same way. Standard PC
-    extras add ``pc_energy_start`` (the target-clamped feedforward state) and
-    ``pc_energy_end`` (the final inference state the weight update uses).
-    ``pc_total_energy`` sums the energies stored in the final state, which
-    were computed before the last latent update, so it is the energy of step
-    ``T - 1``, not ``pc_energy_end``.
+    Both modes draw dropout masks from ``key`` the same way. Standard PC and
+    ePC extras add ``pc_energy_start`` (the target-clamped feedforward state)
+    and ``pc_energy_end`` (the final inference state the weight update uses),
+    both batch means of the total energy recomputed at the state's latents.
+    ``pc_energy_rises`` counts per-sample energy increases between
+    consecutive inference steps, summed over samples; ePC also reports
+    ``pc_energy_total_rises``, the steps whose batch-total energy rose. The
+    energies are per-sample sums under the head energy ``s · Σ_masked CE``, in
+    units about ``N`` (masked tokens per micro-batch) times those of the
+    earlier mean-CE head. ``pc_total_energy`` is the batch mean of the
+    energies stored in the final state: under standard PC they were computed
+    before the last latent update, so it is the energy of step ``T - 1``, not
+    ``pc_energy_end``; ePC's final state is re-derived at its final errors, so
+    there it equals ``pc_energy_end``.
     """
     if mode == "backprop":
 
@@ -722,7 +828,7 @@ def make_gradient_fn(
 
         return backprop
     validate_epc_forward_updates(structure, forward_updates)
-    if pc_inference == "standard":
+    if pc_inference in ITERATIVE_PC:
 
         @jax.jit
         def standard(params, batch, key):
@@ -739,6 +845,11 @@ def make_gradient_fn(
                     "pc_total_energy": metrics["pc_total_energy"],
                     "pc_energy_start": state_total_energy(params, initial, structure),
                     "pc_energy_end": state_total_energy(params, final, structure),
+                    **{
+                        key: metrics[key]
+                        for key in ("pc_energy_total_rises",)
+                        if key in metrics
+                    },
                 },
             )
 
@@ -765,13 +876,18 @@ def accumulate_gradients(
     params: GraphParams,
     micro_batches: Sequence[Mapping[str, jax.Array]],
     keys: Sequence[jax.Array],
+    *,
+    summed: bool = False,
 ) -> tuple[GraphParams, float, float, list[dict[str, Any]]]:
     """Return the token-weighted mean gradient of one update's micro-batches.
 
-    ``gradient_fn`` returns each micro-batch's mean-CE gradient ``g_k`` over
-    its ``n_k`` masked tokens; the result is ``Σ_k g_k n_k / max(Σ_k n_k, 1)``
-    with the summed masked CE, the total count and the per-micro-batch
-    extras.
+    With ``summed`` false ``gradient_fn`` returns each micro-batch's mean-CE
+    gradient ``g_k`` over its ``n_k`` masked tokens (backprop) and the result
+    is ``Σ_k g_k n_k / max(Σ_k n_k, 1)``. With ``summed`` true it returns the
+    token-summed gradient ``G_k`` (PC, whose head energy is ``s · Σ_masked
+    CE``) and the result is ``Σ_k G_k / max(Σ_k n_k, 1)``: the normalisation
+    happens once, over the whole update. Also returns the summed masked CE,
+    the total count and the per-micro-batch extras.
     """
     total = None
     loss_sum = 0.0
@@ -779,7 +895,11 @@ def accumulate_gradients(
     extras = []
     for batch, key in zip(micro_batches, keys, strict=True):
         grads, batch_loss, batch_count, batch_extras = gradient_fn(params, batch, key)
-        weighted = jax.tree_util.tree_map(lambda g: g * batch_count, grads)
+        weighted = (
+            grads
+            if summed
+            else jax.tree_util.tree_map(lambda g: g * batch_count, grads)
+        )
         total = (
             weighted
             if total is None
@@ -797,6 +917,108 @@ def accumulate_gradients(
         count,
         extras,
     )
+
+
+RegimeProbe = Callable[[GraphParams, dict[str, jax.Array], jax.Array], Any]
+
+
+def make_regime_probe(
+    structure: GraphStructure,
+    iters: int = 20,
+    final: tuple[float, int] | None = None,
+) -> RegimeProbe:
+    """Return a jitted ``(params, batch, key) -> (spectrum, final_spectrum)``.
+
+    ``spectrum`` is the ε-energy Hessian's ``EpsilonSpectrum`` (on device)
+    at the target-clamped feedforward state of ``batch`` (ε = 0), with
+    ``iters`` Lanczos steps; dropout masks come from ``key`` when
+    ``structure`` has dropout. With ``final = (eta, steps)``,
+    ``final_spectrum`` is the spectrum at the errors reached by ``steps``
+    ePC steps at rate ``eta`` from there (else None): the regime verdict is
+    a statement about ε = 0, and this checks it along the relaxation.
+    """
+    spectrum_fn = make_epsilon_spectrum(structure, iters)
+    relaxed = None
+    if final is not None:
+        eta, steps = final
+        relaxed = structure._replace(
+            config={
+                **structure.config,
+                "inference": EPCInference(eta_infer=eta, infer_steps=int(steps)),
+            }
+        )
+
+    @jax.jit
+    def probe(params, batch, key):
+        _shared, _metrics, _free, initial, clamps = _prepare_pcn_mlm_batch(
+            params, batch, structure, key
+        )
+        spectrum = spectrum_fn(params, initial, clamps, key)
+        if relaxed is None:
+            return spectrum, None
+        state = EPCInference.run_inference(params, initial, clamps, relaxed)
+        return spectrum, spectrum_fn(params, state, clamps, key)
+
+    return probe
+
+
+def spectrum_scalars(spectrum: EpsilonSpectrum) -> dict[str, Any]:
+    """The JSON scalars of one ``EpsilonSpectrum``."""
+    spectrum = spectrum.host()
+    return {
+        "lambda_max": float(spectrum.lambda_max),
+        "lambda_min": float(spectrum.lambda_min),
+        "negative_weight": float(spectrum.negative_weight),
+        "gradient_norm": float(spectrum.gradient_norm),
+        "lanczos_k": int(spectrum.k),
+        "random_start": bool(spectrum.random_start),
+    }
+
+
+def regime_summary(
+    spectrum: EpsilonSpectrum,
+    eta: float,
+    steps: int,
+    final_spectrum: EpsilonSpectrum | None = None,
+) -> dict[str, Any]:
+    """The spectrum's scalars and ``EPCInference(eta, steps).regime`` verdict.
+
+    The verdict reads the quadratic model at the spectrum's point (ε = 0 for
+    ``make_regime_probe``), so it can mispredict on an indefinite spectrum or
+    when the curvature grows as ε relaxes. With ``final_spectrum`` (the
+    spectrum at the relaxed errors) the summary adds ``lambda_max_final``,
+    ``lambda_min_final``, ``eta_lambda_max_final`` and ``unstable_final``
+    (``eta · lambda_max_final > 2``).
+    """
+    host = spectrum.host()
+    regime = EPCInference(eta_infer=eta, infer_steps=steps).regime(host)
+    summary = {
+        **spectrum_scalars(host),
+        "f_weighted": None if math.isnan(regime.f_weighted) else regime.f_weighted,
+        "f_max": regime.f_max,
+        "band": regime.band,
+        "unstable": bool(regime.unstable),
+        "regime": str(regime),
+    }
+    if final_spectrum is not None:
+        final = spectrum_scalars(final_spectrum)
+        summary["lambda_max_final"] = final["lambda_max"]
+        summary["lambda_min_final"] = final["lambda_min"]
+        summary["eta_lambda_max_final"] = eta * final["lambda_max"]
+        summary["unstable_final"] = eta * final["lambda_max"] > 2.0
+    return summary
+
+
+def module_weight_norms(
+    params: GraphParams, structure: GraphStructure
+) -> dict[str, float]:
+    """Global L2 norm of each parameterised node's parameters, in graph order."""
+    norms = {}
+    for name in structure.node_order:
+        leaves = jax.tree_util.tree_leaves(params.nodes[name])
+        if leaves:
+            norms[name] = float(optax.tree.norm(leaves))
+    return norms
 
 
 AlignmentFn = Callable[
@@ -926,6 +1148,7 @@ def train_stage(
     special_ids: Mapping[str, int],
     gradient_fn: GradientFn,
     multipliers: Mapping[str, float] | None = None,
+    regime_fn: Callable[[int, int, GraphParams], None] | None = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any], list[dict[str, Any]]]:
     """Train one domain from ``params`` with a fresh optimizer and schedule.
@@ -936,8 +1159,12 @@ def train_stage(
     and restarts when an epoch ends. Batches, MLM masks
     and dropout keys depend only on ``seed`` and ``stage``, so both modes see
     the same ones. ``multipliers`` scales each module's update
-    (``build_stage_optimizer``). Returns the params, the exposure record and
-    the log.
+    (``build_stage_optimizer``). Each log entry holds ``grad_norm``, the
+    global norm of the update's gradient as the clip sees it (frozen modules
+    zeroed), and ``clipped``, whether the clip rescaled it. ``regime_fn(update,
+    num_updates, params)`` is called before the first update and after every
+    update; it must only read ``params``. Returns the params, the exposure
+    record and the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
     vocab_size = int(structure.nodes[structure.task_map["y"]].node_info.shape[-1])
@@ -967,6 +1194,14 @@ def train_stage(
             params=p, opt_state=o, grads=g, optimizer=optimizer, masked_count=c
         )
     )
+    frozen = {name for name, value in (multipliers or {}).items() if value == 0.0}
+    clip_norm_fn = jax.jit(
+        lambda g: optax.tree.norm(
+            {name: node for name, node in g.nodes.items() if name not in frozen}
+        )
+    )
+    if regime_fn is not None:
+        regime_fn(0, num_updates, params)
     rng_key = jax.random.fold_in(jax.random.PRNGKey(config.seed), stage)
     counts = {
         "stream_tokens": 0,
@@ -994,8 +1229,15 @@ def train_stage(
             if len(pending_batches) < accumulation:
                 continue
             pending_grads, pending_loss, pending_count, pending_extras = (
-                accumulate_gradients(gradient_fn, params, pending_batches, pending_keys)
+                accumulate_gradients(
+                    gradient_fn,
+                    params,
+                    pending_batches,
+                    pending_keys,
+                    summed=config.mode == "pc",
+                )
             )
+            grad_norm = float(clip_norm_fn(pending_grads))
             params, opt_state = update_fn(
                 params, opt_state, pending_grads, jnp.asarray(pending_count)
             )
@@ -1005,6 +1247,12 @@ def train_stage(
                 "update": updates,
                 "masked_loss": pending_loss / max(pending_count, 1.0),
                 "masked_tokens": int(pending_count),
+                "grad_norm": grad_norm,
+                "clipped": bool(
+                    config.clip_norm > 0
+                    and pending_count > 0
+                    and grad_norm > config.clip_norm
+                ),
             }
             if config.mode == "pc":
                 entry["pc_total_energy"] = float(
@@ -1013,7 +1261,11 @@ def train_stage(
                 entry["pc_energy_rises"] = int(
                     sum(int(e["pc_energy_rises"]) for e in pending_extras)
                 )
-                if config.pc_inference == "standard":
+                if "pc_energy_total_rises" in pending_extras[0]:
+                    entry["pc_energy_total_rises"] = int(
+                        sum(int(e["pc_energy_total_rises"]) for e in pending_extras)
+                    )
+                if config.pc_inference in ITERATIVE_PC:
                     start = float(
                         np.mean([float(e["pc_energy_start"]) for e in pending_extras])
                     )
@@ -1029,11 +1281,14 @@ def train_stage(
                     if end > start and not energy_warned:
                         energy_warned = True
                         print(
-                            f"WARNING stage={stage} update={updates}: standard PC "
-                            f"inference raised the energy ({start:.4g} -> {end:.4g}); "
-                            "inference is diverging, lower --pc_eta_infer"
+                            f"WARNING stage={stage} update={updates}: "
+                            f"{config.pc_inference} PC inference raised the energy "
+                            f"({start:.4g} -> {end:.4g}); inference is diverging, "
+                            "lower --pc_eta_infer"
                         )
             log.append(entry)
+            if regime_fn is not None:
+                regime_fn(updates, num_updates, params)
             if verbose and config.log_interval and updates % config.log_interval == 0:
                 print(
                     f"stage={stage} update={updates}/{num_updates} "
@@ -1255,6 +1510,18 @@ def run_domain_forgetting(
     summary holds ``summarize_joint``'s per-domain scores. With a ``gate``,
     every trained stage appends its module multipliers (``GatePlan.record``)
     to ``gates.jsonl`` and the run config holds ``GatePlan.describe()``.
+    With ``pc_regime_interval`` k > 0, every trained stage appends to
+    ``regime.jsonl`` the ε-spectrum (``make_regime_probe``), the
+    ``EPCInference(pc_regime_eta, pc_regime_steps).regime`` verdict and the
+    per-module weight norms at its start, every k updates and its end, on
+    one fixed dropout-free micro-batch of its domain (seed ``seed + stage``).
+    With ``pc_regime_final`` each record also holds the spectrum after
+    ``pc_regime_steps`` ePC steps (``regime_summary``). The probe only reads
+    the params, so the run's results do not depend on it. The regime
+    settings are resume-ignored: reused stages keep their records and
+    retrained stages are probed with the current settings, so a resumed
+    ``regime.jsonl`` can mix settings across stages; every record carries
+    its own (interval, final, eta, steps, Lanczos iterations).
     """
     config.validate()
     domains = list(config.domains)
@@ -1313,6 +1580,7 @@ def run_domain_forgetting(
                 "infer_steps": base.infer_steps,
                 "max_norm": config.pc_max_norm,
                 "output_energy_scale": config.pc_output_energy_scale,
+                "head_energy": HEAD_ENERGY,
             }
             if config.mode == "pc"
             else None
@@ -1358,6 +1626,79 @@ def run_domain_forgetting(
     previous_exposure = (_read_json(output / "exposure.json") if resume else None) or {}
     previous_alignment = _read_jsonl(output / "alignment.jsonl") if resume else []
     previous_gates = _read_jsonl(output / "gates.jsonl") if resume else []
+    previous_regime = _read_jsonl(output / "regime.jsonl") if resume else []
+    regime_records: list[dict[str, Any]] = []
+    regime_probe = None
+    if config.pc_regime_interval:
+        regime_structure = build_structure(
+            base.model_config,
+            replace(config, dropout_rate=0.0),
+            base.structure.config["inference"],
+        )
+        regime_eta, regime_steps = config.regime_setting
+        regime_probe = make_regime_probe(
+            regime_structure,
+            config.pc_regime_iters,
+            (regime_eta, regime_steps) if config.pc_regime_final else None,
+        )
+
+    def stage_regime_fn(stage: int, domain: str, stream: np.ndarray):
+        """Return the stage's ``train_stage`` regime callback and its timer."""
+        batch_size = config.micro_batch_size or config.batch_size
+        batches, keys = fixed_mlm_batches(
+            stream,
+            regime_structure,
+            base.special_ids,
+            num_batches=1,
+            batch_size=batch_size,
+            mask_prob=config.mask_prob,
+            seed=config.seed + stage,
+        )
+        seconds = [0.0]
+
+        def record(update: int, num_updates: int, stage_params: GraphParams) -> None:
+            interval = config.pc_regime_interval
+            if update not in (0, num_updates) and update % interval:
+                return
+            started = time.time()
+            spectrum, final_spectrum = regime_probe(stage_params, batches[0], keys[0])
+            when = (
+                "start"
+                if update == 0
+                else "end" if update == num_updates else "interval"
+            )
+            regime_records.append(
+                {
+                    "stage": stage,
+                    "domain": domain,
+                    "update": update,
+                    "num_updates": num_updates,
+                    "when": when,
+                    "params_sha256": params_hash(stage_params),
+                    "regime_interval": config.pc_regime_interval,
+                    "regime_final": config.pc_regime_final,
+                    "eta_infer": regime_eta,
+                    "infer_steps": regime_steps,
+                    "lanczos_iters": config.pc_regime_iters,
+                    "batch_size": batch_size,
+                    "seed": config.seed + stage,
+                    **regime_summary(
+                        spectrum, regime_eta, regime_steps, final_spectrum
+                    ),
+                    "weight_norms": module_weight_norms(stage_params, base.structure),
+                }
+            )
+            seconds[0] += time.time() - started
+            if verbose:
+                last = regime_records[-1]
+                print(
+                    f"stage={stage} update={update} regime "
+                    f"lambda_max={last['lambda_max']:.4g} "
+                    f"lambda_min={last['lambda_min']:.4g}: {last['regime']}"
+                )
+
+        return record, seconds
+
     gate_records: list[dict[str, Any]] = []
 
     gradient_fn = make_gradient_fn(
@@ -1392,6 +1733,7 @@ def run_domain_forgetting(
                 "params_sha256": params_hash(stage_params),
                 "pc_inference": config.pc_inference,
                 "output_energy_scale": config.pc_output_energy_scale,
+                "head_energy": HEAD_ENERGY,
                 "batch_size": config.micro_batch_size or config.batch_size,
                 "seed": config.seed + stage,
                 **gradient_alignment(
@@ -1464,6 +1806,9 @@ def run_domain_forgetting(
                 r for r in previous_alignment if int(r["stage"]) == stage
             )
             gate_records.extend(r for r in previous_gates if int(r["stage"]) == stage)
+            regime_records.extend(
+                r for r in previous_regime if int(r["stage"]) == stage
+            )
             if verbose:
                 print(f"stage={stage} reused params_sha256={parent_sha[:12]}")
             continue
@@ -1488,23 +1833,32 @@ def run_domain_forgetting(
                         )
             if alignment_fn is not None:
                 alignment_seconds = record_alignment(stage, domain, "start", params)
+            stream = (
+                np.concatenate([caches[name].train for name in domains])
+                if domain == JOINT_STAGE
+                else caches[domain].train
+            )
+            regime_fn, regime_seconds = (
+                stage_regime_fn(stage, domain, stream)
+                if regime_probe is not None
+                else (None, [0.0])
+            )
             train_start = time.time()
             params, stage_exposure, log = train_stage(
                 params,
                 base.structure,
-                (
-                    np.concatenate([caches[name].train for name in domains])
-                    if domain == JOINT_STAGE
-                    else caches[domain].train
-                ),
+                stream,
                 config=config,
                 stage=stage,
                 special_ids=base.special_ids,
                 gradient_fn=gradient_fn,
                 multipliers=multipliers,
+                regime_fn=regime_fn,
                 verbose=verbose,
             )
-            train_seconds = time.time() - train_start
+            train_seconds = time.time() - train_start - regime_seconds[0]
+            if regime_probe is not None:
+                _write_jsonl(output / "regime.jsonl", regime_records)
             exposure[domain] = stage_exposure
             _write_jsonl(output / f"training_log_stage_{stage}.jsonl", log)
             if alignment_fn is not None:
@@ -1552,6 +1906,8 @@ def run_domain_forgetting(
         }
         if alignment_fn is not None:
             stage_runtime[str(stage)]["alignment_seconds"] = alignment_seconds
+        if regime_probe is not None and domain is not None:
+            stage_runtime[str(stage)]["regime_seconds"] = regime_seconds[0]
         if gate_plan is not None and domain is not None:
             stage_runtime[str(stage)]["gate_seconds"] = gate_records[-1]["seconds"]
         atomic_write_json(output / "exposure.json", exposure)
