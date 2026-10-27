@@ -23,7 +23,7 @@ from tests.test_domain_forgetting_runner import DOMAINS, make_setup, tiny_config
 STANDARD = {
     "mode": "pc",
     "pc_inference": "standard",
-    "pc_eta_infer": 0.1,
+    "pc_eta_infer": 0.01,
     "pc_infer_steps": 20,
     "pc_forward_updates": "none",
 }
@@ -225,7 +225,7 @@ def test_probe_spiking_is_exact_and_small_eta_standard_matches_at_the_head(setup
         assert row["cosine_min"] >= 0.999
         assert row["norm_ratio"] == pytest.approx(1.0, rel=1e-3)
     standard = probe_alignment(
-        **common, pc_inference="standard", settings=[(0.01, 200), (0.1, 20)]
+        **common, pc_inference="standard", settings=[(0.001, 200), (0.01, 20)]
     )
     assert standard["forward_updates"] == "none"
     assert [s["infer_steps"] for s in standard["settings"]] == [200, 20]

@@ -167,6 +167,8 @@ def test_analysis_cli_all_and_multi_seed_correlations(run, tmp_path):
         "4",
         "--pc_infer_steps",
         "3",
+        "--pc_eta_infer",
+        "0.001",
         "--predictor_windows",
         "8",
         "--predictor_batch_size",

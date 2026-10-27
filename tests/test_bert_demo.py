@@ -50,6 +50,8 @@ def test_pc_pretrain_tiny_smoke(tmp_path):
             "pretrain",
             "--mode",
             "pc",
+            "--pc_eta_infer",
+            "0.01",
             "--data_source",
             "tiny",
             "--seq_len",
@@ -523,6 +525,8 @@ def test_pc_incremental_pretrain_tiny_smoke(capsys):
             "pretrain",
             "--mode",
             "pc",
+            "--pc_eta_infer",
+            "0.01",
             "--pc_incremental",
             "--pc_infer_steps",
             "2",
@@ -591,6 +595,8 @@ TINY_PC_PRETRAIN = [
     "pretrain",
     "--mode",
     "pc",
+    "--pc_eta_infer",
+    "0.01",
     "--seq_len",
     "6",
     "--embed_dim",
@@ -620,7 +626,9 @@ def test_spiking_flags_parse_and_build_inference():
     from examples.bert_demo import build_pretrain_inference
     from fabricpc.core.inference import InferenceSGDNormClip, InferenceSpikingPrecision
 
-    default = parse_args(["--stage", "pretrain", "--mode", "pc"])
+    default = parse_args(
+        ["--stage", "pretrain", "--mode", "pc", "--pc_eta_infer", "0.01"]
+    )
     assert default.pc_inference == "sgd_clip"
     assert default.pc_spike_eta == 1.0
     assert default.pc_spike_offset == 0
@@ -636,6 +644,8 @@ def test_spiking_flags_parse_and_build_inference():
             "pc",
             "--pc_inference",
             "spiking",
+            "--pc_eta_infer",
+            "0",
             "--pc_spike_eta",
             "0.5",
             "--pc_spike_offset",
@@ -860,6 +870,8 @@ def _tiny_pretrain_argv(tmp_path, *extra):
         "0",
         "--log_interval",
         "0",
+        "--pc_eta_infer",
+        "0.01",
         *extra,
     ]
 

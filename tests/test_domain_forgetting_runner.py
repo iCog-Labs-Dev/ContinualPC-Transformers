@@ -564,17 +564,22 @@ def test_micro_batch_accumulation_equals_the_full_batch_gradient(mode, tmp_path)
         micro = _uneven_micro_batches(vocab_size, SEQ_LEN, np.random.default_rng(0))
         full = {k: jnp.concatenate([b[k] for b in micro]) for k in micro[0]}
         key = jax.random.PRNGKey(0)
+        summed = mode == "pc"
         accumulated, loss_sum, count, extras = accumulate_gradients(
-            gradient_fn, base.params, micro, [key, key]
+            gradient_fn, base.params, micro, [key, key], summed=summed
         )
         expected, full_loss, full_count, _ = gradient_fn(base.params, full, key)
+
+        def mean(batch):
+            grads, _loss, batch_count, _ = gradient_fn(base.params, batch, key)
+            divisor = batch_count if summed else 1.0
+            return jax.tree_util.tree_map(lambda g: g / divisor, grads)
+
         flat_acc = flatten_params(accumulated)
-        flat_full = flatten_params(expected)
+        flat_full = flatten_params(mean(full))
         mean_of_means = flatten_params(
             jax.tree_util.tree_map(
-                lambda a, b: (a + b) / 2,
-                gradient_fn(base.params, micro[0], key)[0],
-                gradient_fn(base.params, micro[1], key)[0],
+                lambda a, b: (a + b) / 2, mean(micro[0]), mean(micro[1])
             )
         )
     assert count == float(full_count) == 6.0

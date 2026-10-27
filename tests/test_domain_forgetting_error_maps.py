@@ -87,6 +87,7 @@ def _bp_logit_signal(params, structure, batch):
 
 
 def test_spike_only_map_equals_backprop_signal_in_float64():
+    """Raw energies use the summed head energy: BP's mean-CE signal times N²."""
     with jax.enable_x64(True):
         probe = _tiny_bert(spike_only_inference(1))
         structure = _tiny_bert(spike_only_inference(max_free_depth(probe)))
@@ -96,6 +97,9 @@ def test_spike_only_map_equals_backprop_signal_in_float64():
         again = jax.jit(lambda p, b: node_energies(p, structure, b))(params, batch)
         bp = bp_signal_energies(params, structure, batch, SCALE)
         logit_signal = _bp_logit_signal(params, structure, batch)
+        count = float(np.sum(np.asarray(batch["loss_mask"])))
+        bp = {n: v * count**2 for n, v in bp.items()}
+        logit_signal = logit_signal * count**2
     assert max_free_depth(probe) == 9
     assert set(bp) == set(hidden_nodes(structure))
     assert "L0_residual" in bp and "mlm_head" not in bp
@@ -141,7 +145,9 @@ def context(tmp_path_factory):
 
 
 def test_run_error_maps_are_nonnegative_deterministic_and_batch_invariant(context):
-    config = ErrorMapConfig(num_windows=8, batch_size=4, pc_infer_steps=5)
+    config = ErrorMapConfig(
+        num_windows=8, batch_size=4, pc_infer_steps=5, pc_eta_infer=0.01
+    )
     result = compute_error_maps(context, config)
     assert set(result["settings"]) == {SPIKE_ONLY, STANDARD_PC}
     assert result["settings"][SPIKE_ONLY]["infer_steps"] == 9
@@ -198,7 +204,11 @@ def test_run_error_maps_are_nonnegative_deterministic_and_batch_invariant(contex
 
 def test_standard_pc_trace_matches_the_untraced_inference(context):
     config = ErrorMapConfig(
-        num_windows=4, batch_size=4, pc_infer_steps=4, settings=(STANDARD_PC,)
+        num_windows=4,
+        batch_size=4,
+        pc_infer_steps=4,
+        pc_eta_infer=0.01,
+        settings=(STANDARD_PC,),
     )
     structure = build_map_structure(context, STANDARD_PC, config)
     batch = window_batches(context.valid_sets["news"], 4, 4)[0]

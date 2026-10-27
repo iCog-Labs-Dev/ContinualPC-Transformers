@@ -42,7 +42,10 @@ from fabricpc.training.train_backprop import (
     _loss_and_grad_backprop_mlm_no_update,
     compute_forward_pass,
 )
-from fabricpc.training.train_mlm import get_graph_param_gradient_pcn_mlm
+from fabricpc.training.train_mlm import (
+    get_graph_param_gradient_pcn_mlm,
+    mean_pc_gradients,
+)
 from tests.test_bert_pc_mlm import (
     _cosines,
     _max_free_depth,
@@ -272,9 +275,10 @@ def test_spiking_zil_matches_backprop_on_bert_graph_with_dropout():
         key = jax.random.PRNGKey(0)
         params = initialize_params(structure, key)
         batch = _two_sample_batch()
-        pc_grads, *_ = get_graph_param_gradient_pcn_mlm(
+        pc_grads, pc_grads_metrics, *_ = get_graph_param_gradient_pcn_mlm(
             params, batch, structure, key, forward_updates="initial"
         )
+        pc_grads = mean_pc_gradients(pc_grads, pc_grads_metrics["num_masked_tokens"])
         _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
             params, batch, structure, key
         )
@@ -466,6 +470,8 @@ def _bert_pretrain_argv(tmp_path, token_path, tokenizer_path, *extra):
         "2",
         "--max_steps",
         "1",
+        "--pc_eta_infer",
+        "0.01",
         "--validation_interval",
         "0",
         "--log_interval",

@@ -49,6 +49,7 @@ from fabricpc.training.train_mlm import (
     create_jit_gradient_step_pcn_mlm,
     create_jit_train_step_pcn_mlm_incremental,
     get_graph_param_gradient_pcn_mlm,
+    mean_pc_gradients,
     create_pc_bp_gradient_comparison,
     pc_node_gradient_norms,
     train_mlm,
@@ -712,10 +713,13 @@ def test_incremental_single_step_matches_manual_update(rng_key):
     new_params, new_opt_state, metrics = train_step_pcn_mlm_incremental(
         params, opt_state, batch, structure, optimizer, rng_key
     )
-    _grads, _metrics, initial_state, _free, _final = get_graph_param_gradient_pcn_mlm(
+    _grads, metrics0, initial_state, _free, _final = get_graph_param_gradient_pcn_mlm(
         params, batch, structure, rng_key
     )
-    expected_grads = compute_local_weight_gradients(params, initial_state, structure)
+    expected_grads = mean_pc_gradients(
+        compute_local_weight_gradients(params, initial_state, structure),
+        metrics0["num_masked_tokens"],
+    )
     updates, expected_opt_state = optimizer.update(expected_grads, opt_state, params)
     expected_params = optax.apply_updates(params, updates)
 
@@ -744,13 +748,16 @@ def test_incremental_three_steps_match_manual_unroll(rng_key):
         params, opt_state, batch, structure, optimizer, rng_key
     )
 
-    _shared, _free_metrics, _free, state, clamps = _prepare_pcn_mlm_batch(
+    _shared, free_metrics, _free, state, clamps = _prepare_pcn_mlm_batch(
         params, batch, structure, rng_key
     )
     inference = structure.config["inference"]
     expected_params, expected_opt_state = params, opt_state
     for _ in range(3):
-        grads = compute_local_weight_gradients(expected_params, state, structure)
+        grads = mean_pc_gradients(
+            compute_local_weight_gradients(expected_params, state, structure),
+            free_metrics["num_masked_tokens"],
+        )
         state = type(inference).inference_step(
             expected_params, state, clamps, structure, dict(inference.config)
         )
@@ -1028,9 +1035,10 @@ def _zil_encoder_errors(depth_mode: str, transformer_init_std: float = 0.02):
     key = jax.random.PRNGKey(0)
     params = initialize_params(structure, key)
     batch = _two_sample_batch()
-    pc_grads, *_ = get_graph_param_gradient_pcn_mlm(
+    pc_grads, pc_grads_metrics, *_ = get_graph_param_gradient_pcn_mlm(
         params, batch, structure, key, forward_updates="initial"
     )
+    pc_grads = mean_pc_gradients(pc_grads, pc_grads_metrics["num_masked_tokens"])
     _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
         params, batch, structure, key
     )
@@ -1185,9 +1193,10 @@ def _zil_encoder_errors_with_dropout(dropout_rate: float):
     key = jax.random.PRNGKey(0)
     params = initialize_params(structure, key)
     batch = _two_sample_batch()
-    pc_grads, *_ = get_graph_param_gradient_pcn_mlm(
+    pc_grads, pc_grads_metrics, *_ = get_graph_param_gradient_pcn_mlm(
         params, batch, structure, key, forward_updates="initial"
     )
+    pc_grads = mean_pc_gradients(pc_grads, pc_grads_metrics["num_masked_tokens"])
     _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
         params, batch, structure, key
     )
@@ -1372,9 +1381,10 @@ def test_pc_bp_probe_uses_forward_update_rule(rng_key):
     result = create_pc_bp_gradient_comparison(structure, "final")(
         params, batch, rng_key
     )
-    pc_grads, *_ = get_graph_param_gradient_pcn_mlm(
+    pc_grads, pc_grads_metrics, *_ = get_graph_param_gradient_pcn_mlm(
         params, batch, structure, rng_key, forward_updates="final"
     )
+    pc_grads = mean_pc_gradients(pc_grads, pc_grads_metrics["num_masked_tokens"])
 
     for name, row in result.items():
         expected = optax.tree.norm(jax.tree_util.tree_leaves(pc_grads.nodes[name]))
@@ -1435,7 +1445,7 @@ def test_spiking_runs_under_x64(rng_key):
 
 
 def _manual_spiking_ipc(params, opt_state, batch, structure, optimizer, rng_key, scale):
-    _shared, _metrics, _free, state, clamps = _prepare_pcn_mlm_batch(
+    _shared, free_metrics, _free, state, clamps = _prepare_pcn_mlm_batch(
         params, batch, structure, rng_key
     )
     config = dict(structure.config["inference"].config)
@@ -1449,7 +1459,10 @@ def _manual_spiking_ipc(params, opt_state, batch, structure, optimizer, rng_key,
     }
     prev_energy = jnp.full((batch["x"].shape[0],), jnp.inf)
     for t in range(config["infer_steps"]):
-        grads = compute_local_weight_gradients(params, state, structure)
+        grads = mean_pc_gradients(
+            compute_local_weight_gradients(params, state, structure),
+            free_metrics["num_masked_tokens"],
+        )
         for name in single_path:
             if spike_steps[name] == t:
                 assert float(optax.tree.norm(grads.nodes[name])) == 0.0, name
@@ -1593,10 +1606,13 @@ def test_incremental_spiking_first_iteration_is_unscaled(rng_key):
     new_params, _opt_state, _metrics = train_step_pcn_mlm_incremental(
         params, opt_state, batch, structure, optimizer, rng_key
     )
-    _shared, _free_metrics, _free, state, _clamps = _prepare_pcn_mlm_batch(
+    _shared, free_metrics, _free, state, _clamps = _prepare_pcn_mlm_batch(
         params, batch, structure, rng_key
     )
-    grads = compute_local_weight_gradients(params, state, structure)
+    grads = mean_pc_gradients(
+        compute_local_weight_gradients(params, state, structure),
+        free_metrics["num_masked_tokens"],
+    )
     updates, _ = optimizer.update(grads, opt_state, params)
     expected = optax.apply_updates(params, updates)
 
@@ -1665,9 +1681,10 @@ def test_train_step_pcn_mlm_threads_forward_updates(rng_key):
     new_params, *_ = train_step_pcn_mlm(
         params, opt_state, batch, structure, optimizer, rng_key, "final"
     )
-    grads, *_ = get_graph_param_gradient_pcn_mlm(
+    grads, grads_metrics, *_ = get_graph_param_gradient_pcn_mlm(
         params, batch, structure, rng_key, forward_updates="final"
     )
+    grads = mean_pc_gradients(grads, grads_metrics["num_masked_tokens"])
     updates, _ = optimizer.update(grads, opt_state, params)
 
     assert tree_allclose(optax.apply_updates(params, updates), new_params)
