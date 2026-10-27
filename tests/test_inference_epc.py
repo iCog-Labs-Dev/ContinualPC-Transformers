@@ -332,7 +332,7 @@ class TestBackpropRegime:
                 if not pc_leaves:
                     continue
                 bp_leaves = jax.tree_util.tree_leaves(bp_grads.nodes[name])
-                scale = 1.0 if name == "mlm_head" else eta
+                scale = (1.0 if name == "mlm_head" else eta) * float(pc_count)
                 got = ravel_pytree(pc_leaves)[0] / scale
                 ref = ravel_pytree(bp_leaves)[0]
                 assert rel(got, ref) < 1e-3, (name, rel(got, ref))
@@ -440,8 +440,8 @@ class TestEpsilonSpectrum:
 
     def test_tiny_bert_regime_predicts_relaxation(self):
         """The measured spectrum predicts the one-step energy change to
-        second order, and ``regime``'s stability verdict matches whether
-        many ε steps lower or raise the energy."""
+        second order, and ``regime``'s stability verdict matches whether a
+        few ε steps descend monotonically or raise the energy."""
         with jax.enable_x64(True):
             structure = tiny_bert(EPCInference(), dropout_rate=0.0)
             params, clamps, state = bert_inputs(structure)
@@ -454,19 +454,114 @@ class TestEpsilonSpectrum:
             def run(eta, steps):
                 inference = EPCInference(eta_infer=eta, infer_steps=steps)
                 s = with_inference(structure, inference)
-                final = run_inference(params, state, clamps, s)
-                return inference.regime(spectrum), total_energy(final)
+                final, stats = EPCInference.run_inference_with_stats(
+                    params, state, clamps, s
+                )
+                np.testing.assert_allclose(
+                    jnp.sum(stats["energy_end"]), total_energy(final), rtol=1e-12
+                )
+                np.testing.assert_allclose(
+                    jnp.sum(stats["energy_start"]), start, rtol=1e-12
+                )
+                regime = inference.regime(spectrum)
+                return regime, total_energy(final), int(stats["energy_rises"])
 
             eta = 0.05 / lam
-            regime, end = run(eta, 1)
+            regime, end, _ = run(eta, 1)
             predicted = -eta * g2 + 0.5 * eta**2 * g2 * curvature
             assert regime.band == "backprop-like"
             assert end - start == pytest.approx(predicted, rel=1e-3)
 
-            stable, stable_end = run(1.0 / lam, 40)
-            assert not stable.unstable and stable_end < start
-            unstable, unstable_end = run(2.5 / lam, 40)
-            assert unstable.unstable and unstable_end > start
+            stable, stable_end, stable_rises = run(0.5 / lam, 8)
+            assert not stable.unstable and stable_rises == 0
+            assert stable_end < start
+            unstable, _, unstable_rises = run(2.5 / lam, 8)
+            assert unstable.unstable and unstable_rises > 0
+
+
+class TestRegimeDiscriminates:
+    def test_stats_count_per_sample_and_total_rises(self):
+        """``energy_rises`` sums per-sample rises over samples and steps;
+        ``energy_total_rises`` counts steps whose batch total rose."""
+        eta, steps = 1.2, 12
+        with jax.enable_x64(True):
+            structure = with_inference(
+                linear_chain(), EPCInference(eta_infer=eta, infer_steps=steps)
+            )
+            params, clamps, state = mlp_inputs(structure, "gaussian", batch=3)
+            final, stats = EPCInference.run_inference_with_stats(
+                params, state, clamps, structure
+            )
+            config = dict(structure.config["inference"].config)
+            current = EPCInference.begin_segment(params, state, clamps, structure)
+            energies = [EPCInference.sample_energies(current, structure)]
+            for _ in range(steps):
+                current = EPCInference.inference_step(
+                    params, current, clamps, structure, config
+                )
+                derived = EPCInference.derive_states(params, current, clamps, structure)
+                energies.append(EPCInference.sample_energies(derived, structure))
+        energies = np.asarray(energies)
+        per_sample = int((np.diff(energies, axis=0) > 0).sum())
+        total = int((np.diff(energies.sum(axis=1)) > 0).sum())
+        assert per_sample > total > 0
+        assert int(stats["energy_rises"]) == per_sample
+        assert int(stats["energy_total_rises"]) == total
+        np.testing.assert_allclose(stats["energy_end"], energies[-1], rtol=1e-12)
+
+    def test_verdict_predicts_monotone_descent_on_a_quadratic(self):
+        """On a linear graph the ε-energy is exactly quadratic: below
+        2/λ_max the batch-total energy falls at every step, above it rises."""
+        with jax.enable_x64(True):
+            structure = linear_chain()
+            params, clamps, state = mlp_inputs(structure, "gaussian", batch=2)
+            spectrum = epsilon_spectrum(params, state, clamps, structure, iters=12)
+            assert spectrum.lambda_min > 0
+            lam = spectrum.lambda_max
+            outcome = {}
+            for factor in (1.9, 2.1):
+                inference = EPCInference(eta_infer=factor / lam, infer_steps=40)
+                _, stats = EPCInference.run_inference_with_stats(
+                    params, state, clamps, with_inference(structure, inference)
+                )
+                outcome[factor] = (
+                    inference.regime(spectrum).unstable,
+                    int(stats["energy_total_rises"]),
+                )
+        assert outcome[1.9] == (False, 0)
+        assert outcome[2.1][0] and outcome[2.1][1] > 0
+
+    def test_tiny_bert_curvature_grows_along_the_relaxation(self):
+        """The verdict is local to ε = 0: on tiny BERT (indefinite at ε = 0)
+        λ_max grows along the relaxation past 2/eta, so eta = 1/λ_max(0),
+        judged stable there, raises the total energy."""
+        from fabricpc.experiments.domain_forgetting.runner import (
+            make_regime_probe,
+            regime_summary,
+        )
+
+        with jax.enable_x64(True):
+            structure = tiny_bert(EPCInference(), dropout_rate=0.0)
+            params = initialize_params(structure, jax.random.PRNGKey(3))
+            batch, key = bert_batch(), jax.random.PRNGKey(0)
+            at_zero, _ = make_regime_probe(structure, 30)(params, batch, key)
+            eta = 1.0 / float(at_zero.lambda_max)
+            _, at_final = make_regime_probe(structure, 30, (eta, 40))(
+                params, batch, key
+            )
+            summary = regime_summary(at_zero, eta, 40, at_final)
+            _clamps_params, clamps, state = bert_inputs(structure)
+            _, stats = EPCInference.run_inference_with_stats(
+                params,
+                state,
+                clamps,
+                with_inference(structure, EPCInference(eta_infer=eta, infer_steps=40)),
+            )
+        assert summary["lambda_min"] < 0
+        assert summary["lambda_max_final"] > 2 * summary["lambda_max"]
+        assert not summary["unstable"] and summary["unstable_final"]
+        assert summary["eta_lambda_max_final"] > 2.0
+        assert int(stats["energy_total_rises"]) > 0
 
 
 class TestRegime:
@@ -715,8 +810,8 @@ class TestTinyBertEquilibrium:
         with jax.enable_x64(True):
             finals = {}
             for key, inference in (
-                ("spc", InferenceSGD(eta_infer=0.2, infer_steps=5000)),
-                ("epc", EPCInference(eta_infer=0.5, infer_steps=300)),
+                ("spc", InferenceSGD(eta_infer=0.05, infer_steps=20000)),
+                ("epc", EPCInference(eta_infer=0.1, infer_steps=1000)),
             ):
                 structure = tiny_bert(inference, dropout_rate=0.0)
                 params, clamps, state = bert_inputs(structure)
