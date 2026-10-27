@@ -322,7 +322,13 @@ def _input_by_slot(inputs: Dict[str, jnp.ndarray], slot_name: str) -> jnp.ndarra
 
 
 class MaskedVocabProjectionNode(NodeBase):
-    """Vocabulary projection whose PC output energy is masked by MLM positions."""
+    """Vocabulary projection whose PC output energy is masked by MLM positions.
+
+    The per-sample energy is ``output_energy_scale * Σ_masked CE``: a fixed
+    per-token precision, independent of the batch size and of how many
+    tokens the batch masks. PC weight gradients are therefore sums over the
+    masked tokens; callers divide by the masked-token count of the update.
+    """
 
     DEFAULT_ENERGY = CrossEntropyEnergy
     DEFAULT_ACTIVATION = SoftmaxActivation
@@ -402,11 +408,10 @@ class MaskedVocabProjectionNode(NodeBase):
         target = state.z_latent
         per_token_ce = -jnp.sum(target * log_probs, axis=-1)
         masked_ce = per_token_ce * mask
-        masked_count = jnp.maximum(jnp.sum(mask), 1.0)
         output_energy_scale = float(
             node_info.node_config.get("output_energy_scale", 1.0)
         )
-        energy = output_energy_scale * jnp.sum(masked_ce, axis=-1) / masked_count
+        energy = output_energy_scale * jnp.sum(masked_ce, axis=-1)
         error = (target - probs) * mask[..., None]
         state = state._replace(
             pre_activation=logits,

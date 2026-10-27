@@ -347,6 +347,14 @@ def get_graph_param_gradient_pcn_mlm(
     ``compute_local_weight_gradients`` on the final state, ``"initial"`` and
     ``"final"`` use ``compute_local_weight_gradients_forward_update`` in that
     mode.
+
+    The MLM head energy is ``s · Σ_masked CE``, so the returned gradients
+    are summed over the batch's masked tokens, and the energy metrics
+    (``pc_output_energy``, ``pc_total_energy``) are per-sample sums in units
+    about ``N`` (masked tokens per batch) times those of the earlier
+    mean-CE head; ``mean_pc_gradients`` divides
+    them by ``metrics["num_masked_tokens"]``. An update over several batches
+    sums them and divides once by the total count.
     """
     _validate_forward_updates(forward_updates)
     _validate_feedforward_start(structure, forward_updates)
@@ -361,7 +369,13 @@ def get_graph_param_gradient_pcn_mlm(
             params, initial_state, clamps, structure
         )
         energy_rises = inference_stats["energy_rises"]
+        extra_stats = (
+            {"pc_energy_total_rises": inference_stats["energy_total_rises"]}
+            if "energy_total_rises" in inference_stats
+            else {}
+        )
     else:
+        extra_stats = {}
         final_state = run_inference(params, initial_state, clamps, structure)
         energy_rises = jnp.array(0, dtype=jnp.int32)
     if forward_updates == "none":
@@ -377,8 +391,15 @@ def get_graph_param_gradient_pcn_mlm(
         "pc_output_energy": output_energy,
         "pc_total_energy": total_energy,
         "pc_energy_rises": energy_rises,
+        **extra_stats,
     }
     return grads, metrics, initial_state, free_state, final_state
+
+
+def mean_pc_gradients(grads: GraphParams, masked_count: jax.Array) -> GraphParams:
+    """Divide token-summed PC gradients by ``max(masked_count, 1)``."""
+    denominator = jnp.maximum(masked_count, 1.0)
+    return jax.tree_util.tree_map(lambda g: g / denominator.astype(g.dtype), grads)
 
 
 def get_graph_param_gradient_pcn_mlm_accumulation(
@@ -388,7 +409,11 @@ def get_graph_param_gradient_pcn_mlm_accumulation(
     rng_key: jax.Array,
     forward_updates: str = "none",
 ) -> tuple[GraphParams, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Compute lean PC MLM grads, loss totals, energy rises and total energy."""
+    """Compute lean PC MLM grads, loss totals, energy rises and total energy.
+
+    The grads are summed over the batch's masked tokens (see
+    ``get_graph_param_gradient_pcn_mlm``).
+    """
     grads, metrics, _initial_state, _free_state, _final_state = (
         get_graph_param_gradient_pcn_mlm(
             params,
@@ -422,9 +447,10 @@ def pc_node_gradient_norms(
     about one node per step, so with too few inference steps the earliest
     nodes, embeddings included, get an exactly zero gradient.
     """
-    grads, _metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
+    grads, metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
         params, batch, structure, rng_key, forward_updates
     )
+    grads = mean_pc_gradients(grads, metrics["num_masked_tokens"])
     norms = {}
     for name, node_grads in grads.nodes.items():
         leaves = jax.tree_util.tree_leaves(node_grads)
@@ -440,18 +466,20 @@ def create_pc_bp_gradient_comparison(
 
     The returned function maps ``(params, batch, rng_key)`` to
     ``{node: {"pc_norm", "bp_norm", "cosine"}}`` for every parameterised node,
-    comparing PC local gradients with backprop gradients of the masked loss on
-    the same batch. Norm ratios carry a global loss-scale constant; compare
-    them against the ``mlm_head`` ratio rather than against one. PC gradients
-    use the training rule selected by ``forward_updates``.
+    comparing PC local gradients (divided by the masked-token count) with
+    backprop gradients of the mean masked loss on the same batch. Norm ratios
+    carry a global loss-scale constant; compare them against the ``mlm_head``
+    ratio rather than against one. PC gradients use the training rule
+    selected by ``forward_updates``.
     """
     _validate_forward_updates(forward_updates)
     _validate_feedforward_start(structure, forward_updates)
 
     def compare(params, batch, rng_key):
-        pc_grads, _metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
+        pc_grads, metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
             params, batch, structure, rng_key, forward_updates
         )
+        pc_grads = mean_pc_gradients(pc_grads, metrics["num_masked_tokens"])
         _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
             params, batch, structure, rng_key
         )
@@ -507,7 +535,7 @@ def train_step_pcn_mlm(
     params, opt_state = _apply_optimizer_update_when_masked(
         params=params,
         opt_state=opt_state,
-        grads=grads,
+        grads=mean_pc_gradients(grads, metrics["num_masked_tokens"]),
         optimizer=optimizer,
         masked_count=metrics["num_masked_tokens"],
     )
@@ -593,7 +621,9 @@ def _train_step_pcn_mlm_incremental_with_state(
 
     def body_fn(t, carry):
         params, opt_state, state, eta, prev_energy, rises, grad_norm_sum = carry
-        grads = compute_local_weight_gradients(params, state, structure)
+        grads = mean_pc_gradients(
+            compute_local_weight_gradients(params, state, structure), masked_count
+        )
         grad_norm_sum = grad_norm_sum + optax.tree.norm(grads).astype(float_dtype)
         if guarded:
             state, eta, prev_energy, step_rises = inference_cls.guarded_step(
@@ -737,7 +767,8 @@ def train_pcn_mlm(
     inference iteration; gradient accumulation is then rejected.
     ``config["pc_forward_updates"]`` ("none", "initial" or "final") selects
     the weight-gradient rule of standard PC and is rejected with incremental
-    PC.
+    PC. An update sums the token-summed micro-batch gradients and divides
+    once by their total masked-token count.
     """
     if config.get("use_pmap"):
         raise ValueError("pmap PC MLM training is not implemented yet")
@@ -798,7 +829,7 @@ def train_pcn_mlm(
         {
             **config,
             "mode": "pc",
-            "objective": "pc_mlm_masked_ce_v1",
+            "objective": "pc_mlm_sum_masked_ce_v2",
             "config_training_identity": _config_training_identity(config),
             "pc_training_identity": _pc_training_identity(
                 structure, train_loader, pc_incremental
@@ -904,17 +935,13 @@ def train_pcn_mlm(
                 grads, loss_numerator, masked_count, energy_rises, energy = grad_fn(
                     params, batch, step_key
                 )
-                scaled_grads = jax.tree_util.tree_map(
-                    lambda grad: grad / gradient_accumulation_steps,
-                    grads,
-                )
                 pending_grads = (
-                    scaled_grads
+                    grads
                     if pending_grads is None
                     else jax.tree_util.tree_map(
                         lambda left, right: left + right,
                         pending_grads,
-                        scaled_grads,
+                        grads,
                     )
                 )
                 pending_loss_numerator = pending_loss_numerator + loss_numerator
@@ -928,6 +955,7 @@ def train_pcn_mlm(
                 if pending_micro_batches < gradient_accumulation_steps:
                     continue
 
+                pending_grads = mean_pc_gradients(pending_grads, pending_masked_count)
                 params, opt_state = update_fn(
                     params,
                     opt_state,
