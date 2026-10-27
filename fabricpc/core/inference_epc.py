@@ -196,6 +196,16 @@ class EPCInference(InferenceBase):
         excited spectrum (``epsilon_spectrum`` on any graph, or
         ``EpsilonSpectrum.from_modes`` on known eigenvalues). λ_max grows with
         the weights during training, so a verdict at init describes init.
+
+        The verdict is a local statement: it reads the quadratic model of the
+        energy at the spectrum's point (ε = 0, the feedforward state, for
+        ``epsilon_spectrum`` on an initialized state). It is exact on a
+        linear graph. On a nonlinear graph the curvature changes as ε
+        relaxes: negative modes of an indefinite spectrum (λ_min < 0) are
+        modelled only through their growth factor, and λ_max can grow along
+        the path (on a tiny BERT MLM graph from 3.4 at ε = 0 to 5-10 after a
+        few steps), so a setting judged stable can still raise the energy.
+        ``epsilon_spectrum`` on the relaxed state re-measures it there.
         """
         eta = float(self.config["eta_infer"])
         steps = int(self.config["infer_steps"])
@@ -456,6 +466,69 @@ class EPCInference(InferenceBase):
         """
         return cls.derive_states(params, state, clamps, structure)
 
+    @staticmethod
+    def sample_energies(state: GraphState, structure: GraphStructure) -> jnp.ndarray:
+        """Per-sample total energy over every node with inputs, shape (batch,)."""
+        total = jnp.zeros((state.batch_size,), dtype=jnp.result_type(float))
+        for name, node in structure.nodes.items():
+            if node.node_info.in_degree == 0:
+                continue
+            energy = state.nodes[name].energy
+            total = total + energy.reshape(state.batch_size, -1).sum(axis=1)
+        return total
+
+    @classmethod
+    def run_inference_with_stats(
+        cls,
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> Tuple[GraphState, Dict[str, jnp.ndarray]]:
+        """``run_inference`` plus energy statistics.
+
+        The per-sample energies E_0..E_T are those of the derived states at
+        each step's errors (E_0 at the incoming latents) and of the final
+        rebuild. ``energy_rises`` (int32) is Σ_t Σ_b [E_t,b > E_{t-1},b],
+        the per-sample increases summed over samples and steps (strict, so a
+        converged run can count rounding-level rises);
+        ``energy_total_rises`` (int32) counts the steps whose batch-total
+        energy Σ_b E_t,b, the quantity the ε gradient descends, rose.
+        ``energy_start`` and ``energy_end`` are E_0 and E_T.
+        """
+        config = structure.config["inference"].config
+        state = cls.begin_segment(params, initial_state, clamps, structure)
+        start = cls.sample_energies(state, structure)
+
+        def count(energy, prev, rises, total_rises):
+            rises = rises + jnp.sum(energy > prev, dtype=jnp.int32)
+            rose = jnp.sum(energy) > jnp.sum(prev)
+            return rises, total_rises + rose.astype(jnp.int32)
+
+        def body_fn(t, carry):
+            state, prev, rises, total_rises = carry
+            state = cls.zero_grads(params, state, clamps, structure)
+            state = cls.forward_value_and_grad(params, state, clamps, structure)
+            energy = cls.sample_energies(state, structure)
+            rises, total_rises = count(energy, prev, rises, total_rises)
+            state = cls.update_latents(params, state, clamps, structure, config)
+            return state, energy, rises, total_rises
+
+        zero = jnp.array(0, jnp.int32)
+        carry = (state, jnp.full_like(start, jnp.inf), zero, zero)
+        state, prev, rises, total_rises = jax.lax.fori_loop(
+            0, config["infer_steps"], body_fn, carry
+        )
+        final = cls.finalize_state(params, state, clamps, structure)
+        end = cls.sample_energies(final, structure)
+        rises, total_rises = count(end, prev, rises, total_rises)
+        return final, {
+            "energy_rises": rises,
+            "energy_total_rises": total_rises,
+            "energy_start": start,
+            "energy_end": end,
+        }
+
     @classmethod
     def run_inference(
         cls,
@@ -467,11 +540,7 @@ class EPCInference(InferenceBase):
         """``begin_segment``, ``infer_steps`` ε steps under ``lax.fori_loop``,
         then ``finalize_state``. The config is read from
         ``structure.config["inference"]``."""
-        config = structure.config["inference"].config
-        state = cls.begin_segment(params, initial_state, clamps, structure)
-
-        def body_fn(t, state):
-            return cls.inference_step(params, state, clamps, structure, config)
-
-        state = jax.lax.fori_loop(0, config["infer_steps"], body_fn, state)
-        return cls.finalize_state(params, state, clamps, structure)
+        final, _ = cls.run_inference_with_stats(
+            params, initial_state, clamps, structure
+        )
+        return final

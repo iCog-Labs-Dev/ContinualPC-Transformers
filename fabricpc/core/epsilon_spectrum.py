@@ -60,12 +60,12 @@ over the Ritz values, which is all the regime reads.
 
 Scope. The Hessian is evaluated at the state's latents on one batch.
 When every node's energy is a per-sample term, H_ε is block-diagonal over
-samples and a batch's λ_max is the per-sample maximum. An energy normalized
-by a batch statistic breaks that: ``MaskedVocabProjectionNode`` divides its
-cross-entropy by the batch's masked-token count N, so the head's curvature
-contribution scales with output_energy_scale / N and λ_max depends on the
-batch composition and size (the same batch tiled 4x gives a smaller
-λ_max). Measure on batches shaped like the training batches. On a nonlinear graph
+samples and a batch's λ_max is the per-sample maximum, independent of the
+batch size. The MLM head (``MaskedVocabProjectionNode``) has the per-token
+energy ``output_energy_scale · Σ_masked CE``, so this holds for the BERT MLM
+graphs: the same windows tiled into a larger batch give the same spectrum.
+An energy normalized by a batch statistic (e.g. a division by the batch's
+masked-token count) would break it. On a nonlinear graph
 the quadratic model is local, and every statement above holds at ε = 0.
 The graph must be acyclic: ``EPCInference`` derives the latents along
 ``structure.node_order``.
