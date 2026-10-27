@@ -11,25 +11,35 @@ every position (only masked positions carry energy). For each hidden node
   feedforward prediction that the forward-update weight rule uses.
 
 Under spike-only inference (``eta_infer`` 0, one unit step per node at its
-longest depth, T = the longest free depth) ``z_m(T) − μ_m(0) = −s ∂L/∂z_m``
-exactly, with ``L`` the batch's mean masked CE and ``s`` the output-energy
-scale, so ``forward_error_energy`` is BP's backward signal ``½ s²‖∂L/∂z_m‖²``
-and is the spike-only map. ``final_energy`` differs from it at nodes whose
-inputs spiked after they did. Under standard PC the map is ``final_energy``.
+longest depth, T = the longest free depth) ``z_m(T) − μ_m(0) = −s ∂C/∂z_m``
+exactly, with ``C`` the batch's summed masked CE and ``s`` the output-energy
+scale, so the raw ``forward_error_energy`` is BP's backward signal
+``½ s²‖∂C/∂z_m‖²``. ``final_energy`` differs from it at nodes whose inputs
+spiked after they did. Under standard PC the map is ``final_energy``.
+
+**Convention.** ``error_maps.json`` records ``head_energy`` =
+``"sum_masked_ce"``. Files without it predate this head energy, which was
+``s · Σ_masked CE_b / N``. The spike-only ``energy``, ``energy_sum_ce`` and
+``forward_error_energy`` (and ``*_sum_ce``) values are the same numbers
+under both conventions; the spike-only ``final_energy`` and
+``output_ce_energy``, every ``standard_pc`` field, and ``energy_trace``
+(raw, about ``N`` times larger) are not comparable across them.
 
 **Normalisation.** The MLM head energy of window ``b`` is
-``s · Σ_masked CE_b / N``, with ``N`` the masked-token count of the whole
-batch, so hidden-node energies scale as ``(s / N)²`` and depend on the batch
-composition. Each energy is also reported multiplied by ``(N / s)²``
-(``*_sum_ce``): in the spike-only setting this is ``½‖∂(Σ_masked CE_b)/∂z_m‖²``,
-which does not depend on the other windows of the batch. The head module's
-value is ``½ s²‖(t − p) ⊙ mask‖² / N²``, BP's signal ``½‖s ∂L/∂logits‖²``
-at its logits; the head's own CE energy is reported as ``output_ce_energy``.
+``s · Σ_masked CE_b`` (a fixed per-token precision). Maps report each raw
+energy divided by ``N²``, with ``N`` the masked-token count of the whole
+batch, which in the spike-only setting is ``½ s²‖∂L/∂z_m‖²`` for ``L`` the
+batch's mean masked CE, and divided by ``s²`` (``*_sum_ce``), which in the
+spike-only setting is ``½‖∂(Σ_masked CE_b)/∂z_m‖²`` and does not depend on
+the other windows of the batch. The head module's value is
+``½ s²‖(t − p) ⊙ mask‖² / N²``, BP's signal ``½‖s ∂L/∂logits‖²`` at its
+logits; the head's own CE energy divided by ``N`` is reported as
+``output_ce_energy``.
 Maps are means over windows with at least one masked token. Each module
 also gets ``energy_sum_ce_per_dim``, ``energy_sum_ce`` over the node's
 output width (e.g. 1,024 for ``mlp1`` and 256 for ``mlp2`` in BERT-Mini).
 
-Under standard PC every map records ``energy_trace``: the total energy
+Under standard PC every map records ``energy_trace``: the raw total energy
 (summed over nodes with inputs, mean over the map's windows) at each
 inference step ``0..T``, the convergence check of the iterative solve.
 """
@@ -60,6 +70,7 @@ from fabricpc.experiments.domain_forgetting.localization import (
     stage_name,
 )
 from fabricpc.experiments.domain_forgetting.runner import (
+    HEAD_ENERGY,
     build_structure,
     max_free_depth,
 )
@@ -77,14 +88,16 @@ ENERGY_FIELDS = ("final_energy", "forward_error_energy")
 class ErrorMapConfig:
     """Error-map settings.
 
-    The standard-PC defaults (120 steps at rate 0.1) were tuned for the µPC
-    encoder; G2 calibrates them on the post-LN, no-µPC BERT graph.
+    ``pc_eta_infer`` has no default and is required with the ``standard_pc``
+    setting: under the head energy ``s · Σ_masked CE`` the latent gradients
+    grow with the masked tokens per batch, so the rate must be calibrated
+    for ``batch_size`` (e.g. with the runner's ``probe``).
     """
 
     num_windows: int = 256
     batch_size: int = 8
     pc_infer_steps: int = 120
-    pc_eta_infer: float = 0.1
+    pc_eta_infer: float | None = None
     pc_max_norm: float = 5.0
     output_energy_scale: float = 1.0
     settings: tuple[str, ...] = SETTINGS
@@ -92,8 +105,15 @@ class ErrorMapConfig:
     def validate(self) -> None:
         if self.num_windows < 1 or self.batch_size < 1:
             raise ValueError("num_windows and batch_size must be positive")
-        if self.pc_infer_steps < 1 or self.pc_eta_infer < 0:
-            raise ValueError("pc_infer_steps must be positive, pc_eta_infer >= 0")
+        if self.pc_infer_steps < 1:
+            raise ValueError("pc_infer_steps must be positive")
+        if STANDARD_PC in self.settings and not (
+            self.pc_eta_infer is not None and self.pc_eta_infer > 0
+        ):
+            raise ValueError(
+                "the standard_pc setting needs an explicit pc_eta_infer > 0, "
+                "calibrated for the map batch size"
+            )
         if self.output_energy_scale <= 0:
             raise ValueError("output_energy_scale must be positive")
         unknown = set(self.settings) - set(SETTINGS)
@@ -222,14 +242,16 @@ def node_energies(
 ) -> dict[str, Any]:
     """Run target-clamped PC inference on one batch; return per-sample energies.
 
-    Returns ``{"final_energy": {node: (B,)}, "forward_error_energy": {node:
-    (B,)}, "head_energy": {field: (B,)}, "output_ce_energy": (B,),
+    Returns raw energies under the head energy ``s · Σ_masked CE``:
+    ``{"final_energy": {node: (B,)}, "forward_error_energy": {node: (B,)},
+    "head_energy": {field: (B,)}, "output_ce_energy": (B,),
     "masked_tokens": (B,), "batch_masked_tokens": ()}``. ``head_energy`` is
-    the head's ``½ s²‖(t − p) ⊙ mask‖² / N²`` at the final state
+    the head's ``½ s²‖(t − p) ⊙ mask‖²`` at the final state
     (``final_energy``) and at the feedforward state
     (``forward_error_energy``). With ``trace`` (base-class inference loops
     only, e.g. standard PC) it also returns ``energy_trace`` ``(T + 1,)``,
-    the batch-summed total energy entering each step and after the last.
+    the batch-summed raw total energy entering each step and after the last.
+    ``aggregate_map`` applies the map normalisation.
     """
     _inputs, clamps = _clamps(structure, batch)
     batch_size = batch["x"].shape[0]
@@ -252,13 +274,12 @@ def node_energies(
     )
     nodes = hidden_nodes(structure)
     mask = batch["loss_mask"].astype(jnp.result_type(float))
-    count = jnp.maximum(jnp.sum(mask), 1.0)
     scale = float(
         structure.nodes[output].node_info.node_config.get("output_energy_scale", 1.0)
     )
 
     def head(error: jax.Array) -> jax.Array:
-        return scale**2 * _half_square(error) / count**2
+        return scale**2 * _half_square(error)
 
     extra = {}
     if trace:
@@ -414,9 +435,10 @@ def aggregate_map(
     """Average per-sample energies over windows with a masked token.
 
     ``batches`` are ``node_energies`` outputs. Modules get
-    ``final_energy``, ``forward_error_energy`` and their ``*_sum_ce``
-    variants (times ``(N / s)²``); the head module gets its logit signal in
-    both fields. Other hidden nodes (``L{i}_residual``) are reported under
+    ``final_energy`` and ``forward_error_energy`` (raw energy / ``N²``) and
+    their ``*_sum_ce`` variants (raw energy / ``s²``); the head module gets
+    its logit signal in both fields and ``output_ce_energy`` is the raw head
+    energy / ``N``. Other hidden nodes (``L{i}_residual``) are reported under
     ``residuals``.
     """
     per_node: dict[str, dict[str, list[np.ndarray]]] = {}
@@ -424,9 +446,11 @@ def aggregate_map(
     windows = 0
     for result in batches:
         valid = np.asarray(result["masked_tokens"]) > 0
-        factor = (float(result["batch_masked_tokens"]) / scale) ** 2
+        count = max(float(result["batch_masked_tokens"]), 1.0)
         windows += int(valid.sum())
-        output_ce.append(np.asarray(result["output_ce_energy"], np.float64)[valid])
+        output_ce.append(
+            np.asarray(result["output_ce_energy"], np.float64)[valid] / count
+        )
         fields = {
             field: {
                 **result[field],
@@ -438,8 +462,8 @@ def aggregate_map(
             for node, value in values.items():
                 selected = np.asarray(value, np.float64)[valid]
                 entry = per_node.setdefault(node, {})
-                entry.setdefault(field, []).append(selected)
-                entry.setdefault(f"{field}_sum_ce", []).append(selected * factor)
+                entry.setdefault(field, []).append(selected / count**2)
+                entry.setdefault(f"{field}_sum_ce", []).append(selected / scale**2)
     if windows == 0:
         raise ValueError("no window has a masked token")
     means = {
@@ -519,11 +543,12 @@ def compute_error_maps(
         "modules": modules,
         "provenance": run_provenance(context),
         "config": asdict(config),
+        "head_energy": HEAD_ENERGY,
         "settings": settings,
         "normalisation": (
-            "energy = per-sample 1/2||.||^2 averaged over windows with a masked "
-            "token; the head energy is s * sum(masked CE) / N with N the batch's "
-            "masked-token count, so *_sum_ce = energy * (N / s)^2 is "
+            "energy = per-sample 1/2||.||^2 / N^2 averaged over windows with a "
+            "masked token, with the head energy s * sum(masked CE) and N the "
+            "batch's masked-token count; *_sum_ce = raw energy / s^2 is "
             "batch-composition invariant in the spike-only setting"
         ),
         "maps": maps,

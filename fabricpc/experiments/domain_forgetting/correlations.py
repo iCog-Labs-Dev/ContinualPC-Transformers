@@ -351,6 +351,27 @@ def _read(path: Path) -> Any:
     return json.loads(path.read_text()) if path.exists() else None
 
 
+def standard_map_convention(error_maps: Mapping[str, Any] | None) -> str | None:
+    """The ``head_energy`` of an ``error_maps.json`` that holds standard-PC maps.
+
+    Returns None when there are no standard-PC maps. Raises for a legacy file
+    (no ``head_energy``, written under the head energy ``s · Σ CE / N``) with
+    standard-PC maps: those values are not comparable with current ones,
+    while its spike-only ``energy_sum_ce`` values are.
+    """
+    maps = (error_maps or {}).get("maps", [])
+    if not any(m["setting"] != SPIKE_ONLY for m in maps):
+        return None
+    convention = error_maps.get("head_energy")
+    if convention is None:
+        raise ValueError(
+            "error_maps.json predates the recorded head_energy convention; its "
+            "standard_pc maps are not comparable with current ones. Recompute "
+            "the error maps, or keep only the spike_only setting"
+        )
+    return convention
+
+
 def run_predictor_table(run_dir: str | Path) -> dict[str, dict[str, Any]]:
     """Collect recovery and every available predictor per transition.
 
@@ -358,7 +379,8 @@ def run_predictor_table(run_dir: str | Path) -> dict[str, dict[str, Any]]:
     ``error_maps.json`` (optional) from ``run_dir``, refusing any whose
     recorded stage and validation SHA-256s differ from the run's current
     ones. Map predictors use ``energy_sum_ce`` and, as ``*_per_dim``,
-    ``energy_sum_ce_per_dim``.
+    ``energy_sum_ce_per_dim``. Standard-PC maps of a legacy ``error_maps.json``
+    are refused (``standard_map_convention``).
     """
     path = Path(run_dir)
     rollback = _read(path / "rollback.json")
@@ -373,6 +395,7 @@ def run_predictor_table(run_dir: str | Path) -> dict[str, dict[str, Any]]:
     ):
         if payload is not None:
             check_provenance(path, payload, name)
+    standard_map_convention(error_maps)
     domains = rollback["domains"]
     modules = rollback["modules"]
     by_name = {t["name"]: t for t in (predictors or {}).get("transitions", [])}
@@ -476,7 +499,23 @@ def compute_correlations(
     permutations: int = PERMUTATIONS,
     seed: int = 0,
 ) -> dict[str, Any]:
-    """Correlate every run and aggregate ρ over runs (seeds) as mean ± sd."""
+    """Correlate every run and aggregate ρ over runs (seeds) as mean ± sd.
+
+    Runs whose error maps hold standard-PC maps must share one head-energy
+    convention; spike-only maps aggregate across conventions.
+    """
+    conventions = {
+        convention
+        for path in run_dirs
+        if (
+            convention := standard_map_convention(_read(Path(path) / "error_maps.json"))
+        )
+        is not None
+    }
+    if len(conventions) > 1:
+        raise ValueError(
+            f"standard_pc error maps use different head energies {sorted(conventions)}"
+        )
     runs = {
         str(path): correlate_run(
             path, resamples=resamples, permutations=permutations, seed=seed
