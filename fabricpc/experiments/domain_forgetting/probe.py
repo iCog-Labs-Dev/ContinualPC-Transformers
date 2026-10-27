@@ -25,6 +25,10 @@ from fabricpc.experiments.domain_forgetting.runner import (
     load_base_model,
     load_stage_snapshot,
     make_alignment_fn,
+    HEAD_ENERGY,
+    make_regime_probe,
+    regime_summary,
+    spectrum_scalars,
 )
 from fabricpc.experiments.forgetting_benchmark.sequential_trainer import params_hash
 
@@ -88,6 +92,8 @@ def probe_alignment(
     mask_prob: float | None = None,
     seed: int = 0,
     expected_shape: dict[str, int] | None = None,
+    lanczos_iters: int = 20,
+    final_spectrum: bool = False,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Return per-module PC vs backprop alignment for each ``(eta, steps)`` setting.
@@ -100,7 +106,18 @@ def probe_alignment(
     unshuffled batches of
     ``domain``'s training stream, with masks and dropout keys from ``seed``.
     ``forward_updates`` defaults to ``"initial"`` for spiking and ``"none"``
-    for standard PC. Each setting holds ``gradient_alignment``'s result.
+    for standard PC and ePC. Each setting holds ``gradient_alignment``'s
+    result. With ``pc_inference="epc"`` the ε-spectrum of every probe batch
+    is measured once (``spectrum``, ``lanczos_iters`` Lanczos steps) and each
+    setting also holds ``regime``: the per-batch ``regime_summary`` of its
+    (eta, steps), the extremes over batches, the mean ``f_weighted`` and the
+    verdict on the batch with the largest λ_max. The verdict describes the
+    quadratic model at ε = 0; with ``final_spectrum`` each setting also
+    measures the spectrum at the errors its own (eta, steps) relaxation
+    reaches (``lambda_max_final``, ``lambda_min_final``, ``unstable_final``).
+    Gradients are token sums divided by each batch's masked-token count, and
+    the stable rate scales with that count, so probe at the run's
+    micro-batch size.
     """
     if num_batches < 1 or batch_size < 1:
         raise ValueError("num_batches and batch_size must be positive")
@@ -166,6 +183,12 @@ def probe_alignment(
         mask_prob=mask_prob,
         seed=seed,
     )
+    spectra = None
+    if pc_inference == "epc":
+        first_inference, _ = build_inference(config, base.model_config)
+        probe_structure = build_structure(base.model_config, config, first_inference)
+        probe = make_regime_probe(probe_structure, lanczos_iters)
+        spectra = [probe(params, batch, key)[0] for batch, key in zip(batches, keys)]
     results = []
     for eta, steps in settings:
         setting_config = replace(config, pc_eta_infer=eta, pc_infer_steps=steps)
@@ -179,8 +202,29 @@ def probe_alignment(
             structure,
         )
         results.append({"eta_infer": eta, "infer_steps": infer_steps, **alignment})
+        if spectra is not None:
+            finals = [None] * len(spectra)
+            if final_spectrum:
+                final_probe = make_regime_probe(
+                    probe_structure, lanczos_iters, (eta, infer_steps)
+                )
+                finals = [
+                    final_probe(params, batch, key)[1]
+                    for batch, key in zip(batches, keys)
+                ]
+            results[-1]["regime"] = combine_regimes(
+                [
+                    regime_summary(spectrum, eta, infer_steps, final)
+                    for spectrum, final in zip(spectra, finals)
+                ]
+            )
         if verbose:
-            print(format_alignment(results[-1]))
+            if spectra is None:
+                print(format_alignment(results[-1]))
+            else:
+                if len(results) == 1:
+                    print(EPC_HEADER)
+                print(format_epc_setting(results[-1]))
     return {
         "checkpoint": str(checkpoint),
         "run_dir": str(run_path) if run_path is not None else None,
@@ -196,8 +240,64 @@ def probe_alignment(
         "forward_updates": forward_updates,
         "max_norm": max_norm,
         "output_energy_scale": output_energy_scale,
+        "head_energy": HEAD_ENERGY,
+        **(
+            {
+                "lanczos_iters": lanczos_iters,
+                "final_spectrum": final_spectrum,
+                "spectrum": [spectrum_scalars(spectrum) for spectrum in spectra],
+            }
+            if spectra is not None
+            else {}
+        ),
         "settings": results,
     }
+
+
+def combine_regimes(batches: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Combine per-batch ``regime_summary`` records of one setting."""
+    worst = max(batches, key=lambda b: b["lambda_max"])
+    fractions = [b["f_weighted"] for b in batches if b["f_weighted"] is not None]
+    final = {}
+    if "lambda_max_final" in batches[0]:
+        final = {
+            "lambda_max_final": max(b["lambda_max_final"] for b in batches),
+            "lambda_min_final": min(b["lambda_min_final"] for b in batches),
+            "unstable_final": any(b["unstable_final"] for b in batches),
+        }
+    return {
+        **final,
+        "lambda_max": worst["lambda_max"],
+        "lambda_min": min(b["lambda_min"] for b in batches),
+        "f_weighted_mean": (
+            float(sum(fractions) / len(fractions)) if fractions else None
+        ),
+        "bands": sorted({b["band"] for b in batches}),
+        "unstable": any(b["unstable"] for b in batches),
+        "regime": worst["regime"],
+        "batches": list(batches),
+    }
+
+
+EPC_HEADER = (
+    f"{'eta':>9} {'T':>4} {'cos_hid':>7} {'cos_min':>7} {'lam_max':>9} "
+    f"{'lam_min':>9} {'lam_fin':>9} {'f_mean':>6}  "
+    "regime at eps=0 (batch with largest lambda_max)"
+)
+
+
+def format_epc_setting(result: dict[str, Any]) -> str:
+    """One compact line per ePC setting: alignment, spectrum and verdict."""
+    regime = result["regime"]
+    return (
+        f"{result['eta_infer']:>9.3g} {result['infer_steps']:>4d} "
+        f"{_fmt(result.get('mean_cosine_hidden'), '7.4f')} "
+        f"{result['min_cosine']:>7.4f} {regime['lambda_max']:>9.4g} "
+        f"{regime['lambda_min']:>9.4g} "
+        f"{_fmt(regime.get('lambda_max_final'), '9.4g')} "
+        f"{_fmt(regime['f_weighted_mean'], '6.3f')}  "
+        f"{regime['regime']}"
+    )
 
 
 def _fmt(value: float | None, spec: str) -> str:
