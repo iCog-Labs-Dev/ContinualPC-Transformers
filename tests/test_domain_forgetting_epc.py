@@ -202,6 +202,8 @@ def test_regime_records_cadence_and_content(epc_run):
         )
         assert isinstance(record["regime"], str) and record["regime"]
         assert record["unstable"] is False
+        assert record["f_valid"] is True and 0.0 <= record["f_weighted"] <= 1.0
+        assert "eta_controlled" not in record
         modules = modules or list(record["weight_norms"])
         assert list(record["weight_norms"]) == modules
         assert all(v > 0 for v in record["weight_norms"].values())
@@ -393,6 +395,7 @@ def test_regime_probe_does_not_change_pc_or_epc_training(setup, epc_run, tmp_pat
     )
     alignment = _read_jsonl(tmp_path / "spiking" / "alignment.jsonl")
     assert alignment and all(r["head_energy"] == HEAD_ENERGY for r in alignment)
+    assert all(r["eta_infer"] == 0.0 and "eta_controlled" not in r for r in alignment)
     assert len(_read_jsonl(tmp_path / "spiking_probed" / "regime.jsonl")) == 9
 
 
