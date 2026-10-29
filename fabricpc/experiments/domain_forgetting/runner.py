@@ -49,7 +49,7 @@ import shutil
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -153,6 +153,16 @@ REGIME_DEFAULTS: dict[str, Any] = {
     "pc_regime_iters": 20,
     "pc_regime_final": False,
 }
+ETA_CONTROL = ("none", "energy")
+CONTROL_SETTINGS = (
+    "pc_energy_target",
+    "pc_eta_gain",
+    "pc_eta_min",
+    "pc_eta_max",
+    "pc_eta_backoff",
+)
+ETA_DROP_EMA = 0.7
+ETA_STEP_CLIP = (0.5, 2.0)
 RESUME_IGNORED_KEYS = (
     "log_interval",
     "output_dir",
@@ -203,6 +213,11 @@ class RunConfig:
     and a double backward pass through the ε-energy) each, about as much as
     tens of training micro-batch gradients; ``pc_regime_final`` adds
     ``pc_regime_steps`` ePC steps and a second spectrum at the relaxed errors.
+
+    ``pc_eta_control="energy"`` (ePC only) adapts the ePC rate after every
+    update so the measured relative energy drop tracks ``pc_energy_target``
+    (``control_eta``), within ``eta_bounds``; the rate restarts at
+    ``pc_eta_infer`` at every stage.
     """
 
     checkpoint: str
@@ -242,6 +257,12 @@ class RunConfig:
     pc_regime_steps: int | None = None
     pc_regime_iters: int = 20
     pc_regime_final: bool = False
+    pc_eta_control: str = "none"
+    pc_energy_target: float = 0.17
+    pc_eta_gain: float = 0.5
+    pc_eta_min: float | None = None
+    pc_eta_max: float | None = None
+    pc_eta_backoff: float = 0.5
     init_perturbation: float = 0.0
     init_perturbation_seed: int = 0
     gate: str = "none"
@@ -292,7 +313,48 @@ class RunConfig:
                 raise ValueError("pc_output_energy_scale must be positive")
             if self.pc_inference in ITERATIVE_PC:
                 self._validate_iterative()
+        self._validate_eta_control()
         self._validate_gate()
+
+    def _validate_eta_control(self) -> None:
+        """The rate controller's settings apply only to ePC runs that enable it."""
+        if self.pc_eta_control not in ETA_CONTROL:
+            raise ValueError(
+                f"pc_eta_control must be one of {ETA_CONTROL}, "
+                f"got {self.pc_eta_control!r}"
+            )
+        if self.pc_eta_control == "none":
+            unused = [
+                name
+                for name, default in CONTROL_DEFAULTS.items()
+                if getattr(self, name) != default
+            ]
+            if unused:
+                raise ValueError(f"{', '.join(unused)} need pc_eta_control 'energy'")
+            return
+        if self.mode != "pc" or self.pc_inference != "epc":
+            raise ValueError("pc_eta_control 'energy' needs mode 'pc' and ePC")
+        if not 0.0 < self.pc_energy_target < 1.0:
+            raise ValueError("pc_energy_target must be in (0, 1)")
+        if not (math.isfinite(self.pc_eta_gain) and self.pc_eta_gain > 0.0):
+            raise ValueError("pc_eta_gain must be finite and positive")
+        if not 0.0 < self.pc_eta_backoff <= 1.0:
+            raise ValueError("pc_eta_backoff must be in (0, 1]")
+        low, high = self.eta_bounds
+        if not all(math.isfinite(v) and v > 0.0 for v in (low, high)):
+            raise ValueError("pc_eta_min and pc_eta_max must be finite and positive")
+        if low > high:
+            raise ValueError("pc_eta_min must not exceed pc_eta_max")
+        if not low <= self.pc_eta_infer <= high:
+            raise ValueError("pc_eta_infer must lie in [pc_eta_min, pc_eta_max]")
+
+    @property
+    def eta_bounds(self) -> tuple[float, float]:
+        """The controller's (min, max) rate, defaulting to pc_eta_infer / 100 and
+        pc_eta_infer."""
+        low = self.pc_eta_infer / 100 if self.pc_eta_min is None else self.pc_eta_min
+        high = self.pc_eta_infer if self.pc_eta_max is None else self.pc_eta_max
+        return float(low), float(high)
 
     def _validate_regime(self) -> None:
         """The regime probe's settings apply only when its interval is set.
@@ -437,9 +499,10 @@ class RunConfig:
     def identity(self) -> dict[str, Any]:
         """The settings that must match for a run to be resumed.
 
-        ``training`` is left out for sequential runs and every gate setting
-        for ungated runs, so their identity is unchanged from before joint
-        training and gates existed.
+        ``training`` is left out for sequential runs, every gate setting
+        for ungated runs and every rate-controller setting for uncontrolled
+        runs, so their identity is unchanged from before joint training,
+        gates and the controller existed.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
@@ -452,12 +515,18 @@ class RunConfig:
         else:
             values["gate_modules"] = list(self.gate_modules)
             values["gate_source"] = list(self.gate_source)
+        if values["pc_eta_control"] == "none":
+            for key in ("pc_eta_control", *CONTROL_DEFAULTS):
+                values.pop(key)
         values["domains"] = list(self.domains)
         return values
 
 
 GATE_DEFAULTS: dict[str, Any] = {
     f.name: f.default for f in fields(RunConfig) if f.name.startswith("gate_")
+}
+CONTROL_DEFAULTS: dict[str, Any] = {
+    f.name: f.default for f in fields(RunConfig) if f.name in CONTROL_SETTINGS
 }
 
 
@@ -759,10 +828,25 @@ def load_stage_snapshot(path: str | Path, structure: GraphStructure) -> GraphPar
     return params_from_flat(load_npz(path), structure)
 
 
-GradientFn = Callable[
-    [GraphParams, dict[str, jax.Array], jax.Array],
-    tuple[GraphParams, jax.Array, jax.Array, dict[str, jax.Array]],
-]
+class GradientFn(Protocol):
+    """``(params, batch, key, eta_infer=None) -> (grads, loss_sum, count, extras)``.
+
+    ``eta_infer`` overrides the ePC rate for one call; only ePC accepts it.
+    """
+
+    def __call__(
+        self,
+        params: GraphParams,
+        batch: dict[str, jax.Array],
+        key: jax.Array,
+        eta_infer: jax.Array | None = None,
+    ) -> tuple[GraphParams, jax.Array, jax.Array, dict[str, jax.Array]]: ...
+
+
+def _reject_eta_infer(eta_infer: jax.Array | None) -> None:
+    """Raise unless ``eta_infer`` is None (the gradient function is not ePC)."""
+    if eta_infer is not None:
+        raise ValueError("eta_infer overrides only the ePC rate")
 
 
 def state_total_energy(
@@ -816,11 +900,15 @@ def make_gradient_fn(
     before the last latent update, so it is the energy of step ``T - 1``, not
     ``pc_energy_end``; ePC's final state is re-derived at its final errors, so
     there it equals ``pc_energy_end``.
+
+    The ePC function takes an optional traced ``eta_infer`` that replaces the
+    configured rate, so changing it between calls does not recompile.
     """
     if mode == "backprop":
 
         @jax.jit
-        def backprop(params, batch, key):
+        def backprop(params, batch, key, eta_infer=None):
+            _reject_eta_infer(eta_infer)
             loss, grads, count = _loss_and_grad_backprop_mlm_no_update(
                 params, batch, structure, key
             )
@@ -831,9 +919,9 @@ def make_gradient_fn(
     if pc_inference in ITERATIVE_PC:
 
         @jax.jit
-        def standard(params, batch, key):
+        def standard(params, batch, key, eta_infer=None):
             grads, metrics, initial, _free, final = get_graph_param_gradient_pcn_mlm(
-                params, batch, structure, key, forward_updates
+                params, batch, structure, key, forward_updates, eta_infer
             )
             count = metrics["num_masked_tokens"]
             return (
@@ -856,7 +944,8 @@ def make_gradient_fn(
         return standard
     pc_step = create_jit_gradient_step_pcn_mlm(structure, forward_updates)
 
-    def pc(params, batch, key):
+    def pc(params, batch, key, eta_infer=None):
+        _reject_eta_infer(eta_infer)
         grads, loss_sum, count, rises, energy = pc_step(params, batch, key)
         return (
             grads,
@@ -878,6 +967,7 @@ def accumulate_gradients(
     keys: Sequence[jax.Array],
     *,
     summed: bool = False,
+    eta_infer: jax.Array | None = None,
 ) -> tuple[GraphParams, float, float, list[dict[str, Any]]]:
     """Return the token-weighted mean gradient of one update's micro-batches.
 
@@ -887,14 +977,18 @@ def accumulate_gradients(
     token-summed gradient ``G_k`` (PC, whose head energy is ``s · Σ_masked
     CE``) and the result is ``Σ_k G_k / max(Σ_k n_k, 1)``: the normalisation
     happens once, over the whole update. Also returns the summed masked CE,
-    the total count and the per-micro-batch extras.
+    the total count and the per-micro-batch extras. ``eta_infer``, when given,
+    is passed to every micro-batch, so one update uses one ePC rate.
     """
+    rate = {} if eta_infer is None else {"eta_infer": eta_infer}
     total = None
     loss_sum = 0.0
     count = 0.0
     extras = []
     for batch, key in zip(micro_batches, keys, strict=True):
-        grads, batch_loss, batch_count, batch_extras = gradient_fn(params, batch, key)
+        grads, batch_loss, batch_count, batch_extras = gradient_fn(
+            params, batch, key, **rate
+        )
         weighted = (
             grads
             if summed
@@ -919,7 +1013,16 @@ def accumulate_gradients(
     )
 
 
-RegimeProbe = Callable[[GraphParams, dict[str, jax.Array], jax.Array], Any]
+class RegimeProbe(Protocol):
+    """``(params, batch, key, eta_infer=None) -> (spectrum, final_spectrum)``."""
+
+    def __call__(
+        self,
+        params: GraphParams,
+        batch: dict[str, jax.Array],
+        key: jax.Array,
+        eta_infer: jax.Array | None = None,
+    ) -> tuple[EpsilonSpectrum, EpsilonSpectrum | None]: ...
 
 
 def make_regime_probe(
@@ -927,7 +1030,8 @@ def make_regime_probe(
     iters: int = 20,
     final: tuple[float, int] | None = None,
 ) -> RegimeProbe:
-    """Return a jitted ``(params, batch, key) -> (spectrum, final_spectrum)``.
+    """Return a jitted ``(params, batch, key, eta_infer=None) -> (spectrum,
+    final_spectrum)``.
 
     ``spectrum`` is the ε-energy Hessian's ``EpsilonSpectrum`` (on device)
     at the target-clamped feedforward state of ``batch`` (ε = 0), with
@@ -936,6 +1040,8 @@ def make_regime_probe(
     ``final_spectrum`` is the spectrum at the errors reached by ``steps``
     ePC steps at rate ``eta`` from there (else None): the regime verdict is
     a statement about ε = 0, and this checks it along the relaxation.
+    ``eta_infer``, when given, replaces ``eta`` for that relaxation without
+    recompiling.
     """
     spectrum_fn = make_epsilon_spectrum(structure, iters)
     relaxed = None
@@ -949,14 +1055,16 @@ def make_regime_probe(
         )
 
     @jax.jit
-    def probe(params, batch, key):
+    def probe(params, batch, key, eta_infer=None):
         _shared, _metrics, _free, initial, clamps = _prepare_pcn_mlm_batch(
             params, batch, structure, key
         )
         spectrum = spectrum_fn(params, initial, clamps, key)
         if relaxed is None:
             return spectrum, None
-        state = EPCInference.run_inference(params, initial, clamps, relaxed)
+        state = EPCInference.run_inference(
+            params, initial, clamps, relaxed, eta_infer=eta_infer
+        )
         return spectrum, spectrum_fn(params, state, clamps, key)
 
     return probe
@@ -989,16 +1097,33 @@ def regime_summary(
     spectrum at the relaxed errors) the summary adds ``lambda_max_final``,
     ``lambda_min_final``, ``eta_lambda_max_final`` and ``unstable_final``
     (``eta · lambda_max_final > 2``).
+
+    ``f_valid`` is true when f̄ is finite, in [0, 1] and ``eta · lambda_max
+    <= 2``. Otherwise ``f_weighted`` is None, and unless no positive mode
+    carries gradient weight ``band`` is "invalid", ``f_max`` is None and
+    ``regime`` names the cause with ``eta · lambda_max`` only.
     """
     host = spectrum.host()
     regime = EPCInference(eta_infer=eta, infer_steps=steps).regime(host)
+    f_weighted = regime.f_weighted
+    f_valid = (
+        math.isfinite(f_weighted)
+        and 0.0 <= f_weighted <= 1.0
+        and regime.eta_lambda_max <= 2.0
+    )
+    invalid = not f_valid and not (math.isnan(f_weighted) and not regime.unstable)
+    verdict = str(regime)
+    if invalid:
+        cause = "unstable" if regime.unstable else "relaxed fraction outside [0, 1]"
+        verdict = f"invalid: {cause}, eta*lambda_max = {regime.eta_lambda_max:.3g}"
     summary = {
         **spectrum_scalars(host),
-        "f_weighted": None if math.isnan(regime.f_weighted) else regime.f_weighted,
-        "f_max": regime.f_max,
-        "band": regime.band,
+        "f_weighted": f_weighted if f_valid else None,
+        "f_valid": bool(f_valid),
+        "f_max": None if invalid else regime.f_max,
+        "band": "invalid" if invalid else regime.band,
         "unstable": bool(regime.unstable),
-        "regime": str(regime),
+        "regime": verdict,
     }
     if final_spectrum is not None:
         final = spectrum_scalars(final_spectrum)
@@ -1021,15 +1146,24 @@ def module_weight_norms(
     return norms
 
 
-AlignmentFn = Callable[
-    [GraphParams, dict[str, jax.Array], jax.Array], dict[str, dict[str, jax.Array]]
-]
+class AlignmentFn(Protocol):
+    """``(params, batch, key, eta_infer=None) -> {module: {pc_norm, bp_norm,
+    cosine}}``; ``eta_infer`` overrides the ePC rate."""
+
+    def __call__(
+        self,
+        params: GraphParams,
+        batch: dict[str, jax.Array],
+        key: jax.Array,
+        eta_infer: jax.Array | None = None,
+    ) -> dict[str, dict[str, jax.Array]]: ...
 
 
 def make_alignment_fn(
     structure: GraphStructure, forward_updates: str = "none"
 ) -> AlignmentFn:
-    """Return the jitted per-module PC vs backprop gradient comparison."""
+    """Return the jitted per-module PC vs backprop gradient comparison; its
+    optional traced ``eta_infer`` overrides the ePC rate without recompiling."""
     return create_pc_bp_gradient_comparison(structure, forward_updates)
 
 
@@ -1083,8 +1217,11 @@ def gradient_alignment(
     batches: Sequence[Mapping[str, jax.Array]],
     keys: Sequence[jax.Array],
     structure: GraphStructure,
+    eta_infer: jax.Array | None = None,
 ) -> dict[str, Any]:
     """Average the per-module PC vs backprop comparison over ``batches``.
+
+    ``eta_infer``, when given, is the ePC rate of every comparison.
 
     A module is one parameterised graph node, in graph order. Per module:
     the mean and minimum cosine, the mean norms and ``norm_ratio`` (mean of
@@ -1096,8 +1233,9 @@ def gradient_alignment(
     ``mean_cosine_hidden`` leaves it out. ``module_order`` lists the modules
     in graph order.
     """
+    rate = {} if eta_infer is None else {"eta_infer": eta_infer}
     per_batch = [
-        jax.tree_util.tree_map(float, alignment_fn(params, batch, key))
+        jax.tree_util.tree_map(float, alignment_fn(params, batch, key, **rate))
         for batch, key in zip(batches, keys, strict=True)
     ]
     if not per_batch:
@@ -1138,6 +1276,45 @@ def gradient_alignment(
     }
 
 
+def control_eta(
+    eta: float,
+    smoothed: float | None,
+    drop: float,
+    increased: bool,
+    *,
+    target: float,
+    gain: float,
+    eta_min: float,
+    eta_max: float,
+    backoff: float,
+) -> tuple[float, float, bool]:
+    """One step of the ePC rate controller.
+
+    Returns ``(eta_next, smoothed_next, backed_off)``. An update whose
+    inference ended above its start energy (``increased``) or whose ``drop``
+    is not finite backs off: it enters the average as a drop of 1, the
+    deepest possible, and caps the step factor at ``backoff``. The drop is
+    smoothed as d̃ ← 0.7·d̃ + 0.3·d, seeded with the first d; the step factor
+    is r = clip((target / max(d̃, 1e-6))^gain, 0.5, 2.0) and
+    eta_next = clip(eta·r, eta_min, eta_max). Averaging a divergence as a
+    full drop keeps the following updates from raising the rate straight
+    back to where it diverged.
+    """
+    backed_off = increased or not math.isfinite(drop)
+    if backed_off:
+        drop = 1.0
+    smoothed = (
+        drop
+        if smoothed is None
+        else ETA_DROP_EMA * smoothed + (1.0 - ETA_DROP_EMA) * drop
+    )
+    low, high = ETA_STEP_CLIP
+    factor = min(max((target / max(smoothed, 1e-6)) ** gain, low), high)
+    if backed_off:
+        factor = min(factor, backoff)
+    return min(max(eta * factor, eta_min), eta_max), smoothed, backed_off
+
+
 def train_stage(
     params: GraphParams,
     structure: GraphStructure,
@@ -1148,7 +1325,7 @@ def train_stage(
     special_ids: Mapping[str, int],
     gradient_fn: GradientFn,
     multipliers: Mapping[str, float] | None = None,
-    regime_fn: Callable[[int, int, GraphParams], None] | None = None,
+    regime_fn: Callable[[int, int, GraphParams, float | None], None] | None = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any], list[dict[str, Any]]]:
     """Train one domain from ``params`` with a fresh optimizer and schedule.
@@ -1162,9 +1339,17 @@ def train_stage(
     (``build_stage_optimizer``). Each log entry holds ``grad_norm``, the
     global norm of the update's gradient as the clip sees it (frozen modules
     zeroed), and ``clipped``, whether the clip rescaled it. ``regime_fn(update,
-    num_updates, params)`` is called before the first update and after every
-    update; it must only read ``params``. Returns the params, the exposure
-    record and the log.
+    num_updates, params, eta)`` is called before the first update and after
+    every update with the ePC rate the next update uses, or after the last
+    update the rate it used (None without the rate controller); it must
+    only read ``params``. ``pc_energy_rel_decrease`` is NaN (null in the log)
+    when either energy is non-finite or the start energy is not positive.
+    With ``pc_eta_control="energy"`` the rate starts at ``pc_eta_infer``,
+    each log entry adds ``eta_infer`` (the rate it used), ``eta_next``,
+    ``eta_backoff`` and ``pc_energy_rel_decrease_ema`` (``control_eta``), and
+    the exposure record adds the stage's rate range, mean and last used
+    value under ``eta_infer``.
+    Returns the params, the exposure record and the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
     vocab_size = int(structure.nodes[structure.task_map["y"]].node_info.shape[-1])
@@ -1200,8 +1385,13 @@ def train_stage(
             {name: node for name, node in g.nodes.items() if name not in frozen}
         )
     )
+    controlled = config.pc_eta_control == "energy"
+    eta = config.pc_eta_infer
+    eta_min, eta_max = config.eta_bounds
+    smoothed: float | None = None
+    etas_used: list[float] = []
     if regime_fn is not None:
-        regime_fn(0, num_updates, params)
+        regime_fn(0, num_updates, params, eta if controlled else None)
     rng_key = jax.random.fold_in(jax.random.PRNGKey(config.seed), stage)
     counts = {
         "stream_tokens": 0,
@@ -1235,6 +1425,7 @@ def train_stage(
                     pending_batches,
                     pending_keys,
                     summed=config.mode == "pc",
+                    eta_infer=jnp.asarray(eta) if controlled else None,
                 )
             )
             grad_norm = float(clip_norm_fn(pending_grads))
@@ -1275,7 +1466,9 @@ def train_stage(
                     entry["pc_energy_start"] = start
                     entry["pc_energy_end"] = end
                     entry["pc_energy_rel_decrease"] = (
-                        (start - end) / start if start > 0 else 0.0
+                        (start - end) / start
+                        if math.isfinite(start) and math.isfinite(end) and start > 0
+                        else math.nan
                     )
                     entry["pc_energy_increased"] = end > start
                     if end > start and not energy_warned:
@@ -1286,9 +1479,35 @@ def train_stage(
                             f"({start:.4g} -> {end:.4g}); inference is diverging, "
                             "lower --pc_eta_infer"
                         )
+            if controlled:
+                entry["eta_infer"] = eta
+                etas_used.append(eta)
+                eta, smoothed, backed_off = control_eta(
+                    eta,
+                    smoothed,
+                    entry["pc_energy_rel_decrease"],
+                    entry["pc_energy_increased"],
+                    target=config.pc_energy_target,
+                    gain=config.pc_eta_gain,
+                    eta_min=eta_min,
+                    eta_max=eta_max,
+                    backoff=config.pc_eta_backoff,
+                )
+                entry["eta_next"] = eta
+                entry["eta_backoff"] = backed_off
+                entry["pc_energy_rel_decrease_ema"] = smoothed
             log.append(entry)
             if regime_fn is not None:
-                regime_fn(updates, num_updates, params)
+                regime_fn(
+                    updates,
+                    num_updates,
+                    params,
+                    (
+                        (etas_used[-1] if updates == num_updates else eta)
+                        if controlled
+                        else None
+                    ),
+                )
             if verbose and config.log_interval and updates % config.log_interval == 0:
                 print(
                     f"stage={stage} update={updates}/{num_updates} "
@@ -1317,6 +1536,13 @@ def train_stage(
         "epochs_started": int(batcher.state_dict()["epoch"]),
         "optimizer": optimizer_info,
     }
+    if controlled:
+        exposure["eta_infer"] = {
+            "min": min(etas_used),
+            "max": max(etas_used),
+            "mean": float(np.mean(etas_used)),
+            "last": etas_used[-1],
+        }
     return params, exposure, log
 
 
@@ -1521,7 +1747,11 @@ def run_domain_forgetting(
     settings are resume-ignored: reused stages keep their records and
     retrained stages are probed with the current settings, so a resumed
     ``regime.jsonl`` can mix settings across stages; every record carries
-    its own (interval, final, eta, steps, Lanczos iterations).
+    its own (interval, final, eta, steps, Lanczos iterations). With
+    ``pc_eta_control="energy"`` and no explicit ``pc_regime_eta``, each
+    record judges the controller's current rate and marks
+    ``eta_controlled``; ``run_config.json`` holds the controller under
+    ``pc.eta_control``.
     """
     config.validate()
     domains = list(config.domains)
@@ -1581,6 +1811,23 @@ def run_domain_forgetting(
                 "max_norm": config.pc_max_norm,
                 "output_energy_scale": config.pc_output_energy_scale,
                 "head_energy": HEAD_ENERGY,
+                **(
+                    {
+                        "eta_control": {
+                            "rule": config.pc_eta_control,
+                            "energy_target": config.pc_energy_target,
+                            "gain": config.pc_eta_gain,
+                            "eta_min": config.eta_bounds[0],
+                            "eta_max": config.eta_bounds[1],
+                            "backoff": config.pc_eta_backoff,
+                            "drop_ema": ETA_DROP_EMA,
+                            "step_clip": list(ETA_STEP_CLIP),
+                            "stage_reset": True,
+                        }
+                    }
+                    if config.pc_eta_control != "none"
+                    else {}
+                ),
             }
             if config.mode == "pc"
             else None
@@ -1656,12 +1903,24 @@ def run_domain_forgetting(
         )
         seconds = [0.0]
 
-        def record(update: int, num_updates: int, stage_params: GraphParams) -> None:
+        def record(
+            update: int,
+            num_updates: int,
+            stage_params: GraphParams,
+            eta_infer: float | None = None,
+        ) -> None:
             interval = config.pc_regime_interval
             if update not in (0, num_updates) and update % interval:
                 return
             started = time.time()
-            spectrum, final_spectrum = regime_probe(stage_params, batches[0], keys[0])
+            controlled = eta_infer is not None and config.pc_regime_eta is None
+            eta = eta_infer if controlled else regime_eta
+            spectrum, final_spectrum = regime_probe(
+                stage_params,
+                batches[0],
+                keys[0],
+                jnp.asarray(eta) if controlled else None,
+            )
             when = (
                 "start"
                 if update == 0
@@ -1677,14 +1936,13 @@ def run_domain_forgetting(
                     "params_sha256": params_hash(stage_params),
                     "regime_interval": config.pc_regime_interval,
                     "regime_final": config.pc_regime_final,
-                    "eta_infer": regime_eta,
+                    "eta_infer": eta,
+                    **({"eta_controlled": True} if controlled else {}),
                     "infer_steps": regime_steps,
                     "lanczos_iters": config.pc_regime_iters,
                     "batch_size": batch_size,
                     "seed": config.seed + stage,
-                    **regime_summary(
-                        spectrum, regime_eta, regime_steps, final_spectrum
-                    ),
+                    **regime_summary(spectrum, eta, regime_steps, final_spectrum),
                     "weight_norms": module_weight_norms(stage_params, base.structure),
                 }
             )
@@ -1712,9 +1970,17 @@ def run_domain_forgetting(
     alignment_records: list[dict[str, Any]] = []
 
     def record_alignment(
-        stage: int, domain: str, when: str, stage_params: GraphParams
+        stage: int,
+        domain: str,
+        when: str,
+        stage_params: GraphParams,
+        eta_infer: float | None = None,
     ) -> float:
-        """Append one alignment record and return the seconds it took."""
+        """Append one alignment record and return the seconds it took.
+
+        ``eta_infer`` is the controller's rate to compare at (None: the
+        configured ``pc_eta_infer``); the record holds the rate used.
+        """
         started = time.time()
         batches, keys = fixed_mlm_batches(
             caches[domain].train,
@@ -1736,8 +2002,15 @@ def run_domain_forgetting(
                 "head_energy": HEAD_ENERGY,
                 "batch_size": config.micro_batch_size or config.batch_size,
                 "seed": config.seed + stage,
+                "eta_infer": config.pc_eta_infer if eta_infer is None else eta_infer,
+                **({"eta_controlled": True} if eta_infer is not None else {}),
                 **gradient_alignment(
-                    alignment_fn, stage_params, batches, keys, base.structure
+                    alignment_fn,
+                    stage_params,
+                    batches,
+                    keys,
+                    base.structure,
+                    None if eta_infer is None else jnp.asarray(eta_infer),
                 ),
             }
         )
@@ -1862,7 +2135,13 @@ def run_domain_forgetting(
             exposure[domain] = stage_exposure
             _write_jsonl(output / f"training_log_stage_{stage}.jsonl", log)
             if alignment_fn is not None:
-                alignment_seconds += record_alignment(stage, domain, "end", params)
+                alignment_seconds += record_alignment(
+                    stage,
+                    domain,
+                    "end",
+                    params,
+                    stage_exposure.get("eta_infer", {}).get("last"),
+                )
                 _write_jsonl(output / "alignment.jsonl", alignment_records)
         snapshot = save_stage_snapshot(output / f"stage_{stage}.npz", params)
         eval_start = time.time()

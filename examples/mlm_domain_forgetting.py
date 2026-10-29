@@ -65,6 +65,8 @@ Usage:
     Backprop or any PC run can log the ε-spectrum and regime verdict of an
     ePC setting during training (regime.jsonl): --pc_regime_interval K
     --pc_regime_eta ETA --pc_regime_steps T (ePC runs default to their own).
+    ePC runs can hold the relative energy drop near a target by adapting the
+    rate: --pc_eta_control energy --pc_energy_target 0.17.
 
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
         --init_perturbation 1e-7 --output_dir results/domain_forgetting/bp_pert
@@ -92,6 +94,7 @@ from fabricpc.experiments.domain_forgetting.probe import parse_grid, probe_align
 from fabricpc.experiments.domain_forgetting.runner import (
     BERT_MINI_SHAPE,
     DEFAULT_FORWARD_UPDATES,
+    ETA_CONTROL,
     MODES,
     PC_INFERENCE,
     GATES,
@@ -220,6 +223,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--pc_regime_final",
         action="store_true",
         help="Also measure the spectrum after pc_regime_steps ePC steps",
+    )
+    parser.add_argument(
+        "--pc_eta_control",
+        choices=ETA_CONTROL,
+        default=defaults.pc_eta_control,
+        help="energy = adapt the ePC rate after every update so the relative "
+        "energy drop tracks --pc_energy_target; it restarts at --pc_eta_infer "
+        "every stage (ePC only)",
+    )
+    parser.add_argument(
+        "--pc_energy_target", type=float, default=defaults.pc_energy_target
+    )
+    parser.add_argument("--pc_eta_gain", type=float, default=defaults.pc_eta_gain)
+    parser.add_argument(
+        "--pc_eta_min",
+        type=float,
+        default=None,
+        help="Controller floor (default pc_eta_infer / 100)",
+    )
+    parser.add_argument(
+        "--pc_eta_max",
+        type=float,
+        default=None,
+        help="Controller ceiling (default pc_eta_infer)",
+    )
+    parser.add_argument(
+        "--pc_eta_backoff",
+        type=float,
+        default=defaults.pc_eta_backoff,
+        help="Largest rate factor after an update whose inference raised the energy",
     )
     parser.add_argument(
         "--gate",
@@ -402,6 +435,12 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         pc_regime_steps=args.pc_regime_steps,
         pc_regime_iters=args.pc_regime_iters,
         pc_regime_final=args.pc_regime_final,
+        pc_eta_control=args.pc_eta_control,
+        pc_energy_target=args.pc_energy_target,
+        pc_eta_gain=args.pc_eta_gain,
+        pc_eta_min=args.pc_eta_min,
+        pc_eta_max=args.pc_eta_max,
+        pc_eta_backoff=args.pc_eta_backoff,
         init_perturbation=args.init_perturbation,
         init_perturbation_seed=args.init_perturbation_seed,
         gate=args.gate,

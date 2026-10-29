@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
+from fabricpc.core.epsilon_spectrum import EpsilonSpectrum
 from fabricpc.experiments.domain_forgetting.artifacts import file_sha256
 from fabricpc.experiments.domain_forgetting.data import load_domain_cache
 from fabricpc.experiments.domain_forgetting.runner import (
@@ -203,7 +204,7 @@ def probe_alignment(
         )
         results.append({"eta_infer": eta, "infer_steps": infer_steps, **alignment})
         if spectra is not None:
-            finals = [None] * len(spectra)
+            finals: list[EpsilonSpectrum | None] = [None] * len(spectra)
             if final_spectrum:
                 final_probe = make_regime_probe(
                     probe_structure, lanczos_iters, (eta, infer_steps)
@@ -255,7 +256,11 @@ def probe_alignment(
 
 
 def combine_regimes(batches: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Combine per-batch ``regime_summary`` records of one setting."""
+    """Combine per-batch ``regime_summary`` records of one setting.
+
+    ``f_weighted_mean`` averages the valid batches' f̄; ``f_valid`` is true
+    only when every batch's is valid.
+    """
     worst = max(batches, key=lambda b: b["lambda_max"])
     fractions = [b["f_weighted"] for b in batches if b["f_weighted"] is not None]
     final = {}
@@ -272,6 +277,7 @@ def combine_regimes(batches: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "f_weighted_mean": (
             float(sum(fractions) / len(fractions)) if fractions else None
         ),
+        "f_valid": all(b.get("f_valid", True) for b in batches),
         "bands": sorted({b["band"] for b in batches}),
         "unstable": any(b["unstable"] for b in batches),
         "regime": worst["regime"],
@@ -287,15 +293,24 @@ EPC_HEADER = (
 
 
 def format_epc_setting(result: dict[str, Any]) -> str:
-    """One compact line per ePC setting: alignment, spectrum and verdict."""
+    """One compact line per ePC setting: alignment, spectrum and verdict.
+
+    The f_mean column reads ``diverged`` when any batch's band is "invalid"
+    (``regime_summary``).
+    """
     regime = result["regime"]
+    f_mean = (
+        "diverged"
+        if "invalid" in regime["bands"]
+        else _fmt(regime["f_weighted_mean"], "6.3f")
+    )
     return (
         f"{result['eta_infer']:>9.3g} {result['infer_steps']:>4d} "
         f"{_fmt(result.get('mean_cosine_hidden'), '7.4f')} "
         f"{result['min_cosine']:>7.4f} {regime['lambda_max']:>9.4g} "
         f"{regime['lambda_min']:>9.4g} "
         f"{_fmt(regime.get('lambda_max_final'), '9.4g')} "
-        f"{_fmt(regime['f_weighted_mean'], '6.3f')}  "
+        f"{f_mean}  "
         f"{regime['regime']}"
     )
 
