@@ -340,6 +340,7 @@ def get_graph_param_gradient_pcn_mlm(
     structure: GraphStructure,
     rng_key: jax.Array,
     forward_updates: str = "none",
+    eta_infer: jax.Array | float | None = None,
 ) -> Tuple[GraphParams, dict[str, jax.Array], GraphState, GraphState, GraphState]:
     """Compute one BERT MLM PC local-gradient step without applying updates.
 
@@ -347,6 +348,10 @@ def get_graph_param_gradient_pcn_mlm(
     ``compute_local_weight_gradients`` on the final state, ``"initial"`` and
     ``"final"`` use ``compute_local_weight_gradients_forward_update`` in that
     mode.
+
+    ``eta_infer``, when given, overrides ``EPCInference``'s configured rate
+    for this call and may be traced; it raises ``ValueError`` for any other
+    inference class.
 
     The MLM head energy is ``s · Σ_masked CE``, so the returned gradients
     are summed over the batch's masked tokens, and the energy metrics
@@ -358,15 +363,21 @@ def get_graph_param_gradient_pcn_mlm(
     """
     _validate_forward_updates(forward_updates)
     _validate_feedforward_start(structure, forward_updates)
+    inference_cls = type(structure.config["inference"])
+    if eta_infer is not None and not issubclass(inference_cls, EPCInference):
+        raise ValueError(
+            "eta_infer overrides only EPCInference's rate, got "
+            f"{inference_cls.__name__}"
+        )
     _shared_clamps, free_metrics, free_state, initial_state, clamps = (
         _prepare_pcn_mlm_batch(params, batch, structure, rng_key)
     )
     batch_size = batch["x"].shape[0]
     output_node = structure.task_map["y"]
-    inference_cls = type(structure.config["inference"])
     if hasattr(inference_cls, "run_inference_with_stats"):
+        rate = {} if eta_infer is None else {"eta_infer": eta_infer}
         final_state, inference_stats = inference_cls.run_inference_with_stats(
-            params, initial_state, clamps, structure
+            params, initial_state, clamps, structure, **rate
         )
         energy_rises = inference_stats["energy_rises"]
         extra_stats = (
@@ -470,14 +481,15 @@ def create_pc_bp_gradient_comparison(
     backprop gradients of the mean masked loss on the same batch. Norm ratios
     carry a global loss-scale constant; compare them against the ``mlm_head``
     ratio rather than against one. PC gradients use the training rule
-    selected by ``forward_updates``.
+    selected by ``forward_updates``. An optional traced ``eta_infer``
+    overrides ``EPCInference``'s rate (``get_graph_param_gradient_pcn_mlm``).
     """
     _validate_forward_updates(forward_updates)
     _validate_feedforward_start(structure, forward_updates)
 
-    def compare(params, batch, rng_key):
+    def compare(params, batch, rng_key, eta_infer=None):
         pc_grads, metrics, _initial, _free, _final = get_graph_param_gradient_pcn_mlm(
-            params, batch, structure, rng_key, forward_updates
+            params, batch, structure, rng_key, forward_updates, eta_infer
         )
         pc_grads = mean_pc_gradients(pc_grads, metrics["num_masked_tokens"])
         _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(

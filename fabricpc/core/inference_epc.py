@@ -484,6 +484,7 @@ class EPCInference(InferenceBase):
         initial_state: GraphState,
         clamps: Dict[str, jnp.ndarray],
         structure: GraphStructure,
+        eta_infer: jax.Array | float | None = None,
     ) -> Tuple[GraphState, Dict[str, jnp.ndarray]]:
         """``run_inference`` plus energy statistics.
 
@@ -495,8 +496,14 @@ class EPCInference(InferenceBase):
         ``energy_total_rises`` (int32) counts the steps whose batch-total
         energy Σ_b E_t,b, the quantity the ε gradient descends, rose.
         ``energy_start`` and ``energy_end`` are E_0 and E_T.
+
+        ``eta_infer``, when given, replaces the configured rate for this call.
+        It may be a traced scalar, so a jitted caller can change it between
+        calls without recompiling; ``None`` uses the configured rate.
         """
         config = structure.config["inference"].config
+        if eta_infer is not None:
+            config = {**config, "eta_infer": eta_infer}
         state = cls.begin_segment(params, initial_state, clamps, structure)
         start = cls.sample_energies(state, structure)
 
@@ -536,11 +543,13 @@ class EPCInference(InferenceBase):
         initial_state: GraphState,
         clamps: Dict[str, jnp.ndarray],
         structure: GraphStructure,
+        eta_infer: jax.Array | float | None = None,
     ) -> GraphState:
         """``begin_segment``, ``infer_steps`` ε steps under ``lax.fori_loop``,
         then ``finalize_state``. The config is read from
-        ``structure.config["inference"]``."""
+        ``structure.config["inference"]``; ``eta_infer``, when given,
+        replaces its rate (see ``run_inference_with_stats``)."""
         final, _ = cls.run_inference_with_stats(
-            params, initial_state, clamps, structure
+            params, initial_state, clamps, structure, eta_infer=eta_infer
         )
         return final
