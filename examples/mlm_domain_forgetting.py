@@ -3,9 +3,9 @@
 
 S0 loads the checkpoint; stage s trains on the s-th domain with a fresh
 optimizer and schedule, and every stage evaluates all domains on their fixed
-validation sets. ``compare`` checks a run (spike-only PC, or BP from a
-perturbed initialisation for the float32 noise floor) against a BP run of
-the same setup. ``probe`` prints per-module PC vs backprop gradient cosines
+validation sets. ``compare`` checks a run (spike-only PC, BP from a
+perturbed initialisation for the float32 noise floor, or BP with gradient
+noise at a fixed per-module cosine) against a BP run of the same setup. ``probe`` prints per-module PC vs backprop gradient cosines
 and norm ratios on fixed batches of one domain, for one or a grid of PC
 inference settings; for ePC it also measures the ε-spectrum and prints the
 regime verdict of each setting.
@@ -71,6 +71,9 @@ Usage:
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
         --init_perturbation 1e-7 --output_dir results/domain_forgetting/bp_pert
 
+    PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
+        --grad_noise_cosine 0.89 --output_dir results/domain_forgetting/bp_noise
+
     PYTHONPATH=. python examples/mlm_domain_forgetting.py compare \\
         --pc_dir results/domain_forgetting/pc_seed0 \\
         --bp_dir results/domain_forgetting/bp_seed0
@@ -95,6 +98,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     BERT_MINI_SHAPE,
     DEFAULT_FORWARD_UPDATES,
     ETA_CONTROL,
+    GRAD_NOISE_MODES,
     MODES,
     PC_INFERENCE,
     GATES,
@@ -195,6 +199,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--init_perturbation_seed", type=int, default=defaults.init_perturbation_seed
     )
     parser.add_argument(
+        "--grad_noise_cosine",
+        type=float,
+        default=defaults.grad_noise_cosine,
+        metavar="C",
+        help="Replace each module's gradient by one of equal norm at cosine C "
+        "to it with a random orthogonal part, C in (0, 1) (backprop only)",
+    )
+    parser.add_argument("--grad_noise_seed", type=int, default=defaults.grad_noise_seed)
+    parser.add_argument(
+        "--grad_noise_mode",
+        choices=GRAD_NOISE_MODES,
+        default=defaults.grad_noise_mode,
+        help="fresh = new noise direction every update; persistent = one per "
+        "stage and module, re-projected against each update's gradient",
+    )
+    parser.add_argument(
         "--pc_alignment_batches",
         type=int,
         default=defaults.pc_alignment_batches,
@@ -291,8 +311,8 @@ def build_compare_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mlm_domain_forgetting.py compare",
         description=(
-            "Compare a run (PC, or perturbed BP) with a BP reference run of "
-            "the same setup."
+            "Compare a run (PC, perturbed BP or gradient-noised BP) with a BP "
+            "reference run of the same setup."
         ),
     )
     parser.add_argument("--pc_dir", "--run_dir", dest="pc_dir", required=True)
@@ -443,6 +463,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         pc_eta_backoff=args.pc_eta_backoff,
         init_perturbation=args.init_perturbation,
         init_perturbation_seed=args.init_perturbation_seed,
+        grad_noise_cosine=args.grad_noise_cosine,
+        grad_noise_seed=args.grad_noise_seed,
+        grad_noise_mode=args.grad_noise_mode,
         gate=args.gate,
         gate_beta=args.gate_beta,
         gate_modules=tuple(args.gate_modules),

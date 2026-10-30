@@ -38,6 +38,11 @@ With ``gate`` other than ``"none"`` every stage from 2 on multiplies each
 module's AdamW update by a fixed per-module multiplier (``gates.GatePlan``),
 chained after the optimizer so that a multiplier of 0 freezes the module;
 frozen modules' gradients are also zeroed before the global-norm clip.
+
+With ``grad_noise_cosine`` c (backprop only) every update's gradient is
+replaced, module by module, by a vector of the same norm and support at
+cosine exactly c to it, with a seeded random orthogonal part
+(``noise_gradients``).
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 import numpy as np
 import optax
 
@@ -161,6 +167,9 @@ CONTROL_SETTINGS = (
     "pc_eta_max",
     "pc_eta_backoff",
 )
+GRAD_NOISE_SETTINGS = ("grad_noise_cosine", "grad_noise_seed", "grad_noise_mode")
+GRAD_NOISE_MODES = ("fresh", "persistent")
+GRAD_NOISE_TAG = 0x6E6F6973
 ETA_DROP_EMA = 0.7
 ETA_STEP_CLIP = (0.5, 2.0)
 RESUME_IGNORED_KEYS = (
@@ -175,6 +184,7 @@ COMPARE_IGNORED_KEYS = (
     "log_interval",
     "init_perturbation",
     "init_perturbation_seed",
+    *GRAD_NOISE_SETTINGS,
 )
 ANALYSIS_FILES = (
     "drift.json",
@@ -218,6 +228,12 @@ class RunConfig:
     update so the measured relative energy drop tracks ``pc_energy_target``
     (``control_eta``), within ``eta_bounds``; the rate restarts at
     ``pc_eta_infer`` at every stage.
+
+    ``grad_noise_cosine`` c (backprop only, None = off) replaces each
+    module's gradient by one of equal norm and support at cosine c to it,
+    with a random orthogonal part seeded by ``grad_noise_seed``
+    (``noise_gradients``); ``grad_noise_mode="fresh"`` draws it anew every
+    update, ``"persistent"`` once per stage and module.
     """
 
     checkpoint: str
@@ -265,6 +281,9 @@ class RunConfig:
     pc_eta_backoff: float = 0.5
     init_perturbation: float = 0.0
     init_perturbation_seed: int = 0
+    grad_noise_cosine: float | None = None
+    grad_noise_seed: int = 0
+    grad_noise_mode: str = "fresh"
     gate: str = "none"
     gate_beta: float = 1.0
     gate_modules: tuple[str, ...] = ()
@@ -314,7 +333,37 @@ class RunConfig:
             if self.pc_inference in ITERATIVE_PC:
                 self._validate_iterative()
         self._validate_eta_control()
+        self._validate_grad_noise()
         self._validate_gate()
+
+    def _validate_grad_noise(self) -> None:
+        """Gradient noise is a backprop control with a cosine in (0, 1)."""
+        if self.grad_noise_mode not in GRAD_NOISE_MODES:
+            raise ValueError(
+                f"grad_noise_mode must be one of {GRAD_NOISE_MODES}, "
+                f"got {self.grad_noise_mode!r}"
+            )
+        cosine = self.grad_noise_cosine
+        if cosine is None:
+            unused = [
+                name
+                for name, default in (
+                    ("grad_noise_seed", 0),
+                    ("grad_noise_mode", "fresh"),
+                )
+                if getattr(self, name) != default
+            ]
+            if unused:
+                raise ValueError(f"{', '.join(unused)} need grad_noise_cosine")
+            return
+        if self.mode != "backprop":
+            raise ValueError("grad_noise_cosine needs mode 'backprop'")
+        if not (math.isfinite(cosine) and 0.0 < cosine < 1.0):
+            raise ValueError(
+                "grad_noise_cosine must be finite and in (0, 1); None turns it off"
+            )
+        if not 0 <= self.grad_noise_seed < 2**32:
+            raise ValueError("grad_noise_seed must be in [0, 2**32)")
 
     def _validate_eta_control(self) -> None:
         """The rate controller's settings apply only to ePC runs that enable it."""
@@ -500,9 +549,10 @@ class RunConfig:
         """The settings that must match for a run to be resumed.
 
         ``training`` is left out for sequential runs, every gate setting
-        for ungated runs and every rate-controller setting for uncontrolled
-        runs, so their identity is unchanged from before joint training,
-        gates and the controller existed.
+        for ungated runs, every rate-controller setting for uncontrolled
+        runs and both gradient-noise settings for runs without it, so their
+        identity is unchanged from before joint training, gates, the
+        controller and gradient noise existed.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
@@ -517,6 +567,9 @@ class RunConfig:
             values["gate_source"] = list(self.gate_source)
         if values["pc_eta_control"] == "none":
             for key in ("pc_eta_control", *CONTROL_DEFAULTS):
+                values.pop(key)
+        if values["grad_noise_cosine"] is None:
+            for key in GRAD_NOISE_SETTINGS:
                 values.pop(key)
         values["domains"] = list(self.domains)
         return values
@@ -1013,6 +1066,93 @@ def accumulate_gradients(
     )
 
 
+def grad_noise_key(
+    seed: jax.Array | int,
+    stage: jax.Array | int,
+    update: jax.Array | int,
+    index: int,
+    persistent: bool = False,
+) -> jax.Array:
+    """The key of one module's noise draw.
+
+    ``fold_in`` of ``PRNGKey(seed)`` with ``GRAD_NOISE_TAG``, the mode
+    (0 fresh, 1 persistent), ``stage``, ``update`` (fresh only) and the
+    module ``index``; the tag keeps it apart from the training keys, which
+    start from ``fold_in(PRNGKey(seed), stage)``.
+    """
+    key = jax.random.fold_in(jax.random.PRNGKey(seed), GRAD_NOISE_TAG)
+    key = jax.random.fold_in(key, int(persistent))
+    key = jax.random.fold_in(key, stage)
+    if not persistent:
+        key = jax.random.fold_in(key, update)
+    return jax.random.fold_in(key, index)
+
+
+def _noise_gradients(
+    grads: GraphParams,
+    cosine: jax.Array,
+    seed: jax.Array,
+    stage: jax.Array,
+    update: jax.Array,
+    persistent: bool = False,
+) -> tuple[GraphParams, jax.Array]:
+    """Rotate every module's gradient to cosine ``cosine`` with itself.
+
+    Each entry of ``grads.nodes`` is one module, its parameter subtree
+    flattened to a vector g with support m = (g ≠ 0). With ĝ = g/‖g‖,
+    r = m ⊙ N(0, I) drawn with ``grad_noise_key`` (``index`` the module's
+    position in the sorted node names; ``persistent`` leaves ``update`` out,
+    so r is the same at every update of a stage), u = r − (r·ĝ)ĝ (projected
+    twice) and û = u/‖u‖, g becomes ‖g‖·(c·ĝ + sqrt(1 − c²)·û): cosine c
+    with g, the same norm, and exact zeros off its support. A module with
+    g = 0, or whose u vanishes (a gradient with one nonzero entry), is
+    returned unchanged. Also returns the mean realised cosine over the
+    modules that were rotated (NaN if there are none).
+    """
+    noised = {}
+    cosines = []
+    applied = []
+    for index, name in enumerate(sorted(grads.nodes)):
+        flat, unravel = ravel_pytree(grads.nodes[name])
+        if flat.size == 0:
+            noised[name] = grads.nodes[name]
+            continue
+        scale = jnp.max(jnp.abs(flat))
+        nonzero = scale > 0
+        safe_scale = jnp.where(nonzero, scale, 1.0)
+        scaled = flat / safe_scale
+        scaled_norm = jnp.linalg.norm(scaled)
+        unit = scaled / jnp.where(nonzero, scaled_norm, 1.0)
+        key = grad_noise_key(seed, stage, update, index, persistent)
+        r = jax.random.normal(key, flat.shape, flat.dtype) * (flat != 0)
+        u = r - jnp.dot(r, unit) * unit
+        u = u - jnp.dot(u, unit) * unit
+        u_norm = jnp.linalg.norm(u)
+        usable = nonzero & (u_norm > 1e-6 * jnp.linalg.norm(r))
+        c = jnp.asarray(cosine, flat.dtype)
+        direction = c * unit + jnp.sqrt(1 - c * c) * (
+            u / jnp.where(usable, u_norm, 1.0)
+        )
+        rotated = jnp.where(usable, (scale * scaled_norm) * direction, flat)
+        noised[name] = unravel(rotated)
+        rotated_scaled = rotated / safe_scale
+        cosines.append(
+            jnp.dot(rotated_scaled, unit)
+            / jnp.where(nonzero, jnp.linalg.norm(rotated_scaled), 1.0)
+        )
+        applied.append(usable)
+    if not cosines:
+        return grads._replace(nodes=noised), jnp.asarray(jnp.nan)
+    weights = jnp.stack(applied).astype(jnp.float32)
+    achieved = jnp.sum(weights * jnp.stack(cosines).astype(jnp.float32)) / jnp.sum(
+        weights
+    )
+    return grads._replace(nodes=noised), achieved
+
+
+noise_gradients = jax.jit(_noise_gradients, static_argnames="persistent")
+
+
 class RegimeProbe(Protocol):
     """``(params, batch, key, eta_infer=None) -> (spectrum, final_spectrum)``."""
 
@@ -1348,7 +1488,13 @@ def train_stage(
     each log entry adds ``eta_infer`` (the rate it used), ``eta_next``,
     ``eta_backoff`` and ``pc_energy_rel_decrease_ema`` (``control_eta``), and
     the exposure record adds the stage's rate range, mean and last used
-    value under ``eta_infer``.
+    value under ``eta_infer``. With ``grad_noise_cosine`` each update's
+    gradient is noised (``noise_gradients`` with the stage and the 1-based
+    update index) after accumulation, so ``grad_norm`` and ``clipped``
+    describe the noised gradient the optimizer sees, and each log entry adds
+    ``grad_noise_cosine``, ``grad_noise_mode`` and ``grad_noise_achieved``,
+    the mean realised cosine over the rotated modules. The noise keys are separate
+    from the batch and dropout keys, so batches and masks are unchanged.
     Returns the params, the exposure record and the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
@@ -1428,6 +1574,17 @@ def train_stage(
                     eta_infer=jnp.asarray(eta) if controlled else None,
                 )
             )
+            noise_achieved = None
+            if config.grad_noise_cosine is not None:
+                pending_grads, achieved = noise_gradients(
+                    pending_grads,
+                    jnp.asarray(config.grad_noise_cosine, jnp.float32),
+                    jnp.asarray(config.grad_noise_seed, jnp.uint32),
+                    jnp.asarray(stage, jnp.uint32),
+                    jnp.asarray(updates + 1, jnp.uint32),
+                    persistent=config.grad_noise_mode == "persistent",
+                )
+                noise_achieved = float(achieved)
             grad_norm = float(clip_norm_fn(pending_grads))
             params, opt_state = update_fn(
                 params, opt_state, pending_grads, jnp.asarray(pending_count)
@@ -1445,6 +1602,10 @@ def train_stage(
                     and grad_norm > config.clip_norm
                 ),
             }
+            if noise_achieved is not None:
+                entry["grad_noise_cosine"] = config.grad_noise_cosine
+                entry["grad_noise_mode"] = config.grad_noise_mode
+                entry["grad_noise_achieved"] = noise_achieved
             if config.mode == "pc":
                 entry["pc_total_energy"] = float(
                     np.mean([float(e["pc_total_energy"]) for e in pending_extras])
@@ -1845,6 +2006,18 @@ def run_domain_forgetting(
     }
     if gate_plan is not None:
         run_config["gate"] = gate_plan.describe()
+    if config.grad_noise_cosine is not None:
+        run_config["grad_noise"] = {
+            "cosine": config.grad_noise_cosine,
+            "seed": config.grad_noise_seed,
+            "mode": config.grad_noise_mode,
+            "rule": "per module g -> |g| (c g/|g| + sqrt(1 - c^2) u), "
+            "u a unit N(0, I) direction on the support of g, orthogonal to g; "
+            "zero g unchanged",
+            "key": "fold_in(PRNGKey(seed), tag, mode, stage, update (fresh "
+            "only), sorted module index)",
+            "applied": "after accumulation, before the clip",
+        }
     run_config_path = output / "run_config.json"
     previous_config = _read_json(run_config_path) if resume else None
     if previous_config is not None and json.loads(
@@ -2276,7 +2449,8 @@ def check_comparable_runs(
     """Return why two ``run_config.json`` payloads cannot be compared (empty if fine).
 
     The configs must be equal except for ``mode``, ``pc_*``, ``output_dir``,
-    ``log_interval`` and ``init_perturbation`` (with its seed), with equal
+    ``log_interval``, ``init_perturbation`` (with its seed) and
+    ``grad_noise_*``, with equal
     validation and train-array SHA-256s, the same source parameters and the
     same domain order.
     """
@@ -2298,9 +2472,9 @@ def check_comparable_runs(
 def compare_runs(run_dir: str | Path, reference_dir: str | Path) -> dict[str, Any]:
     """Compare a run with a reference run of the same setup.
 
-    Used for PC vs BP and for BP vs a BP run from a perturbed initialisation
-    (the float32 noise floor). Raises ``ValueError`` unless
-    ``check_comparable_runs`` passes.
+    Used for PC vs BP, for BP vs a BP run from a perturbed initialisation
+    (the float32 noise floor) and for gradient-noised BP vs PC or BP. Raises
+    ``ValueError`` unless ``check_comparable_runs`` passes.
     """
     run_path, reference_path = Path(run_dir), Path(reference_dir)
     run_config = json.loads((run_path / "run_config.json").read_text())
@@ -2321,6 +2495,10 @@ def compare_runs(run_dir: str | Path, reference_dir: str | Path) -> dict[str, An
         "init_perturbation": [
             run_config["config"].get("init_perturbation", 0.0),
             reference_config["config"].get("init_perturbation", 0.0),
+        ],
+        "grad_noise_cosine": [
+            run_config["config"].get("grad_noise_cosine"),
+            reference_config["config"].get("grad_noise_cosine"),
         ],
         **pc_bp_agreement(
             ce_run,
