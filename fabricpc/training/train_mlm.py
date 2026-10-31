@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, Tuple, cast
+from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -471,7 +471,9 @@ def pc_node_gradient_norms(
 
 
 def create_pc_bp_gradient_comparison(
-    structure: GraphStructure, forward_updates: str = "none"
+    structure: GraphStructure,
+    forward_updates: str = "none",
+    grad_transform: Optional[Callable[[GraphParams], GraphParams]] = None,
 ):
     """Create a JIT-compiled per-node PC vs backprop gradient comparison.
 
@@ -483,6 +485,8 @@ def create_pc_bp_gradient_comparison(
     ratio rather than against one. PC gradients use the training rule
     selected by ``forward_updates``. An optional traced ``eta_infer``
     overrides ``EPCInference``'s rate (``get_graph_param_gradient_pcn_mlm``).
+    ``grad_transform``, when given, maps both gradients (e.g. to another
+    parameterisation) before they are compared.
     """
     _validate_forward_updates(forward_updates)
     _validate_feedforward_start(structure, forward_updates)
@@ -495,6 +499,8 @@ def create_pc_bp_gradient_comparison(
         _loss, bp_grads, _count = _loss_and_grad_backprop_mlm_no_update(
             params, batch, structure, rng_key
         )
+        if grad_transform is not None:
+            pc_grads, bp_grads = grad_transform(pc_grads), grad_transform(bp_grads)
         result = {}
         for name, pc_node in pc_grads.nodes.items():
             pc_leaves = jax.tree_util.tree_leaves(pc_node)
