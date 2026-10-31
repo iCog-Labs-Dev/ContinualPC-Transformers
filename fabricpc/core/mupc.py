@@ -362,3 +362,27 @@ def compute_mupc_scalings(
         )
 
     return scalings
+
+
+def jacobian_only_scalings(factors: MuPCScalingFactors) -> MuPCScalingFactors:
+    """Return ``factors`` with the forward scaling removed.
+
+    Every scaled edge gets forward scale 1 and top-down scale ``topdown /
+    forward``, its ``jacobian_gain``; the self-gradient and weight-gradient
+    scales are kept. Unit factors are left out of ``forward_scale`` and
+    ``topdown_grad_scale`` (an absent edge passes through unchanged), so the
+    forward pass and its autodiff are exactly the unscaled graph's. On
+    weights stored as ``W / a`` the full factors give the same latent
+    dynamics as these factors on ``W``, since ``(W / a)(a x) = W x`` and
+    ``a · (W / a)ᵀ δ = Wᵀ δ``.
+    """
+    gains = {
+        key: factors.topdown_grad_scale[key] / a
+        for key, a in factors.forward_scale.items()
+    }
+    return MuPCScalingFactors(
+        forward_scale={},
+        self_grad_scale=factors.self_grad_scale,
+        topdown_grad_scale={key: g for key, g in gains.items() if g != 1.0},
+        weight_grad_scale=dict(factors.weight_grad_scale),
+    )

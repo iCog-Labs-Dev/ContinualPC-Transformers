@@ -9,7 +9,8 @@ classification head.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +19,7 @@ from fabricpc.core.activations import IdentityActivation, SoftmaxActivation
 from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.inference import InferenceBase
 from fabricpc.core.initializers import InitializerBase, NormalInitializer, initialize
-from fabricpc.core.mupc import MuPCConfig
+from fabricpc.core.mupc import MuPCConfig, jacobian_only_scalings
 from fabricpc.core.topology import Edge
 from fabricpc.core.types import (
     GraphParams,
@@ -43,6 +44,7 @@ from fabricpc.utils.helpers import layernorm
 
 ARCHITECTURES = ("encoder", "bert")
 BERT_LN_EPS = 1e-12
+MUPC_MODES = ("off", "jacobian", "full")
 
 
 class AddPositionEmbeddingNode(NodeBase):
@@ -612,8 +614,195 @@ def _resolve_residual_identity(
     return bool(residual_identity)
 
 
-def _graph_scaling(architecture: str) -> Optional[MuPCConfig]:
-    return None if architecture == "bert" else MuPCConfig(include_output=False)
+def _resolve_mupc(architecture: str, mupc: Optional[str]) -> Optional[str]:
+    """Return the BERT μPC mode (``"off"`` by default), or None for the encoder.
+
+    The pre-LN encoder always keeps its own μPC scaling; it accepts only
+    ``None`` or ``"off"``, meaning no BERT μPC mode.
+    """
+    if architecture != "bert":
+        if mupc not in (None, "off"):
+            raise ValueError("mupc is only configurable for architecture='bert'")
+        return None
+    if mupc is None:
+        return "off"
+    if mupc not in MUPC_MODES:
+        raise ValueError(f"mupc must be one of {MUPC_MODES}, got {mupc!r}")
+    return mupc
+
+
+def _graph_scaling(
+    architecture: str, mupc: Optional[str] = None
+) -> Optional[MuPCConfig]:
+    if architecture != "bert":
+        return MuPCConfig(include_output=False)
+    return None if mupc in (None, "off") else MuPCConfig(include_output=False)
+
+
+def _apply_bert_mupc(structure: GraphStructure, mupc: Optional[str]) -> GraphStructure:
+    """Adapt ``compute_mupc_scalings``' factors to a BERT μPC mode.
+
+    Edges into parameterless ``IdentityNode`` s (the ``L{i}_residual`` nodes)
+    stay unscaled in both modes, so the factors equal μPC of the
+    ``residual_identity=False`` graph, where the attention output reaches
+    ``L{i}_mlp2``'s non-scalable residual slot directly: the identity node
+    only relays the residual stream, has no weight that could absorb ``a``,
+    and its ``jacobian_gain`` is 1. Residual depth ``L`` counts skip slots
+    and is the same for both graphs.
+    ``"jacobian"`` replaces every remaining node's factors by
+    ``jacobian_only_scalings``, so only the edges into GELU nodes keep a
+    factor. Nodes left without a factor get none. A μPC mode is recorded as
+    ``structure.config["mupc"]``; ``"off"`` and the encoder return
+    ``structure`` unchanged.
+    """
+    if mupc in (None, "off"):
+        return structure
+    nodes = {}
+    for name, node in structure.nodes.items():
+        info = node.node_info
+        factors = info.scaling_config
+        if factors is not None and info.node_class is IdentityNode:
+            factors = None
+        if factors is not None and mupc == "jacobian":
+            factors = jacobian_only_scalings(factors)
+        if factors is not None and not (
+            factors.forward_scale or factors.topdown_grad_scale
+        ):
+            factors = None
+        if factors is not info.scaling_config:
+            node = node._with_graph_info(replace(info, scaling_config=factors))
+        nodes[name] = node
+    return structure._replace(nodes=nodes, config={**structure.config, "mupc": mupc})
+
+
+@dataclass(frozen=True)
+class LinearInputRule:
+    """Weights that a node applies linearly first to one slot's input.
+
+    ``applies`` checks the node's config and wiring; ``requirement`` names
+    what it checks, for the error message.
+    """
+
+    weights: Tuple[str, ...]
+    applies: Callable[[NodeInfo], bool]
+    requirement: str
+
+
+def _has_slot_edge(info: NodeInfo, slot: str) -> bool:
+    return bool(info.slots[slot].in_neighbors) if slot in info.slots else False
+
+
+MUPC_LINEAR_INPUTS: Dict[Tuple[type, str], LinearInputRule] = {
+    (MhaResidualNode, "in"): LinearInputRule(
+        ("W_q", "W_k", "W_v"),
+        lambda info: info.node_config.get("norm_position", "pre") == "post"
+        and _has_slot_edge(info, "skip"),
+        "norm_position='post' and a skip edge",
+    ),
+    (LnMlp1Node, "in"): LinearInputRule(
+        ("W_ff1",),
+        lambda info: not info.node_config.get("pre_ln", True),
+        "pre_ln=False",
+    ),
+    (Mlp2ResidualNode, "in"): LinearInputRule(
+        ("W_ff2",),
+        lambda info: _has_slot_edge(info, "residual"),
+        "a residual edge",
+    ),
+    (MlmTransformNode, "in"): LinearInputRule(("W_t",), lambda info: True, "none"),
+}
+
+
+def mupc_weight_scales(structure: GraphStructure) -> Dict[str, Dict[str, float]]:
+    """Return ``{node: {weight: a}}`` for every weight behind a scaled edge.
+
+    Each scaled edge must match an entry of ``MUPC_LINEAR_INPUTS`` (exact node
+    class and slot, with its requirement met), so its input reaches only
+    those weights, linearly, before anything else. Raises ``ValueError`` for
+    any other scaled edge, and when two scaled edges of a node would give a
+    weight different factors.
+    """
+    scales: Dict[str, Dict[str, float]] = {}
+    for name in structure.node_order:
+        info = structure.nodes[name].node_info
+        factors = info.scaling_config
+        if factors is None:
+            continue
+        node_scales: Dict[str, float] = {}
+        for edge_key, a in factors.forward_scale.items():
+            slot = structure.edges[edge_key].slot
+            rule = MUPC_LINEAR_INPUTS.get((info.node_class, slot))
+            if rule is None or not rule.applies(info):
+                needs = "" if rule is None else f" (needs {rule.requirement})"
+                raise ValueError(
+                    f"{edge_key}: no function-preserving μPC load for a scaled "
+                    f"input into {info.node_type} slot {slot!r}{needs}"
+                )
+            for weight in rule.weights:
+                if weight in node_scales and node_scales[weight] != a:
+                    raise ValueError(
+                        f"{name}.{weight} is behind scaled edges with different a"
+                    )
+                node_scales[weight] = float(a)
+        if node_scales:
+            scales[name] = node_scales
+    return scales
+
+
+def is_mupc_full(structure: GraphStructure) -> bool:
+    """Whether ``structure`` was built with ``mupc="full"``."""
+    return structure.config.get("mupc") == "full"
+
+
+def _rescale_weights(
+    structure: GraphStructure, params: GraphParams, divide: bool
+) -> GraphParams:
+    if not is_mupc_full(structure):
+        raise ValueError("the W / a conversion needs a graph built with mupc='full'")
+    nodes = dict(params.nodes)
+    for name, node_scales in mupc_weight_scales(structure).items():
+        node = params.nodes[name]
+        weights = dict(node.weights)
+        for weight, a in node_scales.items():
+            value = weights[weight]
+            weights[weight] = (value / a if divide else value * a).astype(value.dtype)
+        nodes[name] = NodeParams(weights=weights, biases=dict(node.biases))
+    return GraphParams(nodes=nodes)
+
+
+def mupc_function_preserving_params(
+    structure: GraphStructure, params: GraphParams
+) -> GraphParams:
+    """Store each weight behind a scaled edge of a ``mupc="full"`` graph as ``W / a``.
+
+    ``params`` are in the unscaled parameterisation (e.g. converted Hugging
+    Face weights). Because each scaled input ``a x`` meets only these
+    weights first, ``(W / a)(a x) = W x`` and the returned params compute
+    the same function under ``structure``. Biases, LayerNorm parameters,
+    embeddings and the output head are unchanged. Raises ``ValueError``
+    unless ``structure`` is a ``mupc="full"`` graph that
+    ``mupc_weight_scales`` accepts. ``mupc_plain_params`` is the inverse.
+    """
+    return _rescale_weights(structure, params, divide=True)
+
+
+def mupc_plain_params(structure: GraphStructure, params: GraphParams) -> GraphParams:
+    """Return ``W`` from params stored as ``W / a`` under a ``mupc="full"`` graph.
+
+    The inverse of ``mupc_function_preserving_params`` (to rounding): the
+    result computes the same function under the ``"off"`` or ``"jacobian"``
+    graph of the same shape.
+    """
+    return _rescale_weights(structure, params, divide=False)
+
+
+def mupc_plain_grads(structure: GraphStructure, grads: GraphParams) -> GraphParams:
+    """Map gradients with respect to ``W / a`` to gradients with respect to ``W``.
+
+    ``∂E/∂W = (∂E/∂(W / a)) / a`` for each rescaled weight; every other leaf
+    is unchanged.
+    """
+    return _rescale_weights(structure, grads, divide=True)
 
 
 def create_encoder_sentiment_classifier(
@@ -635,12 +824,14 @@ def create_encoder_sentiment_classifier(
     architecture: str = "encoder",
     ln_eps: Optional[float] = None,
     residual_identity: Optional[bool] = None,
+    mupc: Optional[str] = None,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for sequence classification.
 
-    ``architecture`` and ``ln_eps`` select the backbone as in
+    ``architecture``, ``ln_eps`` and ``mupc`` select the backbone as in
     ``create_encoder_mlm_model``.
     """
+    resolved_mupc = _resolve_mupc(architecture, mupc)
     _validate_encoder_config(
         depth=depth,
         embed_dim=embed_dim,
@@ -710,9 +901,10 @@ def create_encoder_sentiment_classifier(
             **task_kwargs,
         ),
         inference=inference,
-        scaling=_graph_scaling(architecture),
+        scaling=_graph_scaling(architecture, resolved_mupc),
         graph_state_initializer=FeedforwardStateInit(),
     )
+    structure = _apply_bert_mupc(structure, resolved_mupc)
     return structure._replace(
         config={**structure.config, "dropout_rate": float(dropout_rate)}
     )
@@ -737,6 +929,7 @@ def create_encoder_mlm_model(
     architecture: str = "encoder",
     ln_eps: Optional[float] = None,
     residual_identity: Optional[bool] = None,
+    mupc: Optional[str] = None,
 ) -> GraphStructure:
     """Create a bidirectional encoder transformer for masked LM pretraining.
 
@@ -749,8 +942,17 @@ def create_encoder_mlm_model(
     ``residual_identity`` (default on for ``"bert"``) adds the parameterless
     ``L{i}_residual`` nodes that keep spike-only PC exact; turn it off for
     standard PC runs that should keep BERT's direct residual edges.
+
+    ``mupc`` (``"bert"`` only) selects μPC for BERT: ``"off"`` (default) has
+    no scaling; ``"full"`` attaches ``compute_mupc_scalings``' factors
+    (``include_output=False``) and needs its weights loaded through
+    ``mupc_function_preserving_params``; ``"jacobian"`` keeps only the
+    top-down Jacobian gain on the same edges (``jacobian_only_scalings``)
+    and uses the weights as they are. Under standard PC inference the two
+    give the same latent dynamics; they differ in what the optimiser sees.
     """
     resolved_ln_eps = _resolve_ln_eps(architecture, ln_eps)
+    resolved_mupc = _resolve_mupc(architecture, mupc)
     _validate_encoder_config(
         depth=depth,
         embed_dim=embed_dim,
@@ -830,9 +1032,10 @@ def create_encoder_mlm_model(
             **task_kwargs,
         ),
         inference=inference,
-        scaling=_graph_scaling(architecture),
+        scaling=_graph_scaling(architecture, resolved_mupc),
         graph_state_initializer=FeedforwardStateInit(),
     )
+    structure = _apply_bert_mupc(structure, resolved_mupc)
     return structure._replace(
         config={**structure.config, "dropout_rate": float(dropout_rate)}
     )
