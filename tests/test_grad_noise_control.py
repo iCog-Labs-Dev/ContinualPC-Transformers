@@ -478,6 +478,21 @@ def test_one_draw_per_update_with_micro_batches(setup, tmp_path, monkeypatch):
             {"grad_noise_cosine": 0.9, "grad_noise_seed": 2**32},
             r"in \[0, 2\*\*32\)",
         ),
+        (
+            {"grad_noise_stage_cosines": (0.9,) * len(DOMAINS)},
+            "grad_noise_stage_cosines need grad_noise_cosine",
+        ),
+        (
+            {"grad_noise_cosine": 0.9, "grad_noise_stage_cosines": (0.9,)},
+            "grad_noise_stage_cosines has 1 values",
+        ),
+        (
+            {
+                "grad_noise_cosine": 0.9,
+                "grad_noise_stage_cosines": (0.9,) * (len(DOMAINS) - 1) + (1.0,),
+            },
+            r"grad_noise_stage_cosines must be finite and in \(0, 1\)",
+        ),
     ],
 )
 def test_validation(overrides, message, tmp_path):
@@ -596,3 +611,68 @@ def test_cli_flags_reach_the_config(setup, tmp_path):
         grad_noise_seed=4,
         grad_noise_mode="persistent",
     )
+
+
+def test_stage_cosines_set_each_stage_and_record_the_schedule(setup, tmp_path):
+    """Each stage noises at its own cosine; the schedule is recorded and guarded."""
+    checkpoint, data_dir = setup
+    schedule = tuple(0.95 - 0.1 * i for i in range(len(DOMAINS)))
+    config = tiny_config(
+        checkpoint,
+        data_dir,
+        tmp_path / "scheduled",
+        grad_noise_cosine=0.89,
+        grad_noise_stage_cosines=schedule,
+        grad_noise_mode="persistent",
+    )
+    run_domain_forgetting(config, verbose=False)
+    out = Path(config.output_dir)
+    for stage, cosine in enumerate(schedule, start=1):
+        log = [
+            json.loads(line)
+            for line in (out / f"training_log_stage_{stage}.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert all(e["grad_noise_cosine"] == pytest.approx(cosine) for e in log)
+        assert all(abs(e["grad_noise_achieved"] - cosine) < 1e-5 for e in log)
+    recorded = json.loads((out / "run_config.json").read_text())
+    assert recorded["config"]["grad_noise_stage_cosines"] == list(schedule)
+    assert recorded["grad_noise"]["stage_cosines"] == list(schedule)
+    with pytest.raises(ValueError, match="cannot resume with a different setup"):
+        run_domain_forgetting(
+            replace(config, grad_noise_stage_cosines=()), resume=True, verbose=False
+        )
+    run_domain_forgetting(config, resume=True, verbose=False)
+
+
+def test_identity_omits_an_empty_schedule(tmp_path):
+    """A noised run without a schedule keeps the identity it had before."""
+    noisy = tiny_config("ck", "data", tmp_path, grad_noise_cosine=0.89)
+    assert "grad_noise_stage_cosines" not in noisy.identity()
+    assert noisy.noise_cosine(1) == 0.89
+    scheduled = replace(noisy, grad_noise_stage_cosines=(0.9,) * len(DOMAINS))
+    assert scheduled.identity()["grad_noise_stage_cosines"] == [0.9] * len(DOMAINS)
+
+
+def test_cli_stage_cosines_reach_the_config(setup, tmp_path):
+    from examples import mlm_domain_forgetting as cli
+
+    checkpoint, data_dir = setup
+    argv = [
+        "--checkpoint",
+        str(checkpoint),
+        "--data_dir",
+        str(data_dir),
+        "--domains",
+        *DOMAINS,
+        "--output_dir",
+        str(tmp_path),
+        "--skip_shape_check",
+        "--grad_noise_cosine",
+        "0.89",
+        "--grad_noise_stage_cosines",
+        *["0.9"] * len(DOMAINS),
+    ]
+    config = cli.config_from_args(cli.build_parser().parse_args(argv))
+    assert config.grad_noise_stage_cosines == (0.9,) * len(DOMAINS)
