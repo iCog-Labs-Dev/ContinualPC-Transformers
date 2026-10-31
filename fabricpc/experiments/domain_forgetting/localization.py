@@ -343,7 +343,7 @@ def load_run(
     path = Path(run_dir)
     run_config = json.loads((path / "run_config.json").read_text())
     values = dict(run_config["config"])
-    for key in ("domains", "gate_modules", "gate_source"):
+    for key in ("domains", "gate_modules", "gate_source", "grad_noise_stage_cosines"):
         if key in values:
             values[key] = tuple(values[key])
     config = RunConfig(**values, output_dir=str(path))

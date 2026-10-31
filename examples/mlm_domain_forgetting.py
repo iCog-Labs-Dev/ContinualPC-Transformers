@@ -221,6 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replace each module's gradient by one of equal norm at cosine C "
         "to it with a random orthogonal part, C in (0, 1) (backprop only)",
     )
+    parser.add_argument(
+        "--grad_noise_stage_cosines",
+        type=float,
+        nargs="+",
+        default=list(defaults.grad_noise_stage_cosines),
+        metavar="C",
+        help="One cosine per stage, replacing --grad_noise_cosine stage by stage",
+    )
     parser.add_argument("--grad_noise_seed", type=int, default=defaults.grad_noise_seed)
     parser.add_argument(
         "--grad_noise_mode",
@@ -489,6 +497,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         grad_noise_cosine=args.grad_noise_cosine,
         grad_noise_seed=args.grad_noise_seed,
         grad_noise_mode=args.grad_noise_mode,
+        grad_noise_stage_cosines=tuple(args.grad_noise_stage_cosines),
         pc_mupc=args.pc_mupc,
         gate=args.gate,
         gate_beta=args.gate_beta,

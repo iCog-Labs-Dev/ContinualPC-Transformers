@@ -175,7 +175,12 @@ CONTROL_SETTINGS = (
     "pc_eta_max",
     "pc_eta_backoff",
 )
-GRAD_NOISE_SETTINGS = ("grad_noise_cosine", "grad_noise_seed", "grad_noise_mode")
+GRAD_NOISE_SETTINGS = (
+    "grad_noise_cosine",
+    "grad_noise_seed",
+    "grad_noise_mode",
+    "grad_noise_stage_cosines",
+)
 GRAD_NOISE_MODES = ("fresh", "persistent")
 GRAD_NOISE_TAG = 0x6E6F6973
 ETA_DROP_EMA = 0.7
@@ -242,6 +247,8 @@ class RunConfig:
     with a random orthogonal part seeded by ``grad_noise_seed``
     (``noise_gradients``); ``grad_noise_mode="fresh"`` draws it anew every
     update, ``"persistent"`` once per stage and module.
+    ``grad_noise_stage_cosines`` (one value per stage, empty = off) replaces c
+    stage by stage (``noise_cosine``).
 
     ``pc_mupc`` selects μPC for the BERT graph (``create_encoder_mlm_model``'s
     ``mupc``): ``"full"`` loads every weight behind a scaled edge as ``W / a``
@@ -301,6 +308,7 @@ class RunConfig:
     grad_noise_cosine: float | None = None
     grad_noise_seed: int = 0
     grad_noise_mode: str = "fresh"
+    grad_noise_stage_cosines: tuple[float, ...] = ()
     pc_mupc: str = "off"
     gate: str = "none"
     gate_beta: float = 1.0
@@ -385,6 +393,7 @@ class RunConfig:
                 for name, default in (
                     ("grad_noise_seed", 0),
                     ("grad_noise_mode", "fresh"),
+                    ("grad_noise_stage_cosines", ()),
                 )
                 if getattr(self, name) != default
             ]
@@ -399,6 +408,25 @@ class RunConfig:
             )
         if not 0 <= self.grad_noise_seed < 2**32:
             raise ValueError("grad_noise_seed must be in [0, 2**32)")
+        stage_cosines = self.grad_noise_stage_cosines
+        if stage_cosines:
+            if len(stage_cosines) != len(self.stage_domains):
+                raise ValueError(
+                    f"grad_noise_stage_cosines has {len(stage_cosines)} values "
+                    f"for {len(self.stage_domains)} stages"
+                )
+            if not all(math.isfinite(c) and 0.0 < c < 1.0 for c in stage_cosines):
+                raise ValueError(
+                    "grad_noise_stage_cosines must be finite and in (0, 1)"
+                )
+
+    def noise_cosine(self, stage: int) -> float:
+        """The gradient-noise cosine of ``stage`` (1-based)."""
+        if self.grad_noise_cosine is None:
+            raise ValueError("gradient noise is off")
+        if self.grad_noise_stage_cosines:
+            return float(self.grad_noise_stage_cosines[stage - 1])
+        return float(self.grad_noise_cosine)
 
     def _validate_eta_control(self) -> None:
         """The rate controller's settings apply only to ePC runs that enable it."""
@@ -607,6 +635,10 @@ class RunConfig:
         if values["grad_noise_cosine"] is None:
             for key in GRAD_NOISE_SETTINGS:
                 values.pop(key)
+        elif not values["grad_noise_stage_cosines"]:
+            values.pop("grad_noise_stage_cosines")
+        else:
+            values["grad_noise_stage_cosines"] = list(self.grad_noise_stage_cosines)
         if values["pc_mupc"] == "off":
             values.pop("pc_mupc")
         values["domains"] = list(self.domains)
@@ -1661,7 +1693,7 @@ def train_stage(
             if config.grad_noise_cosine is not None:
                 pending_grads, achieved = noise_gradients(
                     pending_grads,
-                    jnp.asarray(config.grad_noise_cosine, jnp.float32),
+                    jnp.asarray(config.noise_cosine(stage), jnp.float32),
                     jnp.asarray(config.grad_noise_seed, jnp.uint32),
                     jnp.asarray(stage, jnp.uint32),
                     jnp.asarray(updates + 1, jnp.uint32),
@@ -1686,7 +1718,7 @@ def train_stage(
                 ),
             }
             if noise_achieved is not None:
-                entry["grad_noise_cosine"] = config.grad_noise_cosine
+                entry["grad_noise_cosine"] = config.noise_cosine(stage)
                 entry["grad_noise_mode"] = config.grad_noise_mode
                 entry["grad_noise_achieved"] = noise_achieved
             if config.mode == "pc":
@@ -2094,6 +2126,7 @@ def run_domain_forgetting(
     if config.grad_noise_cosine is not None:
         run_config["grad_noise"] = {
             "cosine": config.grad_noise_cosine,
+            "stage_cosines": list(config.grad_noise_stage_cosines) or None,
             "seed": config.grad_noise_seed,
             "mode": config.grad_noise_mode,
             "rule": "per module g -> |g| (c g/|g| + sqrt(1 - c^2) u), "
