@@ -15,6 +15,11 @@ their squared update ``Σ (θ_ref − θ_cur)²`` reaches the module's
 
 Every analysis records the run's stage ``params_sha256`` values and
 validation SHA-256s (``run_provenance``) so stale results can be refused.
+
+A ``pc_mupc="full"`` run stores ``W / a``; ``load_run`` converts its
+snapshots to plain ``W`` on the equivalent ``"jacobian"`` graph, so every
+parameter-space measure is in the same units as for other runs, and the
+provenance records the conversion under ``mupc``.
 """
 
 from __future__ import annotations
@@ -33,9 +38,12 @@ from fabricpc.experiments.domain_forgetting.artifacts import file_sha256, load_n
 from fabricpc.experiments.domain_forgetting.data import load_domain_cache
 from fabricpc.experiments.domain_forgetting.runner import (
     RunConfig,
+    build_structure,
+    flatten_params,
     load_base_model,
     params_from_flat,
 )
+from fabricpc.nodes.encoder_transformer import mupc_plain_params
 from fabricpc.experiments.domain_forgetting.validation import MultiDomainEvaluator
 
 FlatParams = Mapping[str, np.ndarray]
@@ -302,6 +310,7 @@ class RunContext:
     domains: list[str]
     snapshots: list[dict[str, np.ndarray]]
     valid_sets: dict[str, dict[str, np.ndarray]]
+    mupc_conversion: dict[str, str] | None = None
 
     def params(self, stage_or_flat: int | FlatParams) -> GraphParams:
         """Return graph params for a stage index or a flat parameter dict."""
@@ -326,6 +335,10 @@ def load_run(
     and every domain cache against the validation SHA-256 recorded in
     ``run_config.json``. ``checkpoint`` and ``data_dir`` override the
     recorded paths; ``max_valid_windows`` defaults to the run's setting.
+    For a ``pc_mupc="full"`` run the snapshots are converted to plain ``W``
+    (``mupc_plain_params``) and the config and graph are the run's with
+    ``pc_mupc="jacobian"``, which computes the same function and the same
+    PC dynamics on plain ``W``; ``mupc_conversion`` records this.
     """
     path = Path(run_dir)
     run_config = json.loads((path / "run_config.json").read_text())
@@ -360,6 +373,24 @@ def load_run(
         if file_sha256(snapshot_path) != entry["file_sha256"]:
             raise ValueError(f"{snapshot_path}: SHA-256 does not match the manifest")
         snapshots.append(load_npz(snapshot_path))
+    structure = base.structure
+    conversion = None
+    if config.pc_mupc == "full":
+        snapshots = [
+            flatten_params(
+                mupc_plain_params(structure, params_from_flat(flat, structure))
+            )
+            for flat in snapshots
+        ]
+        config = replace(config, pc_mupc="jacobian")
+        structure = build_structure(
+            base.model_config, config, structure.config["inference"]
+        )
+        conversion = {
+            "run": "full",
+            "params": "plain W = stored (W / a) * a",
+            "graph": "jacobian",
+        }
     seq_len = int(base.model_config["seq_len"])
     valid_sets = {}
     for name in domains:
@@ -377,17 +408,22 @@ def load_run(
         run_dir=path,
         config=config,
         run_config=run_config,
-        structure=base.structure,
+        structure=structure,
         model_config=base.model_config,
         domains=domains,
         snapshots=snapshots,
         valid_sets=valid_sets,
+        mupc_conversion=conversion,
     )
 
 
 def run_provenance(context: RunContext) -> dict[str, Any]:
-    """Return the stage ``params_sha256`` values and validation SHA-256s used."""
-    return {
+    """Return the stage ``params_sha256`` values and validation SHA-256s used.
+
+    ``mupc`` holds ``context.mupc_conversion`` when the snapshots were
+    converted.
+    """
+    provenance: dict[str, Any] = {
         "stage_params_sha256": stage_params_sha256(context.run_dir),
         "valid_sha256": dict(context.run_config["valid_sha256"]),
         "num_valid_windows": {
@@ -395,6 +431,9 @@ def run_provenance(context: RunContext) -> dict[str, Any]:
             for name, arrays in context.valid_sets.items()
         },
     }
+    if context.mupc_conversion is not None:
+        provenance["mupc"] = dict(context.mupc_conversion)
+    return provenance
 
 
 def stage_params_sha256(run_dir: str | Path) -> list[str]:

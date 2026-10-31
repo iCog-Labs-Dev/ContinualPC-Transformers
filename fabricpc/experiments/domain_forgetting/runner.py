@@ -104,7 +104,15 @@ from fabricpc.experiments.forgetting_benchmark.sequential_trainer import (
     params_hash,
 )
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.nodes.encoder_transformer import create_encoder_mlm_model
+from fabricpc.nodes.encoder_transformer import (
+    MUPC_MODES,
+    create_encoder_mlm_model,
+    is_mupc_full,
+    mupc_function_preserving_params,
+    mupc_plain_grads,
+    mupc_plain_params,
+    mupc_weight_scales,
+)
 from fabricpc.training.optimizers import build_warmup_cosine_adamw
 from fabricpc.training.plasticity_gates import scale_module_updates
 from fabricpc.training.train import _convert_batch
@@ -234,6 +242,15 @@ class RunConfig:
     with a random orthogonal part seeded by ``grad_noise_seed``
     (``noise_gradients``); ``grad_noise_mode="fresh"`` draws it anew every
     update, ``"persistent"`` once per stage and module.
+
+    ``pc_mupc`` selects μPC for the BERT graph (``create_encoder_mlm_model``'s
+    ``mupc``): ``"full"`` loads every weight behind a scaled edge as ``W / a``
+    (``mupc_function_preserving_params``), so the loaded model computes the
+    checkpoint's function while Adam, the clip and weight decay act on
+    ``W / a``; ``"jacobian"`` keeps the checkpoint's weights and only
+    multiplies the top-down error on each scaled edge by its Jacobian gain.
+    Both apply to standard PC and to backprop, where ``"full"`` is the
+    optimiser control and ``"jacobian"`` changes no gradient at all.
     """
 
     checkpoint: str
@@ -284,6 +301,7 @@ class RunConfig:
     grad_noise_cosine: float | None = None
     grad_noise_seed: int = 0
     grad_noise_mode: str = "fresh"
+    pc_mupc: str = "off"
     gate: str = "none"
     gate_beta: float = 1.0
     gate_modules: tuple[str, ...] = ()
@@ -334,7 +352,24 @@ class RunConfig:
                 self._validate_iterative()
         self._validate_eta_control()
         self._validate_grad_noise()
+        self._validate_mupc()
         self._validate_gate()
+
+    def _validate_mupc(self) -> None:
+        """μPC applies to backprop and standard PC, without the ε-spectrum probe."""
+        if self.pc_mupc not in MUPC_MODES:
+            raise ValueError(
+                f"pc_mupc must be one of {MUPC_MODES}, got {self.pc_mupc!r}"
+            )
+        if self.pc_mupc == "off":
+            return
+        if self.mode == "pc" and self.pc_inference != "standard":
+            raise ValueError(
+                f"pc_mupc {self.pc_mupc!r} needs mode 'backprop' or standard PC, "
+                f"not {self.pc_inference}"
+            )
+        if self.pc_regime_interval:
+            raise ValueError("pc_regime_interval does not support pc_mupc")
 
     def _validate_grad_noise(self) -> None:
         """Gradient noise is a backprop control with a cosine in (0, 1)."""
@@ -552,7 +587,8 @@ class RunConfig:
         for ungated runs, every rate-controller setting for uncontrolled
         runs and both gradient-noise settings for runs without it, so their
         identity is unchanged from before joint training, gates, the
-        controller and gradient noise existed.
+        controller and gradient noise existed; ``pc_mupc`` is left out when
+        off.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
@@ -571,6 +607,8 @@ class RunConfig:
         if values["grad_noise_cosine"] is None:
             for key in GRAD_NOISE_SETTINGS:
                 values.pop(key)
+        if values["pc_mupc"] == "off":
+            values.pop("pc_mupc")
         values["domains"] = list(self.domains)
         return values
 
@@ -581,6 +619,30 @@ GATE_DEFAULTS: dict[str, Any] = {
 CONTROL_DEFAULTS: dict[str, Any] = {
     f.name: f.default for f in fields(RunConfig) if f.name in CONTROL_SETTINGS
 }
+
+
+def mupc_record(structure: GraphStructure, mode: str) -> dict[str, Any]:
+    """The μPC mode and every scaled edge's forward and top-down factors.
+
+    For ``"full"`` also ``weight_scales``, the ``a`` each loaded weight was
+    divided by (``mupc_weight_scales``).
+    """
+    forward: dict[str, float] = {}
+    topdown: dict[str, float] = {}
+    for name in structure.node_order:
+        factors = structure.nodes[name].node_info.scaling_config
+        if factors is not None:
+            forward.update(factors.forward_scale)
+            topdown.update(factors.topdown_grad_scale)
+    record: dict[str, Any] = {
+        "mode": mode,
+        "forward_scale": forward,
+        "topdown_grad_scale": topdown,
+    }
+    if mode == "full":
+        record["weight_scales"] = mupc_weight_scales(structure)
+        record["load"] = "W / a for each weight behind a scaled edge"
+    return record
 
 
 def _setting(value: Any) -> Any:
@@ -632,6 +694,7 @@ def build_structure(
         architecture="bert",
         ln_eps=model_config.get("ln_eps"),
         residual_identity=True,
+        mupc=config.pc_mupc,
     )
 
 
@@ -700,6 +763,8 @@ def load_base_model(config: RunConfig) -> BaseModel:
     vocabulary equals the checkpoint vocabulary, and (through
     ``load_init_params``) architecture, ``seq_len``, ``ln_eps`` and every
     parameter shape. The inference object comes from ``build_inference``.
+    With ``pc_mupc="full"`` the params are the checkpoint's in the ``W / a``
+    parameterisation and ``params_sha256`` is theirs.
     """
     from tokenizers import Tokenizer
 
@@ -736,6 +801,8 @@ def load_base_model(config: RunConfig) -> BaseModel:
         seq_len=int(model_config["seq_len"]),
         ln_eps=model_config.get("ln_eps"),
     )
+    if config.pc_mupc == "full":
+        params = mupc_function_preserving_params(structure, params)
     tensor_path = path.with_name(json.loads(path.read_text())["tensor_file"])
     return BaseModel(
         structure=structure,
@@ -1277,7 +1344,13 @@ def regime_summary(
 def module_weight_norms(
     params: GraphParams, structure: GraphStructure
 ) -> dict[str, float]:
-    """Global L2 norm of each parameterised node's parameters, in graph order."""
+    """Global L2 norm of each parameterised node's parameters, in graph order.
+
+    Params of a ``mupc="full"`` graph are measured as plain ``W``
+    (``mupc_plain_params``).
+    """
+    if is_mupc_full(structure):
+        params = mupc_plain_params(structure, params)
     norms = {}
     for name in structure.node_order:
         leaves = jax.tree_util.tree_leaves(params.nodes[name])
@@ -1303,8 +1376,18 @@ def make_alignment_fn(
     structure: GraphStructure, forward_updates: str = "none"
 ) -> AlignmentFn:
     """Return the jitted per-module PC vs backprop gradient comparison; its
-    optional traced ``eta_infer`` overrides the ePC rate without recompiling."""
-    return create_pc_bp_gradient_comparison(structure, forward_updates)
+    optional traced ``eta_infer`` overrides the ePC rate without recompiling.
+
+    On a ``mupc="full"`` graph both gradients are mapped to plain ``W``
+    (``mupc_plain_grads``) first, so cosines and norms do not depend on the
+    ``W / a`` storage.
+    """
+    transform = (
+        (lambda grads: mupc_plain_grads(structure, grads))
+        if is_mupc_full(structure)
+        else None
+    )
+    return create_pc_bp_gradient_comparison(structure, forward_updates, transform)
 
 
 def fixed_mlm_batches(
@@ -2006,6 +2089,8 @@ def run_domain_forgetting(
     }
     if gate_plan is not None:
         run_config["gate"] = gate_plan.describe()
+    if config.pc_mupc != "off":
+        run_config["mupc"] = mupc_record(base.structure, config.pc_mupc)
     if config.grad_noise_cosine is not None:
         run_config["grad_noise"] = {
             "cosine": config.grad_noise_cosine,
@@ -2452,7 +2537,8 @@ def check_comparable_runs(
     ``log_interval``, ``init_perturbation`` (with its seed) and
     ``grad_noise_*``, with equal
     validation and train-array SHA-256s, the same source parameters and the
-    same domain order.
+    same domain order. A ``pc_mupc="full"`` run is comparable only with
+    another full run.
     """
     problems = []
     a, b = _comparable_config(left), _comparable_config(right)
@@ -2464,7 +2550,15 @@ def check_comparable_runs(
     for key in ("valid_sha256", "train_array_sha256"):
         if left.get(key) != right.get(key):
             problems.append(f"{key} differ")
-    if left["source"]["params_sha256"] != right["source"]["params_sha256"]:
+    full = [run["config"].get("pc_mupc") == "full" for run in (left, right)]
+    if full[0] != full[1]:
+        problems.append(
+            "μPC parameterisations differ (pc_mupc 'full' stores W / a, the other "
+            "run W), so stage params are not comparable; compare against a run "
+            "with the same parameterisation, or convert the full run's stages "
+            "with mupc_plain_params (localization.load_run does this)"
+        )
+    elif left["source"]["params_sha256"] != right["source"]["params_sha256"]:
         problems.append("source checkpoints differ")
     return problems
 

@@ -32,6 +32,10 @@ from fabricpc.experiments.domain_forgetting.runner import (
     spectrum_scalars,
 )
 from fabricpc.experiments.forgetting_benchmark.sequential_trainer import params_hash
+from fabricpc.nodes.encoder_transformer import (
+    mupc_function_preserving_params,
+    mupc_plain_params,
+)
 
 Setting = tuple[float, int | None]
 
@@ -95,6 +99,7 @@ def probe_alignment(
     expected_shape: dict[str, int] | None = None,
     lanczos_iters: int = 20,
     final_spectrum: bool = False,
+    pc_mupc: str | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Return per-module PC vs backprop alignment for each ``(eta, steps)`` setting.
@@ -118,12 +123,18 @@ def probe_alignment(
     reaches (``lambda_max_final``, ``lambda_min_final``, ``unstable_final``).
     Gradients are token sums divided by each batch's masked-token count, and
     the stable rate scales with that count, so probe at the run's
-    micro-batch size.
+    micro-batch size. ``pc_mupc`` (``RunConfig.pc_mupc``, standard PC only)
+    defaults to the run's, else ``"off"``. A stage snapshot whose run used
+    another parameterisation (``"full"`` stores ``W / a``) is converted to
+    the probed one (``params_converted``), so it computes the same function;
+    ``params_sha256`` stays the snapshot's. Alignment on a full graph is
+    measured on plain ``W`` (``make_alignment_fn``).
     """
     if num_batches < 1 or batch_size < 1:
         raise ValueError("num_batches and batch_size must be positive")
     if (stage is None) != (run_dir is None):
         raise ValueError("stage and run_dir must be given together")
+    run_mupc = "off"
     if not settings:
         raise ValueError("probe needs at least one setting")
     run_path = Path(run_dir) if run_dir is not None else None
@@ -135,6 +146,10 @@ def probe_alignment(
         if output_energy_scale is None:
             output_energy_scale = recorded["pc_output_energy_scale"]
         mask_prob = recorded["mask_prob"] if mask_prob is None else mask_prob
+        run_mupc = recorded.get("pc_mupc", "off")
+        if pc_mupc is None:
+            pc_mupc = run_mupc
+    pc_mupc = "off" if pc_mupc is None else pc_mupc
     max_norm = 5.0 if max_norm is None else max_norm
     output_energy_scale = 1.0 if output_energy_scale is None else output_energy_scale
     mask_prob = 0.15 if mask_prob is None else mask_prob
@@ -162,13 +177,26 @@ def probe_alignment(
         pc_forward_updates=forward_updates,
         pc_max_norm=max_norm,
         pc_output_energy_scale=output_energy_scale,
+        pc_mupc=pc_mupc,
     )
     for eta, steps in settings:
         replace(config, pc_eta_infer=eta, pc_infer_steps=steps).validate()
     base = load_base_model(config)
     params, sha = base.params, base.source["params_sha256"]
+    converted = None
     if run_path is not None:
         params, sha = _stage_params(run_path, int(stage), base.structure)
+        if (run_mupc == "full") != (pc_mupc == "full"):
+            if pc_mupc == "full":
+                params = mupc_function_preserving_params(base.structure, params)
+            else:
+                full_structure = build_structure(
+                    base.model_config,
+                    replace(config, pc_mupc="full"),
+                    base.structure.config["inference"],
+                )
+                params = mupc_plain_params(full_structure, params)
+            converted = f"{run_mupc} -> {pc_mupc}"
     cache = load_domain_cache(
         config.data_dir,
         domain,
@@ -242,6 +270,8 @@ def probe_alignment(
         "max_norm": max_norm,
         "output_energy_scale": output_energy_scale,
         "head_energy": HEAD_ENERGY,
+        **({"pc_mupc": pc_mupc} if pc_mupc != "off" else {}),
+        **({"params_converted": converted} if converted is not None else {}),
         **(
             {
                 "lanczos_iters": lanczos_iters,

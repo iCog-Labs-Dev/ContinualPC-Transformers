@@ -68,6 +68,12 @@ Usage:
     ePC runs can hold the relative energy drop near a target by adapting the
     rate: --pc_eta_control energy --pc_energy_target 0.17.
 
+    μPC (backprop and standard PC, run and probe): --pc_mupc jacobian
+    multiplies the top-down error on each scaled edge by its Jacobian gain on
+    the original weights; --pc_mupc full also loads those weights as W / a,
+    the same function with μPC's optimiser behaviour (with --mode backprop it
+    is the optimiser control).
+
     PYTHONPATH=. python examples/mlm_domain_forgetting.py ... --mode backprop \\
         --init_perturbation 1e-7 --output_dir results/domain_forgetting/bp_pert
 
@@ -100,6 +106,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     ETA_CONTROL,
     GRAD_NOISE_MODES,
     MODES,
+    MUPC_MODES,
     PC_INFERENCE,
     GATES,
     TRAINING,
@@ -187,6 +194,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--pc_output_energy_scale",
         type=float,
         default=defaults.pc_output_energy_scale,
+    )
+    parser.add_argument(
+        "--pc_mupc",
+        choices=MUPC_MODES,
+        default=defaults.pc_mupc,
+        help="μPC for backprop or standard PC: full = μPC with the W / a load "
+        "(same function, μPC's optimiser behaviour); jacobian = μPC's top-down "
+        "Jacobian gain only, original weights (no effect on backprop gradients)",
     )
     parser.add_argument(
         "--init_perturbation",
@@ -351,6 +366,13 @@ def build_probe_parser() -> argparse.ArgumentParser:
         "--pc_forward_updates", choices=("none", "initial", "final"), default=None
     )
     parser.add_argument(
+        "--pc_mupc",
+        choices=MUPC_MODES,
+        default=None,
+        help="μPC mode (standard PC only); default: the run's, else off. A "
+        "stage of a run with another μPC parameterisation is converted",
+    )
+    parser.add_argument(
         "--grid",
         default=None,
         metavar="ETA:STEPS,...",
@@ -409,6 +431,7 @@ def run_probe(argv: Sequence[str]) -> dict[str, Any]:
         expected_shape=None if args.skip_shape_check else dict(BERT_MINI_SHAPE),
         lanczos_iters=args.lanczos_iters,
         final_spectrum=args.final_spectrum,
+        pc_mupc=args.pc_mupc,
     )
     if args.out:
         atomic_write_json(Path(args.out), report)
@@ -466,6 +489,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         grad_noise_cosine=args.grad_noise_cosine,
         grad_noise_seed=args.grad_noise_seed,
         grad_noise_mode=args.grad_noise_mode,
+        pc_mupc=args.pc_mupc,
         gate=args.gate,
         gate_beta=args.gate_beta,
         gate_modules=tuple(args.gate_modules),
