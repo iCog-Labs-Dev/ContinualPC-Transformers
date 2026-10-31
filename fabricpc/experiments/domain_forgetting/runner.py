@@ -1673,7 +1673,7 @@ def train_stage(
                 print(
                     f"stage={stage} update={updates}/{num_updates} "
                     + " ".join(
-                        f"{k}={v:.4g}"
+                        f"{k}={v:.4g}" if isinstance(v, (int, float)) else f"{k}={v}"
                         for k, v in entry.items()
                         if k not in ("stage", "update")
                     )

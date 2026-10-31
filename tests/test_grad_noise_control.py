@@ -271,7 +271,16 @@ def setup(tmp_path_factory):
     return make_setup(tmp_path_factory.mktemp("grad_noise"))
 
 
-def _stage(setup, tmp_path, *, tokens=40, record=None, multipliers=None, **overrides):
+def _stage(
+    setup,
+    tmp_path,
+    *,
+    tokens=40,
+    record=None,
+    multipliers=None,
+    verbose=False,
+    **overrides,
+):
     checkpoint, data_dir = setup
     config = tiny_config(
         checkpoint, data_dir, tmp_path / "run", tokens_per_domain=tokens, **overrides
@@ -294,9 +303,25 @@ def _stage(setup, tmp_path, *, tokens=40, record=None, multipliers=None, **overr
         special_ids=base.special_ids,
         gradient_fn=gradient_fn,
         multipliers=multipliers,
-        verbose=False,
+        verbose=verbose,
     )
     return config, base, fn, params, log
+
+
+@pytest.mark.parametrize("mode", ["fresh", "persistent"])
+def test_verbose_log_lines_print_the_noise_mode(setup, tmp_path, capsys, mode):
+    """Per-update log lines print string fields such as the noise mode."""
+    _stage(
+        setup,
+        tmp_path,
+        verbose=True,
+        log_interval=1,
+        grad_noise_cosine=0.89,
+        grad_noise_mode=mode,
+    )
+    out = capsys.readouterr().out
+    assert f"grad_noise_mode={mode}" in out
+    assert "grad_noise_cosine=0.89" in out
 
 
 def test_off_path_matches_a_plain_optimizer_loop(setup, tmp_path):
