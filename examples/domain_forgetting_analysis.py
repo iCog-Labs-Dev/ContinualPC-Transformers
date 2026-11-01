@@ -10,7 +10,9 @@ refuses any computed from other stage snapshots, and writes
 ``correlations.json`` and ``correlations.png``. ``frontier`` reads only
 ``run_config.json`` and ``summary.json`` of the ``--run_dirs`` (default:
 every run under ``--results_dir``) and writes ``frontier.json``,
-``frontier.pdf`` and ``frontier.png``; ``all`` leaves it out.
+``frontier.pdf`` and ``frontier.png``; ``commutator`` reads the stage
+snapshots and training logs of the ``--run_dirs`` (both domain orders per
+seed and condition) and writes ``commutator.json``; ``all`` leaves both out.
 
 Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py drift \\
@@ -33,6 +35,9 @@ Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py frontier \\
         --results_dir results/domain_forgetting \\
         --output_dir results/domain_forgetting/frontier
+    PYTHONPATH=. python examples/domain_forgetting_analysis.py commutator \\
+        --run_dirs results/domain_forgetting/commutator_*_seed* \\
+        --output_dir results/domain_forgetting/commutator_bert
     PYTHONPATH=. python examples/domain_forgetting_analysis.py all \\
         --run_dir results/domain_forgetting/bp_seed0
 """
@@ -50,6 +55,12 @@ from jax_setup import set_jax_flags_before_importing_jax
 set_jax_flags_before_importing_jax()
 
 from fabricpc.experiments.domain_forgetting.artifacts import atomic_write_json
+from fabricpc.experiments.domain_forgetting.commutator import (
+    compute_commutator,
+)
+from fabricpc.experiments.domain_forgetting.commutator import (
+    format_table as format_commutator_table,
+)
 from fabricpc.experiments.domain_forgetting.error_maps import (
     SETTINGS,
     ErrorMapConfig,
@@ -78,7 +89,7 @@ from fabricpc.experiments.domain_forgetting.localization import (
 )
 
 RUN_COMMANDS = ("drift", "rollback", "error_maps", "predictors", "correlations")
-COMMANDS = (*RUN_COMMANDS, "frontier", "all")
+COMMANDS = (*RUN_COMMANDS, "frontier", "commutator", "all")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictor_batch_size", type=int, default=8)
     parser.add_argument("--bootstrap", type=int, default=BOOTSTRAP_RESAMPLES)
     parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
+    parser.add_argument(
+        "--no_divergence",
+        action="store_true",
+        help="commutator: skip the function-space distance",
+    )
     parser.add_argument("--no_figure", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -181,6 +197,25 @@ def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def run_commutator(args: argparse.Namespace) -> dict[str, Any]:
+    """Order distances and noise floors of paired-order runs."""
+    if not args.run_dirs:
+        raise SystemExit("commutator needs --run_dirs")
+    output = Path(args.output_dir or Path(args.results_dir) / "commutator")
+    output.mkdir(parents=True, exist_ok=True)
+    result = compute_commutator(
+        args.run_dirs,
+        divergence=not args.no_divergence,
+        batch_size=args.eval_batch_size or 64,
+        checkpoint=args.checkpoint,
+        data_dir=args.data_dir,
+    )
+    atomic_write_json(output / "commutator.json", result)
+    if not args.quiet:
+        print(format_commutator_table(result))
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     """Run one analysis command, or ``all`` of them in order."""
     args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
@@ -194,6 +229,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             results[command] = run_correlations(args)
         elif command == "frontier":
             results[command] = run_frontier(args)
+        elif command == "commutator":
+            results[command] = run_commutator(args)
         else:
             context = context or _context(args)
             output = Path(args.run_dir)
