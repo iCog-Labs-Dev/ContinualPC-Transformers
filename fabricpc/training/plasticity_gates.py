@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, Mapping
+from typing import Any, Dict, Mapping, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -119,6 +119,109 @@ def scale_module_updates(
         return scale_node_updates(updates, gates), state
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+class ModuleMultiplierState(NamedTuple):
+    """Per-node float32 scalar multipliers of ``scale_module_updates_traced``."""
+
+    multipliers: Dict[str, jax.Array]
+
+
+def _positive_multipliers(multipliers: Mapping[str, float]) -> Dict[str, float]:
+    values = {str(name): float(value) for name, value in multipliers.items()}
+    bad = sorted(n for n, v in values.items() if not (np.isfinite(v) and v > 0))
+    if bad:
+        raise ValueError(f"multipliers must be finite and positive; not at {bad}")
+    return values
+
+
+def scale_module_updates_traced(
+    multipliers: Mapping[str, float],
+) -> optax.GradientTransformation:
+    """``scale_module_updates`` with the multipliers held in the optimizer state.
+
+    The state holds one float32 scalar per node of the params (1.0 for nodes
+    absent from ``multipliers``), so ``set_module_multipliers`` changes them
+    between updates without retracing a jitted update. Multipliers must be
+    finite and positive: no node is frozen, so the global-norm clip before
+    AdamW needs no zeroed gradients. Each update leaf keeps its dtype. Names
+    that are not nodes raise at ``init``.
+    """
+    values = _positive_multipliers(multipliers)
+
+    def init_fn(params: GraphParams) -> ModuleMultiplierState:
+        unknown = sorted(set(values) - set(params.nodes))
+        if unknown:
+            raise ValueError(f"multipliers for unknown nodes {unknown}")
+        return ModuleMultiplierState(
+            {
+                name: jnp.asarray(values.get(name, 1.0), dtype=jnp.float32)
+                for name in params.nodes
+            }
+        )
+
+    def update_fn(
+        updates: GraphParams,
+        state: ModuleMultiplierState,
+        params: GraphParams | None = None,
+    ) -> tuple[GraphParams, ModuleMultiplierState]:
+        nodes = {
+            name: jax.tree_util.tree_map(
+                lambda x, g=state.multipliers[name]: x * g.astype(x.dtype), node
+            )
+            for name, node in updates.nodes.items()
+        }
+        return GraphParams(nodes=nodes), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _is_multiplier_state(node: Any) -> bool:
+    return isinstance(node, ModuleMultiplierState)
+
+
+def set_module_multipliers(opt_state: Any, multipliers: Mapping[str, float]) -> Any:
+    """Return ``opt_state`` with every ``ModuleMultiplierState`` set to ``multipliers``.
+
+    Nodes absent from ``multipliers`` get 1.0; values must be finite and
+    positive and names must be nodes of the state. The new scalars are
+    float32, as at ``init``, so a jitted update is not retraced.
+    """
+    values = _positive_multipliers(multipliers)
+    found = []
+
+    def replace_state(node: Any) -> Any:
+        if not _is_multiplier_state(node):
+            return node
+        unknown = sorted(set(values) - set(node.multipliers))
+        if unknown:
+            raise ValueError(f"multipliers for unknown nodes {unknown}")
+        found.append(node)
+        return ModuleMultiplierState(
+            {
+                name: jnp.asarray(values.get(name, 1.0), dtype=jnp.float32)
+                for name in node.multipliers
+            }
+        )
+
+    new_state = jax.tree_util.tree_map(
+        replace_state, opt_state, is_leaf=_is_multiplier_state
+    )
+    if not found:
+        raise ValueError("opt_state has no ModuleMultiplierState")
+    return new_state
+
+
+def module_multipliers(opt_state: Any) -> Dict[str, float]:
+    """The multipliers the single ``ModuleMultiplierState`` of ``opt_state`` holds."""
+    states = [
+        node
+        for node in jax.tree_util.tree_leaves(opt_state, is_leaf=_is_multiplier_state)
+        if _is_multiplier_state(node)
+    ]
+    if len(states) != 1:
+        raise ValueError(f"opt_state has {len(states)} ModuleMultiplierStates, not 1")
+    return {name: float(value) for name, value in states[0].multipliers.items()}
 
 
 class GateSchedule:
