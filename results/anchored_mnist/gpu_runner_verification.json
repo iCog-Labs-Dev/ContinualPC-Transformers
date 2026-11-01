@@ -1,0 +1,36 @@
+{
+  "date": "2026-11-01",
+  "full_suite": {
+    "command": "JAX_PLATFORMS=cpu python -m pytest -q -p no:cacheprovider",
+    "passed": 571,
+    "xfailed": 1,
+    "warnings": 1,
+    "seconds": 250.91
+  },
+  "targeted_tests": 25,
+  "standalone_tests": 12,
+  "black": "passed: five current source/test files",
+  "mypy": "passed: experiment modules and packaging helper",
+  "notebook": "All code cells parse; no saved outputs; GPU notebook source/test hashes match",
+  "smoke": {
+    "backend": "cpu",
+    "protocol": "rate-sweep",
+    "trials": 54,
+    "updates_per_trial": 1,
+    "unique_parameter_files": 54,
+    "seconds": 10.507142165966798,
+    "scientific_result": false
+  },
+  "gpu_execution": "not run",
+  "review": [
+    "gradient signs and lambda scaling",
+    "common initialization and batch streams",
+    "norm-control direction and clipping order",
+    "all fixed sweep cells and unique checkpoint paths",
+    "distinct inference/nonfinite failure statuses",
+    "atomic checksum-verified downloads and cached-file preservation",
+    "GPU fallback guard before data access",
+    "no checkpoint/data/large archive publication"
+  ],
+  "source_sha256": "4467ffdba67b7e1e8d9f9046eebeb8ce1f9c2b3b4d08bbc83b396ac589bf4069"
+}

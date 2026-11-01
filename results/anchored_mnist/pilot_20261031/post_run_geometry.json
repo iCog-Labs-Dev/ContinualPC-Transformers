@@ -1,0 +1,61 @@
+{
+  "timing": "Post-run diagnostic; not a pre-training gate",
+  "rows": [
+    {
+      "state": "initial",
+      "batch": 0,
+      "beta": 0.1,
+      "pc_bp_cosine": 0.941460807471044,
+      "blend_perpendicular_over_bp_norm": 0.021490761982037813
+    },
+    {
+      "state": "initial",
+      "batch": 0,
+      "beta": 0.5,
+      "pc_bp_cosine": 0.941460807471044,
+      "blend_perpendicular_over_bp_norm": 0.10745380991018906
+    },
+    {
+      "state": "initial",
+      "batch": 1,
+      "beta": 0.1,
+      "pc_bp_cosine": 0.9370956924331824,
+      "blend_perpendicular_over_bp_norm": 0.02319587766467935
+    },
+    {
+      "state": "initial",
+      "batch": 1,
+      "beta": 0.5,
+      "pc_bp_cosine": 0.9370956924331824,
+      "blend_perpendicular_over_bp_norm": 0.11597938832339674
+    },
+    {
+      "state": "bp_20",
+      "batch": 0,
+      "beta": 0.1,
+      "pc_bp_cosine": 0.9718339478461947,
+      "blend_perpendicular_over_bp_norm": 0.012635266170198112
+    },
+    {
+      "state": "bp_20",
+      "batch": 0,
+      "beta": 0.5,
+      "pc_bp_cosine": 0.9718339478461947,
+      "blend_perpendicular_over_bp_norm": 0.06317633085099056
+    },
+    {
+      "state": "bp_20",
+      "batch": 1,
+      "beta": 0.1,
+      "pc_bp_cosine": 0.9703543435195816,
+      "blend_perpendicular_over_bp_norm": 0.012969546817740079
+    },
+    {
+      "state": "bp_20",
+      "batch": 1,
+      "beta": 0.5,
+      "pc_bp_cosine": 0.9703543435195816,
+      "blend_perpendicular_over_bp_norm": 0.06484773408870038
+    }
+  ]
+}

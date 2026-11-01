@@ -1,0 +1,4 @@
+# Standalone MNIST runner: Linux NVIDIA GPU, CUDA 12 wheels.
+# JAX's CUDA extras supply the coupled GPU runtime packages.
+jax[cuda12]==0.11.2
+numpy==2.5.4
