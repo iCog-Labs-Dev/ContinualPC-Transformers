@@ -41,7 +41,8 @@ Usage:
     map / random / inverse / type (module-type means) from the onset error
     map, oracle from --gate_source runs' rollback.json (ungated runs of the
     other domain order), freeze for --gate_modules (module or group names:
-    embeddings, blocks_0-1, blocks_2-3, blocks, head, mlp).
+    embeddings, blocks_0-1, blocks_2-3, blocks, head, mlp), uniform for a
+    constant --gate_scale on every block module (the step-size control).
 
     $ETA has no default worth reusing. The MLM head energy is
     s * sum(masked CE) (a fixed per-token precision), so latent gradients, and
@@ -322,6 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--gate_map_windows", type=int, default=defaults.gate_map_windows
     )
     parser.add_argument("--gate_seed", type=int, default=defaults.gate_seed)
+    parser.add_argument(
+        "--gate_scale",
+        type=float,
+        default=defaults.gate_scale,
+        help="Block-module multiplier of --gate uniform",
+    )
     parser.add_argument("--log_interval", type=int, default=defaults.log_interval)
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume", action="store_true")
@@ -505,6 +512,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         gate_source=tuple(str(Path(p).resolve()) for p in args.gate_source),
         gate_map_windows=args.gate_map_windows,
         gate_seed=args.gate_seed,
+        gate_scale=args.gate_scale,
         log_interval=args.log_interval,
     )
 

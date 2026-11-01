@@ -31,6 +31,8 @@ other module keeps 1.
   same checkpoint with as many domains; their domain order may differ, so
   the scores are a module-level ranking across orders.
 - ``freeze``: the ``gate_modules`` modules or groups get 0, all others 1.
+- ``uniform``: every block module gets ``gate_scale``, all others 1; the
+  step-size control matched to a gate's update path.
 """
 
 from __future__ import annotations
@@ -418,6 +420,8 @@ class GatePlan:
         if stage >= 2:
             if config.gate == "freeze":
                 multipliers.update({m: 0.0 for m in self.frozen})
+            elif config.gate == "uniform":
+                multipliers.update({m: config.gate_scale for m in self.blocks})
             elif config.gate == "oracle":
                 raw = oracle_scores(self.rollbacks, stage, self.blocks)
                 scores = {m: max(v, SCORE_FLOOR) for m, v in raw.items()}

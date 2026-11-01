@@ -87,7 +87,7 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     """Return ``(gate, beta, label)`` of a run's ``run_config["config"]``.
 
     ``beta`` is ``None`` for gates that do not use it. Labels are
-    ``"map_b1"``, ``"freeze[embeddings,L0]"`` and, for ungated runs,
+    ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"`` and, for ungated runs,
     ``"lr3e-05"``.
     """
     gate = config.get("gate", REFERENCE)
@@ -97,6 +97,8 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     beta = float(config["gate_beta"]) if "gate_beta" in settings else None
     if gate == "freeze":
         label = f"freeze[{','.join(config.get('gate_modules', []))}]"
+    elif gate == "uniform":
+        label = f"uniform_s{float(config['gate_scale']):g}"
     elif beta is not None:
         label = f"{gate}_b{beta:g}"
     else:

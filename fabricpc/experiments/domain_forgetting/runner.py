@@ -140,7 +140,7 @@ BERT_MINI_SHAPE = {
 MODES = ("backprop", "pc")
 TRAINING = ("sequential", "joint")
 JOINT_STAGE = "joint"
-GATES = ("none", "map", "random", "inverse", "type", "oracle", "freeze")
+GATES = ("none", "map", "random", "inverse", "type", "oracle", "freeze", "uniform")
 GATE_SETTINGS = {
     "none": (),
     "map": ("gate_beta", "gate_map_windows"),
@@ -149,6 +149,7 @@ GATE_SETTINGS = {
     "random": ("gate_beta", "gate_map_windows", "gate_seed"),
     "oracle": ("gate_beta", "gate_source"),
     "freeze": ("gate_modules",),
+    "uniform": ("gate_scale",),
 }
 PC_INFERENCE = ("spiking", "standard", "epc")
 ITERATIVE_PC = ("standard", "epc")
@@ -316,6 +317,7 @@ class RunConfig:
     gate_source: tuple[str, ...] = ()
     gate_map_windows: int = 256
     gate_seed: int = 0
+    gate_scale: float = 1.0
     log_interval: int = 10
 
     def validate(self) -> None:
@@ -538,6 +540,8 @@ class RunConfig:
             raise ValueError("gate_map_windows must be positive")
         if self.gate_seed < 0:
             raise ValueError("gate_seed must be non-negative")
+        if not (math.isfinite(self.gate_scale) and self.gate_scale > 0):
+            raise ValueError("gate_scale must be finite and positive")
         if self.gate == "freeze":
             if not self.gate_modules:
                 raise ValueError("gate 'freeze' needs gate_modules")
@@ -629,6 +633,8 @@ class RunConfig:
         else:
             values["gate_modules"] = list(self.gate_modules)
             values["gate_source"] = list(self.gate_source)
+            if values["gate"] != "uniform":
+                values.pop("gate_scale")
         if values["pc_eta_control"] == "none":
             for key in ("pc_eta_control", *CONTROL_DEFAULTS):
                 values.pop(key)
