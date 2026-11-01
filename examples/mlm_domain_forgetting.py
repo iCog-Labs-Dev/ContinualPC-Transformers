@@ -42,7 +42,11 @@ Usage:
     map, oracle from --gate_source runs' rollback.json (ungated runs of the
     other domain order), freeze for --gate_modules (module or group names:
     embeddings, blocks_0-1, blocks_2-3, blocks, head, mlp), uniform for a
-    constant --gate_scale on every block module (the step-size control).
+    constant --gate_scale on every block module (the step-size control),
+    online_protect / online_surprise for block multipliers refreshed every
+    --gate_interval updates from the live energy smoothed with --gate_ema
+    (schedules in gate_schedule_stage_<s>.jsonl), with --gate_variant live,
+    type, shuffle (--gate_seed), inverse or replay (one --gate_source run).
 
     $ETA has no default worth reusing. The MLM head energy is
     s * sum(masked CE) (a fixed per-token precision), so latent gradients, and
@@ -110,6 +114,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     MUPC_MODES,
     PC_INFERENCE,
     GATES,
+    GATE_VARIANTS,
     TRAINING,
     RunConfig,
     compare_runs,
@@ -317,7 +322,8 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=list(defaults.gate_source),
         metavar="RUN_DIR",
-        help="Run directories whose rollback.json gives the oracle scores",
+        help="Run directories whose rollback.json gives the oracle scores, or "
+        "the one online gate run to replay",
     )
     parser.add_argument(
         "--gate_map_windows", type=int, default=defaults.gate_map_windows
@@ -328,6 +334,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=defaults.gate_scale,
         help="Block-module multiplier of --gate uniform",
+    )
+    parser.add_argument(
+        "--gate_interval",
+        type=int,
+        default=defaults.gate_interval,
+        help="Updates between online gate refreshes",
+    )
+    parser.add_argument(
+        "--gate_ema",
+        type=float,
+        default=defaults.gate_ema,
+        help="EMA weight of a refresh's energy (online gates)",
+    )
+    parser.add_argument(
+        "--gate_variant",
+        choices=GATE_VARIANTS,
+        default=defaults.gate_variant,
+        help="Online gate variant",
     )
     parser.add_argument("--log_interval", type=int, default=defaults.log_interval)
     resume = parser.add_mutually_exclusive_group()
@@ -513,6 +537,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         gate_map_windows=args.gate_map_windows,
         gate_seed=args.gate_seed,
         gate_scale=args.gate_scale,
+        gate_interval=args.gate_interval,
+        gate_ema=args.gate_ema,
+        gate_variant=args.gate_variant,
         log_interval=args.log_interval,
     )
 

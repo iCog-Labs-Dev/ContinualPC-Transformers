@@ -34,7 +34,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from fabricpc.experiments.domain_forgetting.runner import GATE_SETTINGS
+from fabricpc.experiments.domain_forgetting.runner import GATE_SETTINGS, ONLINE_GATES
 
 SEQ_LR = 1e-4
 PRIMARY_GATE = "map"
@@ -87,7 +87,9 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     """Return ``(gate, beta, label)`` of a run's ``run_config["config"]``.
 
     ``beta`` is ``None`` for gates that do not use it. Labels are
-    ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"`` and, for ungated runs,
+    ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"``,
+    ``"online_protect_b2"``, ``"online_surprise"`` (a non-live variant
+    appended, as in ``"online_protect_b2_replay"``) and, for ungated runs,
     ``"lr3e-05"``.
     """
     gate = config.get("gate", REFERENCE)
@@ -103,6 +105,9 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
         label = f"{gate}_b{beta:g}"
     else:
         label = gate
+    variant = config.get("gate_variant", "live")
+    if gate in ONLINE_GATES and variant != "live":
+        label += f"_{variant}"
     if not math.isclose(float(config["lr"]), SEQ_LR):
         label += f"@lr{lr_text(float(config['lr']))}"
     return gate, beta, label

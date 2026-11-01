@@ -33,6 +33,24 @@ other module keeps 1.
 - ``freeze``: the ``gate_modules`` modules or groups get 0, all others 1.
 - ``uniform``: every block module gets ``gate_scale``, all others 1; the
   step-size control matched to a gate's update path.
+
+The online gates (``online_protect``, ``online_surprise``) refresh their
+block multipliers inside a stage (``OnlineGate``). The smoothed energy
+``ŝ_i`` starts at the ``map`` gate's onset map; after every update ``u``
+with ``u % gate_interval == 0`` and ``u`` before the stage's last, the raw
+``s_i`` of ``onset_map`` on a probe of ``GATE_MAP_BATCH`` windows at the
+live params (``probe_offset``, ``probe_seed``) updates
+``ŝ_i ← (1 − α) ŝ_i + α s_i`` with ``α = gate_ema``, and updates
+``u + 1 … u + gate_interval`` use the multipliers of the new ``ŝ``
+(``online_multipliers``): ``online_protect`` is ``map_multipliers(ŝ, β)``,
+so with ``gate_interval`` at least the stage length it is the ``map``
+gate, and ``online_surprise`` is ``ŝ_i / (ŝ_i + τ_i)`` with ``τ_i`` the
+onset map, 0.5 at onset. ``gate_variant`` ``type`` uses module-type means
+of ``ŝ`` (and of ``τ``), ``shuffle`` permutes the block multipliers at
+every refresh, ``inverse`` reverses the rule and ``replay`` applies the
+recorded schedule of the ``gate_source`` run without computing energies.
+Each gated stage's periods are written to ``gate_schedule_stage_<s>.jsonl``
+with the multipliers the optimizer state held.
 """
 
 from __future__ import annotations
@@ -64,14 +82,20 @@ from fabricpc.experiments.domain_forgetting.localization import (
 )
 from fabricpc.experiments.domain_forgetting.runner import (
     GATE_SETTINGS,
+    ONLINE_GATES,
     BaseModel,
     RunConfig,
     build_inference,
     build_structure,
     fixed_mlm_batches,
     flatten_params,
+    num_stage_updates,
 )
 from fabricpc.experiments.forgetting_benchmark.sequential_trainer import params_hash
+from fabricpc.training.plasticity_gates import (
+    module_multipliers,
+    set_module_multipliers,
+)
 
 GATE_MAP_BATCH = 8
 SCORE_FLOOR = 1e-6
@@ -155,6 +179,31 @@ def permute_multipliers(
     return {m: multipliers[s] for m, s in zip(order, source)}, source
 
 
+def stream_windows(stream: np.ndarray, seq_len: int) -> int:
+    """Number of unshuffled windows (``seq_len - 1`` tokens after ``[CLS]``)."""
+    return math.ceil(len(stream) / (seq_len - 1))
+
+
+def window_stream(
+    stream: np.ndarray, seq_len: int, *, offset: int, count: int, pad_id: int
+) -> np.ndarray:
+    """The tokens of windows ``offset … offset + count - 1`` modulo the window count.
+
+    A short last window is padded with ``pad_id``, so each window of the
+    result is the stream's window, padding and attention included.
+    """
+    stride = seq_len - 1
+    total = stream_windows(stream, seq_len)
+    segments = []
+    for k in range(count):
+        start = ((offset + k) % total) * stride
+        segment = np.asarray(stream[start : start + stride], dtype=np.int32)
+        segments.append(
+            np.pad(segment, (0, stride - len(segment)), constant_values=pad_id)
+        )
+    return np.concatenate(segments)
+
+
 def map_batches(
     stream: np.ndarray,
     structure: GraphStructure,
@@ -163,13 +212,25 @@ def map_batches(
     num_windows: int,
     mask_prob: float,
     seed: int,
+    offset: int = 0,
 ) -> list[dict[str, jax.Array]]:
     """The first ``num_windows`` unshuffled windows in batches of ``GATE_MAP_BATCH``.
 
     Windows are drawn one at a time (``fixed_mlm_batches`` with batch size 1,
     masks from ``seed``), so the window set and masks do not depend on the
-    batching; the last batch may be smaller.
+    batching; the last batch may be smaller. With ``offset`` > 0 the windows
+    start at window ``offset`` and wrap modulo the stream's window count
+    (``window_stream``).
     """
+    if offset:
+        seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
+        stream = window_stream(
+            stream,
+            seq_len,
+            offset=offset,
+            count=num_windows,
+            pad_id=special_ids["[PAD]"],
+        )
     try:
         windows, _ = fixed_mlm_batches(
             stream,
@@ -206,13 +267,14 @@ def onset_map(
     mask_prob: float,
     seed: int,
     energy_fn: EnergyFn,
+    offset: int = 0,
 ) -> dict[str, float]:
-    """Mean ``energy_sum_ce`` per module over the first ``num_windows`` windows.
+    """Mean ``energy_sum_ce`` per module over ``num_windows`` windows from ``offset``.
 
     ``energy_fn`` returns ``bp_signal_energies`` at output scale 1; each
     window's value times the batch's squared masked-token count is the
     batch-invariant ``½‖∂(Σ_masked CE_b)/∂z‖²``. Windows without a masked
-    token are left out.
+    token are left out. The windows are ``map_batches``'.
     """
     missing = sorted(set(modules) - set(hidden_nodes(structure)))
     if missing:
@@ -224,6 +286,7 @@ def onset_map(
         num_windows=num_windows,
         mask_prob=mask_prob,
         seed=seed,
+        offset=offset,
     )
     sums = {m: 0.0 for m in modules}
     windows = 0
@@ -313,6 +376,206 @@ def oracle_scores(
     return {m: float(v) for m, v in zip(modules, mean)}
 
 
+def gate_periods(num_updates: int, interval: int) -> list[tuple[int, int, int]]:
+    """``(refresh, first_update, last_update)`` of each online gate period.
+
+    The onset period is refresh -1; refresh ``r`` follows update
+    ``(r + 1) * interval`` and lasts to the next refresh or the stage's end.
+    """
+    starts = [0, *range(interval, num_updates, interval)]
+    return [
+        (index - 1, start + 1, min(start + interval, num_updates))
+        for index, start in enumerate(starts)
+    ]
+
+
+def probe_offset(map_windows: int, refresh: int, num_windows: int) -> int:
+    """First probe window of ``refresh``: ``map_windows + refresh * GATE_MAP_BATCH``.
+
+    Taken modulo the stream's ``num_windows``.
+    """
+    return (map_windows + refresh * GATE_MAP_BATCH) % num_windows
+
+
+def probe_seed(seed: int, stage: int, refresh: int) -> int:
+    """Mask seed of a probe, from ``SeedSequence([seed, stage, refresh])``, < 2^31."""
+    state = np.random.SeedSequence([seed, stage, refresh]).generate_state(1)
+    return int(state[0] >> 1)
+
+
+def shuffle_rng(
+    gate_seed: int, seed: int, stage: int, refresh: int
+) -> np.random.Generator:
+    """``default_rng([gate_seed, seed, stage, refresh])``; the onset (-1) drops ``refresh``.
+
+    The onset generator is the ``random`` gate's, so a stage without
+    refreshes permutes as that gate does.
+    """
+    entropy = [gate_seed, seed, stage] + ([refresh] if refresh >= 0 else [])
+    return np.random.default_rng(entropy)
+
+
+def ema_update(
+    smoothed: Mapping[str, float], raw: Mapping[str, float], alpha: float
+) -> dict[str, float]:
+    """``(1 − α) ŝ_i + α s_i`` per module."""
+    return {m: (1.0 - alpha) * v + alpha * float(raw[m]) for m, v in smoothed.items()}
+
+
+def surprise_multipliers(
+    scores: Mapping[str, float],
+    tau: Mapping[str, float],
+    *,
+    inverse: bool = False,
+) -> dict[str, float]:
+    """``s_i / (s_i + τ_i)`` per module, ``τ_i / (s_i + τ_i)`` inverse."""
+    return {
+        m: (float(tau[m]) if inverse else v) / (v + float(tau[m]))
+        for m, v in scores.items()
+    }
+
+
+def online_multipliers(
+    smoothed: Mapping[str, float],
+    onset: Mapping[str, float],
+    *,
+    gate: str,
+    variant: str,
+    beta: float,
+    rng: np.random.Generator | None = None,
+) -> tuple[dict[str, float], list[str] | None]:
+    """The block multipliers of an online gate at ``smoothed``, and the permutation.
+
+    Scores and ``τ = onset`` are floored at ``SCORE_FLOOR``; ``type`` replaces
+    both by their module-type means, so the surprise gate still starts at
+    0.5; ``shuffle`` permutes the multipliers with ``rng``
+    (``permute_multipliers``). Every multiplier is positive.
+    """
+    scores = {m: max(float(v), SCORE_FLOOR) for m, v in smoothed.items()}
+    tau = {m: max(float(onset[m]), SCORE_FLOOR) for m in scores}
+    if variant == "type":
+        scores, tau = type_scores(scores), type_scores(tau)
+    inverse = variant == "inverse"
+    if gate == "online_protect":
+        block = map_multipliers(scores, beta, inverse=inverse)
+    elif gate == "online_surprise":
+        block = surprise_multipliers(scores, tau, inverse=inverse)
+    else:
+        raise ValueError(f"{gate!r} is not an online gate")
+    permutation = None
+    if variant == "shuffle":
+        if rng is None:
+            raise ValueError("variant 'shuffle' needs an rng")
+        block, permutation = permute_multipliers(block, list(scores), rng)
+    return block, permutation
+
+
+def schedule_name(stage: int) -> str:
+    """The file of stage ``stage``'s online gate schedule."""
+    return f"gate_schedule_stage_{stage}.jsonl"
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def load_replay_schedules(
+    source: str,
+    config: RunConfig,
+    *,
+    modules: Sequence[str],
+    num_updates: int,
+    params_sha256: str,
+) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any]]:
+    """Read the source run's gated-stage schedules, checking it can be replayed.
+
+    The source must be a ``live`` run of the same online gate from the same
+    checkpoint params, with the same domain order, mode, ``gate_beta``,
+    ``gate_ema``, ``gate_map_windows``, per-stage update count and
+    ``gate_interval``, and a complete schedule
+    for every gated stage whose SHA-256 its ``gates.jsonl`` records. Returns
+    the schedules by stage and the source's description.
+    """
+    root = Path(source)
+    run_config_path = root / "run_config.json"
+    if not run_config_path.is_file():
+        raise FileNotFoundError(f"{run_config_path} is missing")
+    run_config = json.loads(run_config_path.read_text())
+    values = run_config["config"]
+    if values.get("gate") != config.gate:
+        raise ValueError(
+            f"{source}: replay needs a {config.gate!r} run, not gate "
+            f"{values.get('gate', 'none')!r}"
+        )
+    if list(values["domains"]) != list(config.domains):
+        raise ValueError(
+            f"{source}: domain order {values['domains']} differs from "
+            f"{list(config.domains)}"
+        )
+    if run_config.get("updates_per_stage") != num_updates:
+        raise ValueError(
+            f"{source}: has {run_config.get('updates_per_stage')} updates per "
+            f"stage, the run has {num_updates}"
+        )
+    if values.get("gate_variant", "live") != "live":
+        raise ValueError(
+            f"{source}: replay needs a live source, not variant "
+            f"{values.get('gate_variant')!r}"
+        )
+    for name in ("mode", "gate_beta", "gate_ema", "gate_map_windows"):
+        if values.get(name) != getattr(config, name):
+            raise ValueError(
+                f"{source}: {name} {values.get(name)!r} differs from "
+                f"{getattr(config, name)!r}"
+            )
+    if run_config["source"]["params_sha256"] != params_sha256:
+        raise ValueError(f"{source}: not trained from the run's checkpoint")
+    if values.get("gate_interval") != config.gate_interval:
+        raise ValueError(
+            f"{source}: gate_interval {values.get('gate_interval')} differs from "
+            f"{config.gate_interval}"
+        )
+    gates_path = root / "gates.jsonl"
+    records = (
+        {int(r["stage"]): r for r in _read_jsonl(gates_path)}
+        if (gates_path.is_file())
+        else {}
+    )
+    periods = gate_periods(num_updates, config.gate_interval)
+    schedules: dict[int, list[dict[str, Any]]] = {}
+    digests: dict[str, str] = {}
+    for stage in range(2, len(config.domains) + 1):
+        path = root / schedule_name(stage)
+        summary = (records.get(stage) or {}).get("schedule")
+        if summary is None or not path.is_file():
+            raise ValueError(f"{source}: stage {stage} has no complete gate schedule")
+        digest = file_sha256(path)
+        if digest != summary["sha256"]:
+            raise ValueError(f"{path}: SHA-256 differs from gates.jsonl")
+        schedule = _read_jsonl(path)
+        found = [
+            (int(r["refresh"]), int(r["first_update"]), int(r["last_update"]))
+            for r in schedule
+        ]
+        if found != periods:
+            raise ValueError(
+                f"{path}: periods {found} are not the {len(periods)} expected"
+            )
+        for entry in schedule:
+            if sorted(entry["multipliers"]) != sorted(modules):
+                raise ValueError(f"{path}: multipliers do not cover the modules")
+        schedules[stage] = schedule
+        digests[str(stage)] = digest
+    info = {
+        "run_dir": source,
+        "gate": values["gate"],
+        "variant": values.get("gate_variant"),
+        "seed": values.get("seed"),
+        "schedule_sha256": digests,
+    }
+    return schedules, info
+
+
 class GatePlan:
     """One run's gate: resolves its modules and sources, records each stage."""
 
@@ -344,9 +607,22 @@ class GatePlan:
             )
             for stage in range(2, len(config.domains) + 1):
                 oracle_scores(self.rollbacks, stage, self.blocks)
+        self.base_seq_len = int(base.model_config["seq_len"])
+        self.num_updates = num_stage_updates(
+            config.stage_tokens, config.batch_size, self.base_seq_len
+        )
+        self.replay: dict[int, list[dict[str, Any]]] = {}
+        if config.gate in ONLINE_GATES and config.gate_variant == "replay":
+            self.replay, self.sources[config.gate_source[0]] = load_replay_schedules(
+                config.gate_source[0],
+                config,
+                modules=self.modules,
+                num_updates=self.num_updates,
+                params_sha256=base.source["params_sha256"],
+            )
         self.structure: GraphStructure | None = None
         self.energy_fn: EnergyFn | None = None
-        if config.gate in MAP_GATES:
+        if self.uses_map:
             run = replace(config, mode="backprop", dropout_rate=0.0)
             structure = build_structure(
                 base.model_config, run, build_inference(run, base.model_config)[0]
@@ -365,6 +641,13 @@ class GatePlan:
                     seed=config.seed + stage,
                 )
 
+    @property
+    def uses_map(self) -> bool:
+        """True when the gate computes the onset map and energies."""
+        if self.config.gate in ONLINE_GATES:
+            return self.config.gate_variant != "replay"
+        return self.config.gate in MAP_GATES
+
     def describe(self) -> dict[str, Any]:
         """The resolved gate setup recorded in ``run_config.json``."""
         info: dict[str, Any] = {
@@ -381,7 +664,7 @@ class GatePlan:
         if self.config.gate == "oracle":
             info["sources"] = {k: dict(v) for k, v in self.sources.items()}
             info["score_floor"] = SCORE_FLOOR
-        if self.config.gate in MAP_GATES:
+        if self.uses_map:
             info["map"] = {
                 "energy": "energy_sum_ce of bp_signal_energies (spike-only map)",
                 "stream": "train stream of the stage's domain, unshuffled",
@@ -390,7 +673,59 @@ class GatePlan:
                 "windows_masked": "one at a time (batch size 1)",
                 "mask_seed": "seed + stage",
             }
+        if self.config.gate in ONLINE_GATES:
+            info["online"] = {
+                "variant": self.config.gate_variant,
+                "interval": self.config.gate_interval,
+                "ema": self.config.gate_ema,
+                "updates_per_stage": self.num_updates,
+                "probe": {
+                    "windows": GATE_MAP_BATCH,
+                    "offset": "gate_map_windows + refresh * windows, modulo the "
+                    "stream's window count",
+                    "mask_seed": "SeedSequence([seed, stage, refresh]) >> 1",
+                },
+                "score_floor": SCORE_FLOOR,
+                "multipliers": "traced optimizer state, set at each refresh",
+            }
+            if self.config.gate_variant == "shuffle":
+                info["online"]["shuffle_rng"] = (
+                    "default_rng([gate_seed, seed, stage, refresh]); onset "
+                    "default_rng([gate_seed, seed, stage])"
+                )
+            if self.config.gate_variant == "replay":
+                info["sources"] = {k: dict(v) for k, v in self.sources.items()}
         return info
+
+    def _onset_map(
+        self,
+        record: dict[str, Any],
+        stage: int,
+        domain: str,
+        params: GraphParams,
+        stream: np.ndarray,
+    ) -> dict[str, float]:
+        """Compute the stage's onset map and store it in ``record``."""
+        if self.structure is None or self.energy_fn is None:
+            raise ValueError(f"gate {self.config.gate!r} has no onset map")
+        config = self.config
+        values = onset_map(
+            params,
+            self.structure,
+            stream,
+            self.special_ids,
+            modules=self.blocks,
+            num_windows=config.gate_map_windows,
+            mask_prob=config.mask_prob,
+            seed=config.seed + stage,
+            energy_fn=self.energy_fn,
+        )
+        record.update(
+            map=values,
+            map_windows=config.gate_map_windows,
+            map_seed=config.seed + stage,
+        )
+        return values
 
     def record(
         self, stage: int, domain: str, params: GraphParams, stream: np.ndarray
@@ -427,25 +762,22 @@ class GatePlan:
                 scores = {m: max(v, SCORE_FLOOR) for m, v in raw.items()}
                 record["scores"] = raw
                 multipliers.update(map_multipliers(scores, config.gate_beta))
+            elif config.gate in ONLINE_GATES:
+                if config.gate_variant == "replay":
+                    multipliers.update(self.replay[stage][0]["multipliers"])
+                else:
+                    values = self._onset_map(record, stage, domain, params, stream)
+                    block, record["permutation"] = online_multipliers(
+                        values,
+                        values,
+                        gate=config.gate,
+                        variant=config.gate_variant,
+                        beta=config.gate_beta,
+                        rng=shuffle_rng(config.gate_seed, config.seed, stage, -1),
+                    )
+                    multipliers.update(block)
             else:
-                if self.structure is None or self.energy_fn is None:
-                    raise ValueError(f"gate {config.gate!r} has no onset map")
-                values = onset_map(
-                    params,
-                    self.structure,
-                    stream,
-                    self.special_ids,
-                    modules=self.blocks,
-                    num_windows=config.gate_map_windows,
-                    mask_prob=config.mask_prob,
-                    seed=config.seed + stage,
-                    energy_fn=self.energy_fn,
-                )
-                record.update(
-                    map=values,
-                    map_windows=config.gate_map_windows,
-                    map_seed=config.seed + stage,
-                )
+                values = self._onset_map(record, stage, domain, params, stream)
                 scores = values
                 if config.gate == "type":
                     scores = type_scores(values)
@@ -464,6 +796,124 @@ class GatePlan:
                         block, self.blocks, rng
                     )
                 multipliers.update(block)
+        if config.gate in ONLINE_GATES:
+            record.update(
+                variant=config.gate_variant,
+                interval=config.gate_interval,
+                ema=config.gate_ema,
+                schedule=None,
+            )
         record["multipliers"] = multipliers
         record["seconds"] = time.time() - started
         return record
+
+    def online(self, record: Mapping[str, Any], stream: np.ndarray) -> "OnlineGate":
+        """The ``train_stage`` gate callback of a gated stage's ``record``."""
+        if self.config.gate not in ONLINE_GATES or not record.get("gated"):
+            raise ValueError("only gated stages of online gates refresh")
+        return OnlineGate(self, record, stream)
+
+
+class OnlineGate:
+    """One stage's online gate: refreshes the optimizer's block multipliers.
+
+    Called by ``train_stage`` with the update count, the params and the
+    optimizer state before the first update and after every update; it
+    returns the state, with new multipliers after a refresh. ``schedule``
+    holds one record per period with the multipliers read back from the
+    optimizer state, so they are the ones applied; ``seconds`` is the time
+    spent refreshing.
+    """
+
+    def __init__(
+        self, plan: GatePlan, record: Mapping[str, Any], stream: np.ndarray
+    ) -> None:
+        """``record`` is the stage's ``GatePlan.record`` and ``stream`` its domain's."""
+        self.plan = plan
+        self.config = plan.config
+        self.stage = int(record["stage"])
+        self.stream = stream
+        self.periods = gate_periods(plan.num_updates, self.config.gate_interval)
+        self.replay = plan.replay.get(self.stage)
+        self.onset = dict(record["map"]) if record.get("map") is not None else None
+        self.smoothed = dict(self.onset) if self.onset is not None else None
+        self.permutation = record.get("permutation")
+        self.num_windows = stream_windows(stream, plan.base_seq_len)
+        self.schedule: list[dict[str, Any]] = []
+        self.seconds = 0.0
+
+    def __call__(self, update: int, params: GraphParams, opt_state: Any) -> Any:
+        """Record the onset at update 0; refresh after each ``gate_interval`` updates."""
+        config = self.config
+        interval = config.gate_interval
+        if update == 0:
+            self._append(-1, None, None, None, opt_state)
+            return opt_state
+        if update % interval or update >= self.plan.num_updates:
+            return opt_state
+        started = time.time()
+        refresh = update // interval - 1
+        raw = None
+        offset = seed = None
+        permutation = None
+        if self.replay is not None:
+            multipliers = self.replay[refresh + 1]["multipliers"]
+        else:
+            if self.smoothed is None or self.onset is None:
+                raise ValueError(f"stage {self.stage} has no onset map")
+            if self.plan.structure is None or self.plan.energy_fn is None:
+                raise ValueError(f"gate {config.gate!r} has no energy function")
+            offset = probe_offset(config.gate_map_windows, refresh, self.num_windows)
+            seed = probe_seed(config.seed, self.stage, refresh)
+            raw = onset_map(
+                params,
+                self.plan.structure,
+                self.stream,
+                self.plan.special_ids,
+                modules=self.plan.blocks,
+                num_windows=GATE_MAP_BATCH,
+                mask_prob=config.mask_prob,
+                seed=seed,
+                energy_fn=self.plan.energy_fn,
+                offset=offset,
+            )
+            self.smoothed = ema_update(self.smoothed, raw, config.gate_ema)
+            block, permutation = online_multipliers(
+                self.smoothed,
+                self.onset,
+                gate=config.gate,
+                variant=config.gate_variant,
+                beta=config.gate_beta,
+                rng=shuffle_rng(config.gate_seed, config.seed, self.stage, refresh),
+            )
+            multipliers = {**{m: 1.0 for m in self.plan.modules}, **block}
+        self.permutation = permutation
+        opt_state = set_module_multipliers(opt_state, multipliers)
+        self._append(refresh, raw, offset, seed, opt_state)
+        self.seconds += time.time() - started
+        return opt_state
+
+    def _append(
+        self,
+        refresh: int,
+        raw: Mapping[str, float] | None,
+        offset: int | None,
+        seed: int | None,
+        opt_state: Any,
+    ) -> None:
+        held = module_multipliers(opt_state)
+        _, first, last = self.periods[refresh + 1]
+        self.schedule.append(
+            {
+                "stage": self.stage,
+                "refresh": refresh,
+                "first_update": first,
+                "last_update": last,
+                "energies": None if raw is None else dict(raw),
+                "smoothed": None if self.smoothed is None else dict(self.smoothed),
+                "multipliers": {m: held[m] for m in self.plan.modules},
+                "permutation": self.permutation,
+                "probe_offset": offset,
+                "probe_seed": seed,
+            }
+        )

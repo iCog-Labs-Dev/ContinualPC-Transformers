@@ -37,7 +37,8 @@ domains, so each domain is seen for its full budget within one update.
 With ``gate`` other than ``"none"`` every stage from 2 on multiplies each
 module's AdamW update by a fixed per-module multiplier (``gates.GatePlan``),
 chained after the optimizer so that a multiplier of 0 freezes the module;
-frozen modules' gradients are also zeroed before the global-norm clip.
+frozen modules' gradients are also zeroed before the global-norm clip. The
+online gates change the multipliers inside a stage (``gates.OnlineGate``).
 
 With ``grad_noise_cosine`` c (backprop only) every update's gradient is
 replaced, module by module, by a vector of the same norm and support at
@@ -114,7 +115,10 @@ from fabricpc.nodes.encoder_transformer import (
     mupc_weight_scales,
 )
 from fabricpc.training.optimizers import build_warmup_cosine_adamw
-from fabricpc.training.plasticity_gates import scale_module_updates
+from fabricpc.training.plasticity_gates import (
+    scale_module_updates,
+    scale_module_updates_traced,
+)
 from fabricpc.training.train import _convert_batch
 from fabricpc.training.train_backprop import (
     _apply_optimizer_update_when_masked,
@@ -140,7 +144,27 @@ BERT_MINI_SHAPE = {
 MODES = ("backprop", "pc")
 TRAINING = ("sequential", "joint")
 JOINT_STAGE = "joint"
-GATES = ("none", "map", "random", "inverse", "type", "oracle", "freeze", "uniform")
+ONLINE_GATES = ("online_protect", "online_surprise")
+GATES = (
+    "none",
+    "map",
+    "random",
+    "inverse",
+    "type",
+    "oracle",
+    "freeze",
+    "uniform",
+    *ONLINE_GATES,
+)
+GATE_VARIANTS = ("live", "type", "shuffle", "inverse", "replay")
+ONLINE_SETTINGS = (
+    "gate_map_windows",
+    "gate_seed",
+    "gate_source",
+    "gate_interval",
+    "gate_ema",
+    "gate_variant",
+)
 GATE_SETTINGS = {
     "none": (),
     "map": ("gate_beta", "gate_map_windows"),
@@ -150,6 +174,8 @@ GATE_SETTINGS = {
     "oracle": ("gate_beta", "gate_source"),
     "freeze": ("gate_modules",),
     "uniform": ("gate_scale",),
+    "online_protect": ("gate_beta", *ONLINE_SETTINGS),
+    "online_surprise": ONLINE_SETTINGS,
 }
 PC_INFERENCE = ("spiking", "standard", "epc")
 ITERATIVE_PC = ("standard", "epc")
@@ -225,7 +251,11 @@ RUN_ARTIFACT_FILES = (
     "gates.jsonl",
     *ANALYSIS_FILES,
 )
-RUN_ARTIFACT_PATTERNS = ("stage_*.npz", "training_log_stage_*.jsonl")
+RUN_ARTIFACT_PATTERNS = (
+    "stage_*.npz",
+    "training_log_stage_*.jsonl",
+    "gate_schedule_stage_*.jsonl",
+)
 
 
 @dataclass(frozen=True)
@@ -259,6 +289,12 @@ class RunConfig:
     multiplies the top-down error on each scaled edge by its Jacobian gain.
     Both apply to standard PC and to backprop, where ``"full"`` is the
     optimiser control and ``"jacobian"`` changes no gradient at all.
+
+    The online gates (``ONLINE_GATES``) refresh their multipliers every
+    ``gate_interval`` updates from an energy smoothed with ``gate_ema``;
+    ``gate_variant`` selects the control (``GATE_VARIANTS``), ``gate_seed``
+    applies only to ``shuffle`` and ``gate_source`` (one run) only to
+    ``replay`` (``gates.OnlineGate``).
     """
 
     checkpoint: str
@@ -318,6 +354,9 @@ class RunConfig:
     gate_map_windows: int = 256
     gate_seed: int = 0
     gate_scale: float = 1.0
+    gate_interval: int = 50
+    gate_ema: float = 0.3
+    gate_variant: str = "live"
     log_interval: int = 10
 
     def validate(self) -> None:
@@ -552,6 +591,32 @@ class RunConfig:
                 raise ValueError("gate 'oracle' needs gate_source run directories")
             if len(set(self.gate_source)) != len(self.gate_source):
                 raise ValueError("gate_source has duplicates")
+        if self.gate in ONLINE_GATES:
+            self._validate_online_gate()
+
+    def _validate_online_gate(self) -> None:
+        """Online gate settings: positive interval, ``gate_ema`` in (0, 1], variants."""
+        if self.gate_variant not in GATE_VARIANTS:
+            raise ValueError(
+                f"gate_variant must be one of {GATE_VARIANTS}, got "
+                f"{self.gate_variant!r}"
+            )
+        if self.gate_interval < 1:
+            raise ValueError("gate_interval must be at least 1")
+        if not (math.isfinite(self.gate_ema) and 0.0 < self.gate_ema <= 1.0):
+            raise ValueError("gate_ema must be in (0, 1]")
+        if (
+            self.gate_variant != "shuffle"
+            and self.gate_seed != GATE_DEFAULTS["gate_seed"]
+        ):
+            raise ValueError("gate_seed applies only to gate_variant 'shuffle'")
+        if self.gate_variant == "replay":
+            if len(self.gate_source) != 1:
+                raise ValueError(
+                    "gate_variant 'replay' needs exactly one gate_source run"
+                )
+        elif self.gate_source:
+            raise ValueError("gate_source applies only to gate_variant 'replay'")
 
     def _validate_iterative(self) -> None:
         """Standard PC and ePC need explicit inference settings, no spike flags."""
@@ -620,7 +685,8 @@ class RunConfig:
         runs and both gradient-noise settings for runs without it, so their
         identity is unchanged from before joint training, gates, the
         controller and gradient noise existed; ``pc_mupc`` is left out when
-        off.
+        off. ``gate_scale`` is kept only for ``uniform`` and the online gate
+        settings only for ``ONLINE_GATES``.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
@@ -635,6 +701,9 @@ class RunConfig:
             values["gate_source"] = list(self.gate_source)
             if values["gate"] != "uniform":
                 values.pop("gate_scale")
+            if values["gate"] not in ONLINE_GATES:
+                for key in ("gate_interval", "gate_ema", "gate_variant"):
+                    values.pop(key)
         if values["pc_eta_control"] == "none":
             for key in ("pc_eta_control", *CONTROL_DEFAULTS):
                 values.pop(key)
@@ -879,7 +948,9 @@ def build_stage_optimizer(
     ``multipliers`` chains ``scale_module_updates`` after AdamW, so it scales
     each module's final update, weight decay included; modules with
     multiplier 0 also get zero gradients before the clip, so the clip's
-    global norm covers only the trainable modules.
+    global norm covers only the trainable modules. For ``ONLINE_GATES`` the
+    multipliers start the state of ``scale_module_updates_traced`` instead,
+    which the gate changes between updates; they must be positive.
     """
     warmup_steps = min(num_updates, int(round(config.warmup_fraction * num_updates)))
     optimizer = build_warmup_cosine_adamw(
@@ -902,7 +973,11 @@ def build_stage_optimizer(
         "clip_norm": config.clip_norm,
         "adam_eps": config.optimizer_eps,
     }
-    if multipliers is not None:
+    if multipliers is not None and config.gate in ONLINE_GATES:
+        optimizer = optax.chain(optimizer, scale_module_updates_traced(multipliers))
+        info["module_multipliers"] = {k: float(v) for k, v in multipliers.items()}
+        info["multipliers_traced"] = True
+    elif multipliers is not None:
         frozen = {name: 0.0 for name, value in multipliers.items() if value == 0.0}
         optimizer = optax.chain(optimizer, scale_module_updates(multipliers))
         if frozen:
@@ -1587,6 +1662,7 @@ def train_stage(
     gradient_fn: GradientFn,
     multipliers: Mapping[str, float] | None = None,
     regime_fn: Callable[[int, int, GraphParams, float | None], None] | None = None,
+    gate_fn: Callable[[int, GraphParams, Any], Any] | None = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any], list[dict[str, Any]]]:
     """Train one domain from ``params`` with a fresh optimizer and schedule.
@@ -1619,6 +1695,10 @@ def train_stage(
     ``grad_noise_cosine``, ``grad_noise_mode`` and ``grad_noise_achieved``,
     the mean realised cosine over the rotated modules. The noise keys are separate
     from the batch and dropout keys, so batches and masks are unchanged.
+    ``gate_fn(update, params, opt_state)`` (online gates, ``gates.OnlineGate``)
+    is called before the first update and after every update and returns
+    the optimizer state the next update uses; the jitted update takes the
+    state's multipliers as traced inputs, so a refresh does not retrace it.
     Returns the params, the exposure record and the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
@@ -1644,6 +1724,8 @@ def train_stage(
         raise ValueError("domain stream is too short for one micro-batch")
     optimizer, optimizer_info = build_stage_optimizer(config, num_updates, multipliers)
     opt_state = optimizer.init(params)
+    if gate_fn is not None:
+        opt_state = gate_fn(0, params, opt_state)
     update_fn = jax.jit(
         lambda p, o, g, c: _apply_optimizer_update_when_masked(
             params=p, opt_state=o, grads=g, optimizer=optimizer, masked_count=c
@@ -1798,6 +1880,8 @@ def train_stage(
                 entry["eta_backoff"] = backed_off
                 entry["pc_energy_rel_decrease_ema"] = smoothed
             log.append(entry)
+            if gate_fn is not None:
+                opt_state = gate_fn(updates, params, opt_state)
             if regime_fn is not None:
                 regime_fn(
                     updates,
@@ -1959,11 +2043,14 @@ def _gate_record_matches(
     gate: str,
     parent_sha: str | None,
     exposure: Mapping[str, Any] | None,
+    output: Path | None = None,
 ) -> bool:
     """True when ``stage`` has one gate record that matches what it trained with.
 
     The record must start from ``parent_sha`` and its multipliers must be the
     ``module_multipliers`` of the stage's optimizer (absent when ungated).
+    A gated online-gate stage's record must also name a schedule in
+    ``output`` whose SHA-256 it holds.
     """
     found = [r for r in records if int(r["stage"]) == stage]
     if len(found) != 1 or exposure is None:
@@ -1972,7 +2059,15 @@ def _gate_record_matches(
     if record.get("gate") != gate or record.get("params_sha256") != parent_sha:
         return False
     used = (exposure.get("optimizer") or {}).get("module_multipliers")
-    return used == (record["multipliers"] if record.get("gated") else None)
+    if used != (record["multipliers"] if record.get("gated") else None):
+        return False
+    if gate in ONLINE_GATES and record.get("gated"):
+        schedule = record.get("schedule")
+        if schedule is None or output is None:
+            return False
+        path = output / schedule["file"]
+        return path.is_file() and file_sha256(path) == schedule["sha256"]
+    return True
 
 
 def _matrix(
@@ -2036,7 +2131,10 @@ def run_domain_forgetting(
     all domains mixed; ``forgetting_matrices.json`` is not written and the
     summary holds ``summarize_joint``'s per-domain scores. With a ``gate``,
     every trained stage appends its module multipliers (``GatePlan.record``)
-    to ``gates.jsonl`` and the run config holds ``GatePlan.describe()``.
+    to ``gates.jsonl`` and the run config holds ``GatePlan.describe()``; an
+    online gate also writes each gated stage's periods to
+    ``gate_schedule_stage_<s>.jsonl`` and records its SHA-256 in
+    ``gates.jsonl`` once the stage has trained.
     With ``pc_regime_interval`` k > 0, every trained stage appends to
     ``regime.jsonl`` the ε-spectrum (``make_regime_probe``), the
     ``EPCInference(pc_regime_eta, pc_regime_steps).regime`` verdict and the
@@ -2084,7 +2182,10 @@ def run_domain_forgetting(
     initial_params_sha = params_hash(initial_params)
     gate_plan = None
     if config.gate != "none":
-        from fabricpc.experiments.domain_forgetting.gates import GatePlan
+        from fabricpc.experiments.domain_forgetting.gates import (
+            GatePlan,
+            schedule_name,
+        )
 
         gate_plan = GatePlan(
             config, base, {name: cache.train for name, cache in caches.items()}
@@ -2375,6 +2476,7 @@ def run_domain_forgetting(
                     gate=config.gate,
                     parent_sha=parent_sha,
                     exposure=previous_exposure.get(domain),
+                    output=output,
                 ):
                     reused = None
             reusing = reused is not None
@@ -2406,6 +2508,7 @@ def run_domain_forgetting(
         train_seconds = 0.0
         alignment_seconds = 0.0
         multipliers = None
+        online_gate = None
         if domain is not None:
             if gate_plan is not None:
                 gate_record = gate_plan.record(
@@ -2415,6 +2518,10 @@ def run_domain_forgetting(
                 _write_jsonl(output / "gates.jsonl", gate_records)
                 if gate_record["gated"]:
                     multipliers = gate_record["multipliers"]
+                    if config.gate in ONLINE_GATES:
+                        online_gate = gate_plan.online(
+                            gate_record, caches[domain].train
+                        )
                     if verbose:
                         print(
                             f"stage={stage} gate={config.gate} "
@@ -2443,9 +2550,21 @@ def run_domain_forgetting(
                 gradient_fn=gradient_fn,
                 multipliers=multipliers,
                 regime_fn=regime_fn,
+                gate_fn=online_gate,
                 verbose=verbose,
             )
             train_seconds = time.time() - train_start - regime_seconds[0]
+            if online_gate is not None:
+                train_seconds -= online_gate.seconds
+                schedule_path = output / schedule_name(stage)
+                _write_jsonl(schedule_path, online_gate.schedule)
+                gate_record["schedule"] = {
+                    "file": schedule_path.name,
+                    "sha256": file_sha256(schedule_path),
+                    "periods": len(online_gate.schedule),
+                }
+                gate_record["seconds"] += online_gate.seconds
+                _write_jsonl(output / "gates.jsonl", gate_records)
             if regime_probe is not None:
                 _write_jsonl(output / "regime.jsonl", regime_records)
             exposure[domain] = stage_exposure
