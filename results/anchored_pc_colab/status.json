@@ -1,0 +1,18 @@
+{
+  "branch": "feat/anchored-pc-diagnostic",
+  "base_revision": "68088cb22fe80e258d760ea5690aa1e9603383f4",
+  "local_suite": "559 passed, 1 xfailed, 1 warning",
+  "final_targeted_checks": "13 passed",
+  "type_check": "passed with fresh cache",
+  "colab_url": "https://colab.research.google.com/drive/1u1ovIO7eee-y6ZIfJLGOxx62joPCEcbZ",
+  "bundle_sha256": "85923dab55dce8de03c5b4abc5d96275f88756f7033b24fb1bce774f0a0ffd65",
+  "colab_tests": "13 passed; GPU computation verified after removing preinstalled CUDA 13 plugin conflict",
+  "colab_status": "complete",
+  "run_id": "results_20261024T122712Z",
+  "committed": false,
+  "decision": "no_go",
+  "scientific_status": "convergence_failed",
+  "elapsed_seconds": 430.0880550659999,
+  "reason": "no solver passed both calibration batches",
+  "evidence_sha256": "66ecf68b653626be5ba02924ad3d4c764e5b6d5758d96555373c7f84bc6280e6"
+}

@@ -1,0 +1,11 @@
+{
+  "status": "prepared_not_started",
+  "rates": [0.001, 0.0001],
+  "step_pairs": [[30, 60], [60, 120], [120, 240]],
+  "relative_residual_limit": 0.001,
+  "parameter_gradient_change_limit": 0.01,
+  "source_rule_changed": false,
+  "inputs_uploaded": true,
+  "blocker": "Automatic browser approval review failed because the workspace spend cap was reached. A workspace owner must increase the cap before browser control can continue.",
+  "prior_evidence_safe_locally": true
+}
