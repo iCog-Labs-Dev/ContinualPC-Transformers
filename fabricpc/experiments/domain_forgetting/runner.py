@@ -1593,7 +1593,10 @@ def train_stage(
     the same ones. ``multipliers`` scales each module's update
     (``build_stage_optimizer``). Each log entry holds ``grad_norm``, the
     global norm of the update's gradient as the clip sees it (frozen modules
-    zeroed), and ``clipped``, whether the clip rescaled it. ``regime_fn(update,
+    zeroed), ``clipped``, whether the clip rescaled it, and ``update_norm``
+    and ``module_update_norms``, the global and per-module norms of the
+    applied parameter change (gate and weight decay included), whose sum
+    over a stage is its update path length. ``regime_fn(update,
     num_updates, params, eta)`` is called before the first update and after
     every update with the ePC rate the next update uses, or after the last
     update the rate it used (None without the rate controller); it must
@@ -1645,6 +1648,15 @@ def train_stage(
         lambda g: optax.tree.norm(
             {name: node for name, node in g.nodes.items() if name not in frozen}
         )
+    )
+    update_norm_fn = jax.jit(
+        lambda new, old: {
+            name: optax.tree.norm(
+                jax.tree_util.tree_map(jnp.subtract, node, old.nodes[name])
+            )
+            for name, node in new.nodes.items()
+            if jax.tree_util.tree_leaves(node)
+        }
     )
     controlled = config.pc_eta_control == "energy"
     eta = config.pc_eta_infer
@@ -1701,9 +1713,14 @@ def train_stage(
                 )
                 noise_achieved = float(achieved)
             grad_norm = float(clip_norm_fn(pending_grads))
+            previous = params
             params, opt_state = update_fn(
                 params, opt_state, pending_grads, jnp.asarray(pending_count)
             )
+            module_norms = {
+                name: float(value)
+                for name, value in update_norm_fn(params, previous).items()
+            }
             updates += 1
             entry: dict[str, Any] = {
                 "stage": stage,
@@ -1716,6 +1733,8 @@ def train_stage(
                     and pending_count > 0
                     and grad_norm > config.clip_norm
                 ),
+                "update_norm": math.sqrt(sum(v * v for v in module_norms.values())),
+                "module_update_norms": module_norms,
             }
             if noise_achieved is not None:
                 entry["grad_noise_cosine"] = config.noise_cosine(stage)
@@ -1790,7 +1809,7 @@ def train_stage(
                     + " ".join(
                         f"{k}={v:.4g}" if isinstance(v, (int, float)) else f"{k}={v}"
                         for k, v in entry.items()
-                        if k not in ("stage", "update")
+                        if k not in ("stage", "update", "module_update_norms")
                     )
                 )
             pending_batches = []
