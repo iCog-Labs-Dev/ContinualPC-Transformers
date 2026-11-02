@@ -8,7 +8,11 @@ perturbed initialisation for the float32 noise floor, or BP with gradient
 noise at a fixed per-module cosine) against a BP run of the same setup. ``probe`` prints per-module PC vs backprop gradient cosines
 and norm ratios on fixed batches of one domain, for one or a grid of PC
 inference settings; for ePC it also measures the ε-spectrum and prints the
-regime verdict of each setting.
+regime verdict of each setting. ``calibrate_penalty`` takes the run flags
+and writes, on fixed training batches of one domain at the checkpoint, the
+per-module norms of the task gradient and of the error-norm penalty's
+gradient at weight 1, and ``r1``, their median ratio over the block modules:
+``--pc_error_norm_penalty r / r1`` gives the block modules a ratio ``r``.
 
 Usage:
     PYTHONPATH=. python examples/mlm_domain_forgetting.py \\
@@ -47,6 +51,11 @@ Usage:
     --gate_interval updates from the live energy smoothed with --gate_ema
     (schedules in gate_schedule_stage_<s>.jsonl), with --gate_variant live,
     type, shuffle (--gate_seed), inverse or replay (one --gate_source run).
+
+    Interventions in every stage (any mode): --pc_error_norm_penalty GAMMA
+    adds GAMMA times the backpropagated error norm at eps = 0 to the
+    objective; --update_scale_modules NAME... --update_scale KAPPA multiplies
+    those modules' final AdamW update by KAPPA (composes with --gate).
 
     $ETA has no default worth reusing. The MLM head energy is
     s * sum(masked CE) (a fixed per-token precision), so latent gradients, and
@@ -117,13 +126,15 @@ from fabricpc.experiments.domain_forgetting.runner import (
     GATE_VARIANTS,
     TRAINING,
     RunConfig,
+    calibrate_error_norm_penalty,
     compare_runs,
     run_domain_forgetting,
 )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Return the parser of the run command."""
+def build_parser(output_required: bool = True) -> argparse.ArgumentParser:
+    """Return the parser of the run command; ``output_required`` False makes
+    ``--output_dir`` optional (``calibrate_penalty``)."""
     defaults = RunConfig(checkpoint="", data_dir="", domains=(), output_dir="")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", required=True)
@@ -131,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--domains", nargs="+", default=list(DOMAIN_REGISTRY), metavar="DOMAIN"
     )
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--output_dir", required=output_required, default="")
     parser.add_argument("--mode", choices=MODES, default=defaults.mode)
     parser.add_argument(
         "--training",
@@ -353,6 +364,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=defaults.gate_variant,
         help="Online gate variant",
     )
+    parser.add_argument(
+        "--pc_error_norm_penalty",
+        type=float,
+        default=defaults.pc_error_norm_penalty,
+        metavar="GAMMA",
+        help="Add GAMMA times the backpropagated error norm sum_l |dE/d eps_l|^2 "
+        "at eps = 0, per masked token, to every update's objective (any mode); "
+        "0 = off",
+    )
+    parser.add_argument(
+        "--update_scale_modules",
+        nargs="*",
+        default=list(defaults.update_scale_modules),
+        metavar="NAME",
+        help="Modules or groups (as --gate_modules) whose final update "
+        "--update_scale multiplies in every stage",
+    )
+    parser.add_argument(
+        "--update_scale",
+        type=float,
+        default=defaults.update_scale,
+        metavar="KAPPA",
+        help="Multiplier of the --update_scale_modules updates, after AdamW and "
+        "any gate",
+    )
     parser.add_argument("--log_interval", type=int, default=defaults.log_interval)
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume", action="store_true")
@@ -540,6 +576,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         gate_interval=args.gate_interval,
         gate_ema=args.gate_ema,
         gate_variant=args.gate_variant,
+        pc_error_norm_penalty=args.pc_error_norm_penalty,
+        update_scale_modules=tuple(args.update_scale_modules),
+        update_scale=args.update_scale,
         log_interval=args.log_interval,
     )
 
@@ -558,6 +597,27 @@ def run_compare(argv: Sequence[str]) -> dict[str, Any]:
     return report
 
 
+def build_calibrate_parser() -> argparse.ArgumentParser:
+    """Return the parser of ``calibrate_penalty``: the run flags plus its own."""
+    parser = build_parser(output_required=False)
+    parser.prog = "mlm_domain_forgetting.py calibrate_penalty"
+    parser.add_argument("--domain", choices=list(DOMAIN_REGISTRY), default="news")
+    parser.add_argument("--batches", type=int, default=4)
+    parser.add_argument("--out", required=True, help="Write the JSON here")
+    return parser
+
+
+def run_calibrate_penalty(argv: Sequence[str]) -> dict[str, Any]:
+    """Write the error-norm penalty calibration of one run setup."""
+    args = build_calibrate_parser().parse_args(argv)
+    report = calibrate_error_norm_penalty(
+        config_from_args(args), args.domain, args.batches
+    )
+    atomic_write_json(args.out, report)
+    print(json.dumps({"r1": report["r1"], "out": args.out}, sort_keys=True))
+    return report
+
+
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     """Run the benchmark, ``compare`` two finished runs, or ``probe`` alignment."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -565,6 +625,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         return run_compare(argv[1:])
     if argv[:1] == ["probe"]:
         return run_probe(argv[1:])
+    if argv[:1] == ["calibrate_penalty"]:
+        return run_calibrate_penalty(argv[1:])
     args = build_parser().parse_args(argv)
     result = run_domain_forgetting(
         config_from_args(args), resume=args.resume, overwrite=args.overwrite

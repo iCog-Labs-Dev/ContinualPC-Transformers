@@ -83,6 +83,24 @@ def lr_text(lr: float) -> str:
     return short if float(short) == lr else f"{lr:g}"
 
 
+def intervention_label(config: Mapping[str, Any]) -> str:
+    """Return the suffix naming a run's error-norm penalty and update scale.
+
+    ``"_pen0.001"`` for ``pc_error_norm_penalty`` 0.001 and
+    ``"_scale0.5[embeddings,L0_mha]"`` for an update scale on those modules;
+    empty for a run with neither.
+    """
+    label = ""
+    penalty = float(config.get("pc_error_norm_penalty", 0.0))
+    if penalty:
+        label += f"_pen{penalty:g}"
+    modules = config.get("update_scale_modules", [])
+    if modules:
+        scale = float(config.get("update_scale", 1.0))
+        label += f"_scale{scale:g}[{','.join(modules)}]"
+    return label
+
+
 def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     """Return ``(gate, beta, label)`` of a run's ``run_config["config"]``.
 
@@ -90,11 +108,13 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"``,
     ``"online_protect_b2"``, ``"online_surprise"`` (a non-live variant
     appended, as in ``"online_protect_b2_replay"``) and, for ungated runs,
-    ``"lr3e-05"``.
+    ``"lr3e-05"``. An error-norm penalty or update scale appends
+    ``intervention_label``, as in ``"lr3e-05_pen0.001"``.
     """
     gate = config.get("gate", REFERENCE)
+    intervention = intervention_label(config)
     if gate == REFERENCE:
-        return gate, None, f"lr{lr_text(float(config['lr']))}"
+        return gate, None, f"lr{lr_text(float(config['lr']))}{intervention}"
     settings = GATE_SETTINGS.get(gate, ())
     beta = float(config["gate_beta"]) if "gate_beta" in settings else None
     if gate == "freeze":
@@ -110,7 +130,7 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
         label += f"_{variant}"
     if not math.isclose(float(config["lr"]), SEQ_LR):
         label += f"@lr{lr_text(float(config['lr']))}"
-    return gate, beta, label
+    return gate, beta, label + intervention
 
 
 def load_run_point(run_dir: str | Path) -> dict[str, Any] | None:
@@ -139,6 +159,7 @@ def load_run_point(run_dir: str | Path) -> dict[str, Any] | None:
         "gate": gate,
         "beta": beta,
         "label": label,
+        "intervention": bool(intervention_label(config)),
         "x": _mean(gains[d] for d in domains),
         "y": _mean(final[d] for d in domains),
         "bwt": float(summary["bwt_ce"]) if "bwt_ce" in summary else None,
@@ -242,7 +263,12 @@ def mean_sd(values: Sequence[float | None]) -> dict[str, Any]:
 
 
 def _is_reference(point: Mapping[str, Any]) -> bool:
-    return point["training"] != "joint" and point["gate"] == REFERENCE
+    """Ungated sequential runs without an error-norm penalty or update scale."""
+    return (
+        point["training"] != "joint"
+        and point["gate"] == REFERENCE
+        and not point.get("intervention", False)
+    )
 
 
 def _seed_mean_curve(points: Sequence[Mapping[str, Any]]) -> dict[str, list]:
@@ -362,7 +388,11 @@ def _by_beta(
 ) -> dict[float, dict[int, Mapping[str, Any]]]:
     out: dict[float, dict[int, Mapping[str, Any]]] = {}
     for p in members:
-        if p["gate"] == gate and math.isclose(p["lr"], seq_lr):
+        if (
+            p["gate"] == gate
+            and math.isclose(p["lr"], seq_lr)
+            and not p.get("intervention", False)
+        ):
             out.setdefault(p["beta"], {})[p["seed"]] = p
     return out
 

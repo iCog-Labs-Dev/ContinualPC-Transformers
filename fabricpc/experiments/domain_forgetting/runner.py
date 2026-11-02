@@ -44,6 +44,13 @@ With ``grad_noise_cosine`` c (backprop only) every update's gradient is
 replaced, module by module, by a vector of the same norm and support at
 cosine exactly c to it, with a seeded random orthogonal part
 (``noise_gradients``).
+
+With ``pc_error_norm_penalty`` γ > 0 every update's gradient adds the weight
+gradient of γ times the error-norm penalty (``make_error_norm_penalty_fn``),
+before the clip, in any mode. With ``update_scale_modules`` and
+``update_scale`` κ every stage, stage 1 included, multiplies the named
+modules' final AdamW update by κ, independently of the gates, whose
+multipliers it multiplies.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ from __future__ import annotations
 import json
 import math
 import platform
+import re
 import shutil
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -226,6 +234,7 @@ COMPARE_IGNORED_KEYS = (
     "init_perturbation_seed",
     *GRAD_NOISE_SETTINGS,
 )
+COMPARE_KEPT_PC_KEYS = ("pc_error_norm_penalty",)
 ANALYSIS_FILES = (
     "drift.json",
     "rollback.json",
@@ -295,6 +304,15 @@ class RunConfig:
     ``gate_variant`` selects the control (``GATE_VARIANTS``), ``gate_seed``
     applies only to ``shuffle`` and ``gate_source`` (one run) only to
     ``replay`` (``gates.OnlineGate``).
+
+    ``pc_error_norm_penalty`` γ (0 = off) adds γ·P to every update's
+    objective, P the error-norm penalty of ``make_error_norm_penalty_fn``
+    normalised by the update's masked-token count; it applies to every mode
+    but not with gradient noise or μPC. ``update_scale_modules`` (module or
+    group names, resolved like ``gate_modules``) and ``update_scale`` κ
+    (finite, positive) multiply those modules' final AdamW update by κ in
+    every stage, composing with any gate by multiplication; κ = 1 or no
+    modules leaves the run unchanged.
     """
 
     checkpoint: str
@@ -357,6 +375,9 @@ class RunConfig:
     gate_interval: int = 50
     gate_ema: float = 0.3
     gate_variant: str = "live"
+    pc_error_norm_penalty: float = 0.0
+    update_scale_modules: tuple[str, ...] = ()
+    update_scale: float = 1.0
     log_interval: int = 10
 
     def validate(self) -> None:
@@ -403,6 +424,23 @@ class RunConfig:
         self._validate_grad_noise()
         self._validate_mupc()
         self._validate_gate()
+        self._validate_intervention()
+
+    def _validate_intervention(self) -> None:
+        """The error-norm penalty and the per-module update scale."""
+        penalty = self.pc_error_norm_penalty
+        if not (math.isfinite(penalty) and penalty >= 0.0):
+            raise ValueError("pc_error_norm_penalty must be finite and non-negative")
+        if penalty > 0.0 and self.grad_noise_cosine is not None:
+            raise ValueError("pc_error_norm_penalty does not combine with grad_noise")
+        if penalty > 0.0 and self.pc_mupc != "off":
+            raise ValueError("pc_error_norm_penalty does not support pc_mupc")
+        if not (math.isfinite(self.update_scale) and self.update_scale > 0.0):
+            raise ValueError("update_scale must be finite and positive")
+        if self.update_scale != 1.0 and not self.update_scale_modules:
+            raise ValueError("update_scale needs update_scale_modules")
+        if len(set(self.update_scale_modules)) != len(self.update_scale_modules):
+            raise ValueError("update_scale_modules has duplicates")
 
     def _validate_mupc(self) -> None:
         """μPC applies to backprop and standard PC, without the ε-spectrum probe."""
@@ -686,7 +724,9 @@ class RunConfig:
         identity is unchanged from before joint training, gates, the
         controller and gradient noise existed; ``pc_mupc`` is left out when
         off. ``gate_scale`` is kept only for ``uniform`` and the online gate
-        settings only for ``ONLINE_GATES``.
+        settings only for ``ONLINE_GATES``. ``pc_error_norm_penalty`` is left
+        out at 0 and both update-scale settings without
+        ``update_scale_modules``, so runs from before they existed resume.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
@@ -716,6 +756,13 @@ class RunConfig:
             values["grad_noise_stage_cosines"] = list(self.grad_noise_stage_cosines)
         if values["pc_mupc"] == "off":
             values.pop("pc_mupc")
+        if values["pc_error_norm_penalty"] == 0.0:
+            values.pop("pc_error_norm_penalty")
+        if not values["update_scale_modules"]:
+            values.pop("update_scale_modules")
+            values.pop("update_scale")
+        else:
+            values["update_scale_modules"] = list(self.update_scale_modules)
         values["domains"] = list(self.domains)
         return values
 
@@ -940,6 +987,7 @@ def build_stage_optimizer(
     config: RunConfig,
     num_updates: int,
     multipliers: Mapping[str, float] | None = None,
+    update_scales: Mapping[str, float] | None = None,
 ) -> tuple[optax.GradientTransformation, dict[str, Any]]:
     """AdamW with linear warmup then cosine decay to ``min_lr_ratio * lr``.
 
@@ -951,6 +999,10 @@ def build_stage_optimizer(
     global norm covers only the trainable modules. For ``ONLINE_GATES`` the
     multipliers start the state of ``scale_module_updates_traced`` instead,
     which the gate changes between updates; they must be positive.
+    ``update_scales`` (``update_scale_multipliers``) chains a second
+    ``scale_module_updates`` after those, so a module's final update is
+    multiplied by its gate multiplier and its update scale; the clip sees
+    the full gradient. It is recorded under ``update_scale``.
     """
     warmup_steps = min(num_updates, int(round(config.warmup_fraction * num_updates)))
     optimizer = build_warmup_cosine_adamw(
@@ -983,7 +1035,42 @@ def build_stage_optimizer(
         if frozen:
             optimizer = optax.chain(scale_module_updates(frozen), optimizer)
         info["module_multipliers"] = {k: float(v) for k, v in multipliers.items()}
+    if update_scales:
+        optimizer = optax.chain(optimizer, scale_module_updates(update_scales))
+        info["update_scale"] = {k: float(v) for k, v in update_scales.items()}
     return optimizer, info
+
+
+def resolve_update_scale_modules(
+    config: RunConfig, structure: GraphStructure, params: GraphParams
+) -> list[str]:
+    """The parameterised modules ``update_scale_modules`` names, in graph order.
+
+    Module and group names resolve as for ``gate_modules``
+    (``gates.resolve_modules``).
+    """
+    if not config.update_scale_modules:
+        return []
+    from fabricpc.experiments.domain_forgetting.gates import resolve_modules
+
+    modules = [
+        name
+        for name in structure.node_order
+        if jax.tree_util.tree_leaves(params.nodes[name])
+    ]
+    return resolve_modules(modules, config.update_scale_modules)
+
+
+def update_scale_multipliers(
+    config: RunConfig, structure: GraphStructure, params: GraphParams
+) -> dict[str, float] | None:
+    """``{module: update_scale}`` over the resolved modules; None when κ is 1."""
+    if config.update_scale == 1.0 or not config.update_scale_modules:
+        return None
+    return {
+        name: float(config.update_scale)
+        for name in resolve_update_scale_modules(config, structure, params)
+    }
 
 
 def flatten_params(params: GraphParams) -> dict[str, np.ndarray]:
@@ -1191,6 +1278,108 @@ def make_gradient_fn(
         )
 
     return pc
+
+
+class PenaltyFn(Protocol):
+    """``(params, batch, key) -> (penalty_sum, penalty_grads)``."""
+
+    def __call__(
+        self,
+        params: GraphParams,
+        batch: dict[str, jax.Array],
+        key: jax.Array,
+    ) -> tuple[jax.Array, GraphParams]: ...
+
+
+def make_error_norm_penalty_fn(structure: GraphStructure) -> PenaltyFn:
+    """Return the jitted error-norm penalty of one micro-batch and its gradient.
+
+    The penalty is ``Σ_ℓ ‖∂E/∂ε_ℓ‖²`` at ε = 0, summed over the batch, with
+    ``E`` the ε-energy (``EPCInference.error_energy``) of the target-clamped
+    batch and ``ℓ`` the nodes ePC relaxes: every unclamped node except
+    readouts. The MLM output is clamped to the targets, so it is not among
+    them, and the inputs are clamped too. At ε = 0 every relaxed node's own
+    term ``½‖ε_ℓ‖²`` has zero gradient, so ``∂E/∂ε_ℓ = ∂L/∂z_ℓ`` with
+    ``L = s · Σ_masked CE`` the head energy: the backpropagated error at the
+    feedforward state, whose norm is the regime probe's ``gradient_norm``.
+    The penalty therefore scales as ``s²``. The relaxed errors are set to
+    zero explicitly, so the point does not depend on the graph's state
+    initializer, and dropout masks come from ``key`` as in both training
+    modes. The gradient is the double backward pass through ``jax.grad``,
+    with respect to every weight.
+    """
+
+    def penalty(params, clamps, state):
+        energy_of, errors = EPCInference.error_energy(params, state, clamps, structure)
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, errors)
+        grads = jax.grad(lambda e: energy_of(e)[0])(zeros)
+        return sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads))
+
+    @jax.jit
+    def penalty_and_grad(params, batch, key):
+        _shared, _metrics, _free, initial, clamps = _prepare_pcn_mlm_batch(
+            params, batch, structure, key
+        )
+        state = jax.lax.stop_gradient(initial)
+        return jax.value_and_grad(penalty)(params, clamps, state)
+
+    return penalty_and_grad
+
+
+@jax.jit
+def _scaled(tree: GraphParams, scale: jax.Array) -> GraphParams:
+    """``scale`` times every leaf of ``tree``, cast to each leaf's dtype."""
+    return jax.tree_util.tree_map(lambda x: scale.astype(x.dtype) * x, tree)
+
+
+@jax.jit
+def _tree_sum(left: GraphParams, right: GraphParams) -> GraphParams:
+    """The leafwise sum of two gradient trees."""
+    return jax.tree_util.tree_map(jnp.add, left, right)
+
+
+@jax.jit
+def module_grad_norms(grads: GraphParams) -> dict[str, jax.Array]:
+    """The L2 norm of each parameterised node's gradient."""
+    return {
+        name: optax.tree.norm(node)
+        for name, node in grads.nodes.items()
+        if jax.tree_util.tree_leaves(node)
+    }
+
+
+def error_norm_penalty_gradient(
+    penalty_fn: PenaltyFn,
+    params: GraphParams,
+    micro_batches: Sequence[Mapping[str, jax.Array]],
+    keys: Sequence[jax.Array],
+    count: float,
+    weight: float,
+) -> tuple[GraphParams, float]:
+    """Return ``weight`` times the normalised penalty's weight gradient and the
+    normalised penalty before ``weight``.
+
+    The penalty sums over the micro-batches, which is the whole batch's
+    penalty because ε is per sample, and is divided once by ``max(count,
+    1)``, the update's masked-token count, as the gradients are
+    (``accumulate_gradients``). The value is summed on device and read once.
+    """
+    total_value = None
+    total = None
+    for batch, key in zip(micro_batches, keys, strict=True):
+        value, penalty_grads = penalty_fn(params, batch, key)
+        if total is None:
+            total_value, total = value, penalty_grads
+        else:
+            total_value = total_value + value
+            total = _tree_sum(total, penalty_grads)
+    if total is None:
+        raise ValueError("an update needs at least one micro-batch")
+    denominator = max(count, 1.0)
+    return (
+        _scaled(total, jnp.asarray(weight / denominator, jnp.float32)),
+        float(total_value) / denominator,
+    )
 
 
 def accumulate_gradients(
@@ -1663,6 +1852,7 @@ def train_stage(
     multipliers: Mapping[str, float] | None = None,
     regime_fn: Callable[[int, int, GraphParams, float | None], None] | None = None,
     gate_fn: Callable[[int, GraphParams, Any], Any] | None = None,
+    penalty_fn: PenaltyFn | None = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any], list[dict[str, Any]]]:
     """Train one domain from ``params`` with a fresh optimizer and schedule.
@@ -1699,6 +1889,18 @@ def train_stage(
     is called before the first update and after every update and returns
     the optimizer state the next update uses; the jitted update takes the
     state's multipliers as traced inputs, so a refresh does not retrace it.
+    With ``pc_error_norm_penalty`` γ > 0 each update's accumulated gradient
+    adds γ times the gradient of the normalised error-norm penalty
+    (``error_norm_penalty_gradient`` with ``penalty_fn``, built from
+    ``structure`` when not given) before the clip, so ``grad_norm`` and
+    ``clipped`` describe the sum, and each log entry adds
+    ``error_norm_penalty`` (the normalised penalty),
+    ``error_norm_penalty_weighted`` (γ times it), ``task_grad_norm`` and
+    ``error_norm_penalty_grad_norm`` (the global norms of the gradient before
+    the penalty and of the added term, as the clip measures them) and their
+    per-module versions ``module_task_grad_norms`` and
+    ``module_penalty_grad_norms``. The update scale
+    (``update_scale_multipliers``) applies in every stage.
     Returns the params, the exposure record and the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
@@ -1722,7 +1924,15 @@ def train_stage(
     )
     if len(batcher) == 0:
         raise ValueError("domain stream is too short for one micro-batch")
-    optimizer, optimizer_info = build_stage_optimizer(config, num_updates, multipliers)
+    optimizer, optimizer_info = build_stage_optimizer(
+        config,
+        num_updates,
+        multipliers,
+        update_scale_multipliers(config, structure, params),
+    )
+    penalty_weight = float(config.pc_error_norm_penalty)
+    if penalty_weight and penalty_fn is None:
+        penalty_fn = make_error_norm_penalty_fn(structure)
     opt_state = optimizer.init(params)
     if gate_fn is not None:
         opt_state = gate_fn(0, params, opt_state)
@@ -1789,6 +1999,27 @@ def train_stage(
                     eta_infer=jnp.asarray(eta) if controlled else None,
                 )
             )
+            penalty = None
+            if penalty_weight:
+                penalty_grads, penalty = error_norm_penalty_gradient(
+                    penalty_fn,
+                    params,
+                    pending_batches,
+                    pending_keys,
+                    pending_count,
+                    penalty_weight,
+                )
+                components = {
+                    "task_grad_norm": float(clip_norm_fn(pending_grads)),
+                    "error_norm_penalty_grad_norm": float(clip_norm_fn(penalty_grads)),
+                    "module_task_grad_norms": {
+                        k: float(v) for k, v in module_grad_norms(pending_grads).items()
+                    },
+                    "module_penalty_grad_norms": {
+                        k: float(v) for k, v in module_grad_norms(penalty_grads).items()
+                    },
+                }
+                pending_grads = _tree_sum(pending_grads, penalty_grads)
             noise_achieved = None
             if config.grad_noise_cosine is not None:
                 pending_grads, achieved = noise_gradients(
@@ -1824,6 +2055,10 @@ def train_stage(
                 "update_norm": math.sqrt(sum(v * v for v in module_norms.values())),
                 "module_update_norms": module_norms,
             }
+            if penalty is not None:
+                entry["error_norm_penalty"] = penalty
+                entry["error_norm_penalty_weighted"] = penalty_weight * penalty
+                entry.update(components)
             if noise_achieved is not None:
                 entry["grad_noise_cosine"] = config.noise_cosine(stage)
                 entry["grad_noise_mode"] = config.grad_noise_mode
@@ -1899,7 +2134,7 @@ def train_stage(
                     + " ".join(
                         f"{k}={v:.4g}" if isinstance(v, (int, float)) else f"{k}={v}"
                         for k, v in entry.items()
-                        if k not in ("stage", "update", "module_update_norms")
+                        if k not in ("stage", "update") and not k.startswith("module_")
                     )
                 )
             pending_batches = []
@@ -1929,6 +2164,100 @@ def train_stage(
             "last": etas_used[-1],
         }
     return params, exposure, log
+
+
+BLOCK_MODULE_PATTERN = re.compile(r"^L\d+_(mha|mlp1|mlp2)$")
+
+
+def calibrate_error_norm_penalty(
+    config: RunConfig, domain: str = "news", num_batches: int = 4
+) -> dict[str, Any]:
+    """Per-module norms of the task gradient and of the penalty gradient at γ = 1.
+
+    On ``num_batches`` fixed training batches of ``domain``
+    (``fixed_mlm_batches`` with seed ``config.seed``, ``micro_batch_size or
+    batch_size`` windows, dropout keys as there) at the checkpoint params,
+    each batch is one update: the task gradient is the normalised weight
+    gradient the runner would clip (``accumulate_gradients``) and the penalty
+    gradient is ``∇_θ P / N`` (``error_norm_penalty_gradient`` at weight 1).
+    Per module the norms are averaged over batches and ``ratio`` is the mean
+    penalty norm over the mean task norm; ``r1`` is the median ratio over the
+    ``L{i}_mha``, ``L{i}_mlp1`` and ``L{i}_mlp2`` block modules, so
+    ``γ = r / r1`` gives those modules a median ratio ``r`` at the start.
+    """
+    config.validate()
+    base = load_base_model(config)
+    seq_len = int(base.model_config["seq_len"])
+    stream = load_domain_cache(
+        config.data_dir,
+        domain,
+        tokenizer_json=base.tokenizer_json,
+        seq_len=seq_len,
+        tokens_per_domain=config.tokens_per_domain,
+    ).train
+    batch_size = config.micro_batch_size or config.batch_size
+    batches, keys = fixed_mlm_batches(
+        stream,
+        base.structure,
+        base.special_ids,
+        num_batches=num_batches,
+        batch_size=batch_size,
+        mask_prob=config.mask_prob,
+        seed=config.seed,
+    )
+    gradient_fn = make_gradient_fn(
+        config.mode, base.structure, config.pc_forward_updates, config.pc_inference
+    )
+    penalty_fn = make_error_norm_penalty_fn(base.structure)
+    task_norms: dict[str, list[float]] = {}
+    penalty_norms: dict[str, list[float]] = {}
+    losses, penalties = [], []
+    for batch, key in zip(batches, keys, strict=True):
+        grads, loss_sum, count, _ = accumulate_gradients(
+            gradient_fn, base.params, [batch], [key], summed=config.mode == "pc"
+        )
+        penalty_grads, penalty = error_norm_penalty_gradient(
+            penalty_fn, base.params, [batch], [key], count, 1.0
+        )
+        losses.append(loss_sum / max(count, 1.0))
+        penalties.append(penalty)
+        for norms, tree in ((task_norms, grads), (penalty_norms, penalty_grads)):
+            for name, value in module_grad_norms(tree).items():
+                norms.setdefault(name, []).append(float(value))
+    modules = {}
+    for name in [n for n in base.structure.node_order if n in task_norms]:
+        task = float(np.mean(task_norms[name]))
+        penalty = float(np.mean(penalty_norms[name]))
+        modules[name] = {
+            "task_grad_norm": task,
+            "penalty_grad_norm": penalty,
+            "ratio": penalty / task if task > 0 else None,
+        }
+    blocks = [name for name in modules if BLOCK_MODULE_PATTERN.match(name)]
+    ratios = [modules[n]["ratio"] for n in blocks if modules[n]["ratio"] is not None]
+    if not ratios:
+        raise ValueError("no block module has a non-zero task gradient")
+    return {
+        "mode": config.mode,
+        "pc_inference": config.pc_inference if config.mode == "pc" else None,
+        "pc_eta_infer": config.pc_eta_infer if config.mode == "pc" else None,
+        "pc_infer_steps": config.pc_infer_steps if config.mode == "pc" else None,
+        "pc_output_energy_scale": config.pc_output_energy_scale,
+        "checkpoint": config.checkpoint,
+        "params_sha256": base.source["params_sha256"],
+        "domain": domain,
+        "num_batches": num_batches,
+        "batch_size": batch_size,
+        "seed": config.seed,
+        "dropout_rate": config.dropout_rate,
+        "masked_loss_mean": float(np.mean(losses)),
+        "error_norm_penalty_mean": float(np.mean(penalties)),
+        "block_modules": blocks,
+        "modules": modules,
+        "r1": float(np.median(ratios)),
+        "rule": "gamma = r / r1 gives the block modules a median ratio "
+        "|gamma grad P / N| / |task grad| of r at the checkpoint",
+    }
 
 
 def evaluate_domains(
@@ -2262,6 +2591,23 @@ def run_domain_forgetting(
             "only), sorted module index)",
             "applied": "after accumulation, before the clip",
         }
+    if config.pc_error_norm_penalty:
+        run_config["error_norm_penalty"] = {
+            "weight": config.pc_error_norm_penalty,
+            "penalty": "sum over relaxed ePC nodes of |dE/d eps|^2 at eps = 0 "
+            "(the backpropagated error of the head energy), summed over the "
+            "update's micro-batches, divided by its masked tokens",
+            "applied": "weight * gradient added after accumulation, before the clip",
+        }
+    if config.update_scale_modules:
+        run_config["update_scale"] = {
+            "modules": resolve_update_scale_modules(
+                config, base.structure, base.params
+            ),
+            "scale": config.update_scale,
+            "placement": "after AdamW and any gate (scales the final update, "
+            "weight decay included); every stage",
+        }
     run_config_path = output / "run_config.json"
     previous_config = _read_json(run_config_path) if resume else None
     if previous_config is not None and json.loads(
@@ -2378,6 +2724,11 @@ def run_domain_forgetting(
 
     gradient_fn = make_gradient_fn(
         config.mode, base.structure, config.pc_forward_updates, config.pc_inference
+    )
+    penalty_fn = (
+        make_error_norm_penalty_fn(base.structure)
+        if config.pc_error_norm_penalty
+        else None
     )
     alignment_fn = (
         make_alignment_fn(base.structure, config.pc_forward_updates)
@@ -2551,6 +2902,7 @@ def run_domain_forgetting(
                 multipliers=multipliers,
                 regime_fn=regime_fn,
                 gate_fn=online_gate,
+                penalty_fn=penalty_fn,
                 verbose=verbose,
             )
             train_seconds = time.time() - train_start - regime_seconds[0]
@@ -2700,7 +3052,9 @@ def _comparable_config(run_config: Mapping[str, Any]) -> dict[str, Any]:
     """Return a run's config without the keys a comparison may vary."""
     values = dict(run_config["config"])
     for key in list(values):
-        if key in COMPARE_IGNORED_KEYS or key.startswith("pc_"):
+        if key in COMPARE_IGNORED_KEYS or (
+            key.startswith("pc_") and key not in COMPARE_KEPT_PC_KEYS
+        ):
             values.pop(key)
     return json.loads(dumps_strict(values, sort_keys=True))
 
@@ -2710,7 +3064,8 @@ def check_comparable_runs(
 ) -> list[str]:
     """Return why two ``run_config.json`` payloads cannot be compared (empty if fine).
 
-    The configs must be equal except for ``mode``, ``pc_*``, ``output_dir``,
+    The configs must be equal except for ``mode``, ``pc_*`` (but not
+    ``pc_error_norm_penalty``), ``output_dir``,
     ``log_interval``, ``init_perturbation`` (with its seed) and
     ``grad_noise_*``, with equal
     validation and train-array SHA-256s, the same source parameters and the
