@@ -105,7 +105,7 @@ case "${1:-}" in
   analyze)
     shopt -s nullglob
     python examples/domain_forgetting_analysis.py commutator \
-      --run_dirs "$ROOT"/commutator_none_*_seed? "$ROOT"/commutator_map_b2_*_seed? "$ROOT"/commutator_matched_*_seed? \
+      --run_dirs "$ROOT"/commutator_none_{fwd,rev}_seed? "$ROOT"/commutator_map_b2_{fwd,rev}_seed? "$ROOT"/commutator_matched_{fwd,rev}_seed? \
         "$ROOT"/commutator_online_protect_*_seed? "$ROOT"/commutator_matched_online_*_seed? \
       --output_dir "$ROOT/commutator_bert"
     ;;
