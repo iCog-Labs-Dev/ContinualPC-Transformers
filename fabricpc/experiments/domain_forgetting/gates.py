@@ -51,6 +51,16 @@ every refresh, ``inverse`` reverses the rule and ``replay`` applies the
 recorded schedule of the ``gate_source`` run without computing energies.
 Each gated stage's periods are written to ``gate_schedule_stage_<s>.jsonl``
 with the multipliers the optimizer state held.
+
+With ``gate_map_source="learner"`` every map-derived and online gate reads
+the run's own learner errors instead of BP's signal: ``s_i`` is
+``energy_sum_ce`` of ``error_maps.learner_signal_energies`` on the graph of
+``error_maps.learner_map_structure`` (ePC at its starting rate
+``pc_eta_infer``, fixed for the whole run), on the same windows and with the
+same normalisation; backprop runs keep ``bp_signal_energies``, so their
+multipliers are those of ``"bp"``. The gate records and schedules of such a
+run carry ``map_source``, and a replay needs a source run of the same map
+source.
 """
 
 from __future__ import annotations
@@ -72,6 +82,9 @@ from fabricpc.experiments.domain_forgetting.artifacts import file_sha256
 from fabricpc.experiments.domain_forgetting.error_maps import (
     bp_signal_energies,
     hidden_nodes,
+    learner_energy_field,
+    learner_map_structure,
+    learner_signal_energies,
 )
 from fabricpc.experiments.domain_forgetting.localization import (
     block_index,
@@ -271,10 +284,11 @@ def onset_map(
 ) -> dict[str, float]:
     """Mean ``energy_sum_ce`` per module over ``num_windows`` windows from ``offset``.
 
-    ``energy_fn`` returns ``bp_signal_energies`` at output scale 1; each
-    window's value times the batch's squared masked-token count is the
-    batch-invariant ``½‖∂(Σ_masked CE_b)/∂z‖²``. Windows without a masked
-    token are left out. The windows are ``map_batches``'.
+    ``energy_fn`` returns ``bp_signal_energies`` at output scale 1 (or
+    ``learner_signal_energies``, in the same units); each window's value times
+    the batch's squared masked-token count is the batch-invariant
+    ``½‖∂(Σ_masked CE_b)/∂z‖²`` (the learner's ``½‖e_b‖² / s²``). Windows
+    without a masked token are left out. The windows are ``map_batches``'.
     """
     missing = sorted(set(modules) - set(hidden_nodes(structure)))
     if missing:
@@ -491,7 +505,8 @@ def load_replay_schedules(
 
     The source must be a ``live`` run of the same online gate from the same
     checkpoint params, with the same domain order, mode, ``gate_beta``,
-    ``gate_ema``, ``gate_map_windows``, per-stage update count and
+    ``gate_ema``, ``gate_map_windows``, ``gate_map_source``, per-stage update
+    count and
     ``gate_interval``, and a complete schedule
     for every gated stage whose SHA-256 its ``gates.jsonl`` records. Returns
     the schedules by stage and the source's description.
@@ -528,6 +543,12 @@ def load_replay_schedules(
                 f"{source}: {name} {values.get(name)!r} differs from "
                 f"{getattr(config, name)!r}"
             )
+    map_source = values.get("gate_map_source", "bp")
+    if map_source != config.gate_map_source:
+        raise ValueError(
+            f"{source}: gate_map_source {map_source!r} differs from "
+            f"{config.gate_map_source!r}"
+        )
     if run_config["source"]["params_sha256"] != params_sha256:
         raise ValueError(f"{source}: not trained from the run's checkpoint")
     if values.get("gate_interval") != config.gate_interval:
@@ -622,7 +643,16 @@ class GatePlan:
             )
         self.structure: GraphStructure | None = None
         self.energy_fn: EnergyFn | None = None
-        if self.uses_map:
+        self.energy_field: str | None = None
+        if self.uses_map and self.learner_map:
+            structure = learner_map_structure(base.model_config, config)
+            field = learner_energy_field(config)
+            self.structure = structure
+            self.energy_field = field
+            self.energy_fn = jax.jit(
+                lambda p, b: learner_signal_energies(p, structure, b, field)
+            )
+        elif self.uses_map:
             run = replace(config, mode="backprop", dropout_rate=0.0)
             structure = build_structure(
                 base.model_config, run, build_inference(run, base.model_config)[0]
@@ -631,6 +661,7 @@ class GatePlan:
             self.energy_fn = jax.jit(
                 lambda p, b: bp_signal_energies(p, structure, b, 1.0)
             )
+        if self.uses_map:
             for stage in range(2, len(config.domains) + 1):
                 map_batches(
                     streams[config.domains[stage - 1]],
@@ -640,6 +671,11 @@ class GatePlan:
                     mask_prob=config.mask_prob,
                     seed=config.seed + stage,
                 )
+
+    @property
+    def learner_map(self) -> bool:
+        """True when the energies are a PC learner's own errors."""
+        return self.config.gate_map_source == "learner" and self.config.mode == "pc"
 
     @property
     def uses_map(self) -> bool:
@@ -673,6 +709,18 @@ class GatePlan:
                 "windows_masked": "one at a time (batch size 1)",
                 "mask_seed": "seed + stage",
             }
+            if self.config.gate_map_source != "bp":
+                info["map"]["source"] = self.config.gate_map_source
+            if self.learner_map and self.structure is not None:
+                inference = self.structure.config["inference"]
+                info["map"]["energy"] = (
+                    f"energy_sum_ce of learner_signal_energies ({self.energy_field} "
+                    "of the run's own learner errors)"
+                )
+                info["map"]["inference"] = {
+                    "class": type(inference).__name__,
+                    **dict(inference.config),
+                }
         if self.config.gate in ONLINE_GATES:
             info["online"] = {
                 "variant": self.config.gate_variant,
@@ -751,6 +799,8 @@ class GatePlan:
             "scores": None,
             "permutation": None,
         }
+        if config.gate_map_source != "bp":
+            record["map_source"] = config.gate_map_source
         multipliers = {m: 1.0 for m in self.modules}
         if stage >= 2:
             if config.gate == "freeze":
@@ -903,8 +953,14 @@ class OnlineGate:
     ) -> None:
         held = module_multipliers(opt_state)
         _, first, last = self.periods[refresh + 1]
+        source = (
+            {"map_source": self.config.gate_map_source}
+            if self.config.gate_map_source != "bp"
+            else {}
+        )
         self.schedule.append(
             {
+                **source,
                 "stage": self.stage,
                 "refresh": refresh,
                 "first_update": first,

@@ -51,6 +51,8 @@ Usage:
     --gate_interval updates from the live energy smoothed with --gate_ema
     (schedules in gate_schedule_stage_<s>.jsonl), with --gate_variant live,
     type, shuffle (--gate_seed), inverse or replay (one --gate_source run).
+    --gate_map_source learner makes the map-derived and online gates read the
+    run's own learner errors (ePC's relaxed errors) instead of BP's signal.
 
     Interventions in every stage (any mode): --pc_error_norm_penalty GAMMA
     adds GAMMA times the backpropagated error norm at eps = 0 to the
@@ -123,6 +125,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     MUPC_MODES,
     PC_INFERENCE,
     GATES,
+    GATE_MAP_SOURCES,
     GATE_VARIANTS,
     TRAINING,
     RunConfig,
@@ -365,6 +368,14 @@ def build_parser(output_required: bool = True) -> argparse.ArgumentParser:
         help="Online gate variant",
     )
     parser.add_argument(
+        "--gate_map_source",
+        choices=GATE_MAP_SOURCES,
+        default=defaults.gate_map_source,
+        help="Energy of the map-derived and online gates: bp = BP's backward "
+        "signal, learner = the run's own learner errors (ePC at its starting "
+        "pc_eta_infer)",
+    )
+    parser.add_argument(
         "--pc_error_norm_penalty",
         type=float,
         default=defaults.pc_error_norm_penalty,
@@ -576,6 +587,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         gate_interval=args.gate_interval,
         gate_ema=args.gate_ema,
         gate_variant=args.gate_variant,
+        gate_map_source=args.gate_map_source,
         pc_error_norm_penalty=args.pc_error_norm_penalty,
         update_scale_modules=tuple(args.update_scale_modules),
         update_scale=args.update_scale,

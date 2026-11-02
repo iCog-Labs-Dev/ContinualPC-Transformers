@@ -22,6 +22,20 @@ and ``bwt`` the run's ``bwt_ce``. Runs are grouped by (domain order, seed).
 - **Contrasts** ``map - random`` and ``map - type`` are paired by seed per
   order and ``beta``, on ``y`` and on ``d``.
 
+The reference runs are those of one learner: ``collect_runs`` keeps the
+runs of ``mode`` (backprop by default) and, for PC, optionally of one
+``pc_inference``, so an ePC curve is its own ePC sequential runs. Map gates
+with ``gate_map_source="learner"`` are labelled ``..._learner``; the primary
+test and contrasts use the gate runs of one ``map_source`` (``"bp"`` by
+default).
+
+A run whose final CE, learning gain or BWT is not finite has diverged: its
+``x``, ``y`` and ``bwt`` are ``None``. Diverged reference runs leave the
+curve (it interpolates between the others) and are listed per order under
+``failed_reference_runs``; a diverged or missing gate seed fails the primary
+test, which needs every expected seed (by default every seed with a
+reference run in that order).
+
 Means are over seeds; SDs are sample SDs (``ddof=1``), ``None`` for one seed.
 """
 
@@ -72,6 +86,10 @@ def _read(path: Path) -> Any:
         return json.load(handle)
 
 
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(value)
+
+
 def _mean(values: Iterable[float]) -> float:
     values = list(values)
     return float(sum(values) / len(values))
@@ -106,8 +124,9 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
 
     ``beta`` is ``None`` for gates that do not use it. Labels are
     ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"``,
-    ``"online_protect_b2"``, ``"online_surprise"`` (a non-live variant
-    appended, as in ``"online_protect_b2_replay"``) and, for ungated runs,
+    ``"online_protect_b2"``, ``"online_surprise"`` (``"_learner"`` appended
+    for ``gate_map_source="learner"``, then a non-live variant, as in
+    ``"online_protect_b2_learner_replay"``) and, for ungated runs,
     ``"lr3e-05"``. An error-norm penalty or update scale appends
     ``intervention_label``, as in ``"lr3e-05_pen0.001"``.
     """
@@ -125,6 +144,8 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
         label = f"{gate}_b{beta:g}"
     else:
         label = gate
+    if config.get("gate_map_source", "bp") != "bp":
+        label += f"_{config['gate_map_source']}"
     variant = config.get("gate_variant", "live")
     if gate in ONLINE_GATES and variant != "live":
         label += f"_{variant}"
@@ -148,28 +169,42 @@ def load_run_point(run_dir: str | Path) -> dict[str, Any] | None:
     training = config.get("training", summary.get("training", "sequential"))
     final = summary["final_ce"]
     gains = summary["learning_gain_ce"]
+    bwt = summary.get("bwt_ce")
+    values = [*(final[d] for d in domains), *(gains[d] for d in domains)]
+    diverged = not all(_finite(v) for v in values) or (
+        "bwt_ce" in summary and not _finite(bwt)
+    )
     return {
         "run_dir": str(path),
         "domains": list(domains),
         "seed": int(config["seed"]),
         "lr": float(config["lr"]),
         "mode": summary.get("mode", config.get("mode")),
+        "pc_inference": config.get("pc_inference"),
+        "map_source": config.get("gate_map_source", "bp"),
         "tokens_per_domain": config.get("tokens_per_domain"),
         "training": training,
         "gate": gate,
         "beta": beta,
         "label": label,
         "intervention": bool(intervention_label(config)),
-        "x": _mean(gains[d] for d in domains),
-        "y": _mean(final[d] for d in domains),
-        "bwt": float(summary["bwt_ce"]) if "bwt_ce" in summary else None,
+        "diverged": diverged,
+        "x": None if diverged else _mean(gains[d] for d in domains),
+        "y": None if diverged else _mean(final[d] for d in domains),
+        "bwt": None if diverged or "bwt_ce" not in summary else float(bwt),
     }
 
 
 def collect_runs(
-    run_dirs: Sequence[str | Path], mode: str = "backprop"
+    run_dirs: Sequence[str | Path],
+    mode: str = "backprop",
+    pc_inference: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Load finished runs of ``mode`` with at least two domains or joint."""
+    """Load finished runs of ``mode`` with at least two domains or joint.
+
+    With ``mode="pc"`` and ``pc_inference`` only runs of that PC inference
+    are kept.
+    """
     points = []
     for run_dir in run_dirs:
         point = load_run_point(run_dir)
@@ -177,6 +212,16 @@ def collect_runs(
             continue
         if point["mode"] != mode:
             print(f"note: {run_dir} is mode {point['mode']!r}, not {mode!r}; skipped")
+            continue
+        if (
+            mode == "pc"
+            and pc_inference is not None
+            and point["pc_inference"] != pc_inference
+        ):
+            print(
+                f"note: {run_dir} is pc_inference {point['pc_inference']!r}, not "
+                f"{pc_inference!r}; skipped"
+            )
             continue
         if point["training"] != "joint" and len(point["domains"]) < 2:
             print(f"note: {run_dir} is a single-domain run; skipped")
@@ -293,10 +338,18 @@ def _seed_mean_curve(points: Sequence[Mapping[str, Any]]) -> dict[str, list]:
 
 
 def compute_frontier(
-    points: Sequence[Mapping[str, Any]], seq_lr: float = SEQ_LR
+    points: Sequence[Mapping[str, Any]],
+    seq_lr: float = SEQ_LR,
+    map_source: str = "bp",
+    expected_seeds: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Run the frontier analysis on loaded run points (``collect_runs``)."""
-    joint = [p for p in points if p["training"] == "joint"]
+    """Run the frontier analysis on loaded run points (``collect_runs``).
+
+    The primary test and contrasts use the gate runs of ``map_source``; the
+    primary test needs every seed of ``expected_seeds`` (default: the seeds
+    with a reference run in the order).
+    """
+    joint = [p for p in points if p["training"] == "joint" and not p.get("diverged")]
     sequential = [dict(p) for p in points if p["training"] != "joint"]
     y_joint = _mean(p["y"] for p in joint) if joint else None
     orders: dict[tuple[str, ...], list[dict[str, Any]]] = {}
@@ -306,7 +359,18 @@ def compute_frontier(
     result_orders: dict[str, Any] = {}
     for domains, members in orders.items():
         name = order_name(domains)
-        references = [p for p in members if _is_reference(p)]
+        candidates = [p for p in members if _is_reference(p)]
+        references = [p for p in candidates if not p.get("diverged")]
+        failed = [
+            {"run_dir": p["run_dir"], "lr": p["lr"], "seed": p["seed"]}
+            for p in sorted(candidates, key=lambda p: (p["seed"], p["lr"]))
+            if p.get("diverged")
+        ]
+        expected = sorted(
+            {p["seed"] for p in candidates}
+            if expected_seeds is None
+            else set(expected_seeds)
+        )
         curves: dict[int, dict[str, list]] = {}
         seq_y: dict[int, float] = {}
         for seed in sorted({p["seed"] for p in references}):
@@ -320,7 +384,9 @@ def compute_frontier(
 
         for point in members:
             curve = curves.get(point["seed"])
-            if curve is None:
+            if point.get("diverged"):
+                point.update(d=None, d_bwt=None, y_ref=None, outside_range=None)
+            elif curve is None:
                 point.update(d=None, d_bwt=None, y_ref=None, outside_range=None)
                 point["no_reference"] = True
             else:
@@ -328,7 +394,7 @@ def compute_frontier(
             y_seq = seq_y.get(point["seed"])
             point["gap_closed"] = (
                 gap_closed(point["y"], y_seq, y_joint)
-                if y_seq is not None and y_joint is not None
+                if y_seq is not None and y_joint is not None and point["y"] is not None
                 else None
             )
 
@@ -337,12 +403,16 @@ def compute_frontier(
         result_orders[name] = {
             "domains": list(domains),
             "curves": {str(s): c for s, c in curves.items()},
+            "failed_reference_runs": failed,
+            "expected_seeds": expected,
             "mean_curve": _seed_mean_curve(references),
             "seq": {"lr": seq_lr, "y": seq_sd, "per_seed": seq_y},
             "conditions": conditions,
             "runs": sorted(members, key=lambda p: (p["label"], p["seed"])),
-            "primary_test": _primary_tests(members, seq_sd["sd"], seq_lr),
-            "contrasts": _contrasts(members, seq_lr),
+            "primary_test": _primary_tests(
+                members, seq_sd["sd"], seq_lr, map_source, expected
+            ),
+            "contrasts": _contrasts(members, seq_lr, map_source),
         }
 
     return {
@@ -384,7 +454,10 @@ def _aggregate(members: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 def _by_beta(
-    members: Sequence[Mapping[str, Any]], gate: str, seq_lr: float
+    members: Sequence[Mapping[str, Any]],
+    gate: str,
+    seq_lr: float,
+    map_source: str = "bp",
 ) -> dict[float, dict[int, Mapping[str, Any]]]:
     out: dict[float, dict[int, Mapping[str, Any]]] = {}
     for p in members:
@@ -392,18 +465,27 @@ def _by_beta(
             p["gate"] == gate
             and math.isclose(p["lr"], seq_lr)
             and not p.get("intervention", False)
+            and p.get("map_source", "bp") == map_source
         ):
             out.setdefault(p["beta"], {})[p["seed"]] = p
     return out
 
 
 def _primary_tests(
-    members: Sequence[Mapping[str, Any]], seq_sd: float | None, seq_lr: float
+    members: Sequence[Mapping[str, Any]],
+    seq_sd: float | None,
+    seq_lr: float,
+    map_source: str = "bp",
+    expected: Sequence[int] = (),
 ) -> dict[str, Any]:
     tests = {}
-    for beta, runs in sorted(_by_beta(members, PRIMARY_GATE, seq_lr).items()):
+    for beta, runs in sorted(
+        _by_beta(members, PRIMARY_GATE, seq_lr, map_source).items()
+    ):
         ds = [runs[s]["d"] for s in sorted(runs)]
-        complete = all(d is not None for d in ds)
+        missing = sorted(set(expected) - set(runs))
+        diverged = sorted(s for s, p in runs.items() if p.get("diverged"))
+        complete = not missing and all(d is not None for d in ds)
         stats = mean_sd(ds)
         all_negative = complete and all(d < 0 for d in ds)
         exceeds = (
@@ -419,6 +501,9 @@ def _primary_tests(
             "d_mean": stats["mean"],
             "d_sd": stats["sd"],
             "seq_y_sd": seq_sd,
+            "expected_seeds": list(expected),
+            "missing_seeds": missing,
+            "diverged_seeds": diverged,
             "all_seeds_negative": all_negative,
             "exceeds_seq_sd": bool(exceeds),
             "pass": bool(all_negative and exceeds),
@@ -441,11 +526,13 @@ def _both_orders(orders: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     return out
 
 
-def _contrasts(members: Sequence[Mapping[str, Any]], seq_lr: float) -> dict[str, Any]:
+def _contrasts(
+    members: Sequence[Mapping[str, Any]], seq_lr: float, map_source: str = "bp"
+) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for first, second in CONTRASTS:
-        a_runs = _by_beta(members, first, seq_lr)
-        b_runs = _by_beta(members, second, seq_lr)
+        a_runs = _by_beta(members, first, seq_lr, map_source)
+        b_runs = _by_beta(members, second, seq_lr, map_source)
         for beta in sorted(set(a_runs) & set(b_runs)):
             seeds = sorted(set(a_runs[beta]) & set(b_runs[beta]))
             if not seeds:
@@ -500,13 +587,30 @@ def format_table(result: Mapping[str, Any]) -> str:
                 f"{_fmt(c['bwt']):>14}  {_fmt(c['d'], 4):>14}  "
                 f"{_fmt(c['gap_closed']):>14}{flag}"
             )
+        for failed in order.get("failed_reference_runs", []):
+            lines.append(
+                f"failed reference run (diverged, left out of the curve): lr "
+                f"{lr_text(failed['lr'])} seed {failed['seed']} {failed['run_dir']}"
+            )
         for beta, test in order["primary_test"].items():
+            gaps = ""
+            if test.get("missing_seeds"):
+                gaps += f", missing seeds {test['missing_seeds']}"
+            if test.get("diverged_seeds"):
+                gaps += f", diverged seeds {test['diverged_seeds']}"
             lines.append(
                 f"primary map b{beta}: pass={test['pass']} "
                 f"(all d<0: {test['all_seeds_negative']}, |mean d| > seq SD "
-                f"{test['seq_y_sd']}: {test['exceeds_seq_sd']})"
+                f"{test['seq_y_sd']}: {test['exceeds_seq_sd']}{gaps})"
             )
-        for key, c in order["contrasts"].items():
+        contrasts = {
+            key: c
+            for key, c in order["contrasts"].items()
+            if c["y"]["n"] or c["d"]["n"]
+        }
+        if not contrasts:
+            lines.append("contrasts: none (no paired gate runs)")
+        for key, c in contrasts.items():
             lines.append(
                 f"contrast {key}: y {_fmt(c['y'], 4)} "
                 f"(neg {c['y']['fraction_negative']}), d {_fmt(c['d'], 4)} "

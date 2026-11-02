@@ -42,10 +42,25 @@ output width (e.g. 1,024 for ``mlp1`` and 256 for ``mlp2`` in BERT-Mini).
 Under standard PC every map records ``energy_trace``: the raw total energy
 (summed over nodes with inputs, mean over the map's windows) at each
 inference step ``0..T``, the convergence check of the iterative solve.
+
+**Learner-native maps.** The ``learner`` setting runs the run's own learner
+(``learner_map_structure``): ePC with its ``pc_eta_infer`` and
+``pc_infer_steps`` (the energy controller's starting rate η₀, at which every
+stage restarts), standard PC with its own inference, spike-only PC with its
+own schedule, and backprop runs with the spike-only schedule, whose errors
+are BP's signal. Its primary energy is the error of the run's weight rule
+(``learner_energy_field``): ``forward_error_energy`` with forward updates
+(spike-only PC, backprop), ``final_energy`` otherwise (ePC, where it is
+``½‖ε_m‖²`` at the relaxed errors, and standard PC). Module grouping and
+normalisation are the other settings'. One ePC step from ε = 0 gives
+``ε_m = −η s ∂C/∂z_m``, so its ``energy_sum_ce`` is ``η²`` times the
+spike-only map; after ``T`` steps at small ``ηλ_max`` it approaches
+``(ηT)²`` times it.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Sequence
 
@@ -70,7 +85,10 @@ from fabricpc.experiments.domain_forgetting.localization import (
     stage_name,
 )
 from fabricpc.experiments.domain_forgetting.runner import (
+    GATE_MAP_SOURCES,
     HEAD_ENERGY,
+    RunConfig,
+    build_inference,
     build_structure,
     max_free_depth,
 )
@@ -79,7 +97,10 @@ from fabricpc.training.train_autoregressive import compute_loss, create_dropout_
 
 SPIKE_ONLY = "spike_only"
 STANDARD_PC = "standard_pc"
+LEARNER = "learner"
 SETTINGS = (SPIKE_ONLY, STANDARD_PC)
+MAP_SETTINGS = (*SETTINGS, LEARNER)
+MAP_SOURCES = GATE_MAP_SOURCES
 PRIMARY_ENERGY = {SPIKE_ONLY: "forward_error_energy", STANDARD_PC: "final_energy"}
 ENERGY_FIELDS = ("final_energy", "forward_error_energy")
 
@@ -116,9 +137,9 @@ class ErrorMapConfig:
             )
         if self.output_energy_scale <= 0:
             raise ValueError("output_energy_scale must be positive")
-        unknown = set(self.settings) - set(SETTINGS)
+        unknown = set(self.settings) - set(MAP_SETTINGS)
         if unknown or not self.settings:
-            raise ValueError(f"settings must be a non-empty subset of {SETTINGS}")
+            raise ValueError(f"settings must be a non-empty subset of {MAP_SETTINGS}")
 
 
 def spike_only_inference(infer_steps: int, max_norm: float = 5.0) -> Any:
@@ -158,6 +179,53 @@ def build_map_structure(
     else:
         raise ValueError(f"setting must be one of {SETTINGS}, got {setting!r}")
     return build_structure(context.model_config, run_config, inference)
+
+
+def learner_energy_field(config: RunConfig) -> str:
+    """The ``node_energies`` field of the error in the run's weight rule.
+
+    ``forward_error_energy`` (``z_T − μ_0``) for forward updates and for
+    backprop runs (spike-only errors), ``final_energy`` (``z_T − μ_T``) for
+    ``pc_forward_updates="none"``.
+    """
+    if config.mode == "pc" and config.pc_forward_updates == "none":
+        return "final_energy"
+    return "forward_error_energy"
+
+
+def learner_map_structure(
+    model_config: Mapping[str, Any], config: RunConfig
+) -> GraphStructure:
+    """Build the run's graph without dropout and with its learner's inference.
+
+    PC runs keep their inference (``build_inference``; ePC at its starting
+    rate ``pc_eta_infer``) and output-energy scale; backprop runs get the
+    spike-only schedule at scale 1.
+    """
+    if config.mode == "pc":
+        run = replace(config, dropout_rate=0.0)
+    else:
+        run = replace(
+            config,
+            mode="pc",
+            pc_inference="spiking",
+            pc_eta_infer=0.0,
+            pc_spike_eta=1.0,
+            pc_spike_depth="longest",
+            pc_forward_updates="initial",
+            pc_infer_steps=None,
+            pc_output_energy_scale=1.0,
+            dropout_rate=0.0,
+        )
+    inference, _ = build_inference(run, model_config)
+    return build_structure(model_config, run, inference)
+
+
+def output_energy_scale(structure: GraphStructure) -> float:
+    """The output node's energy scale ``s`` (1 when unset)."""
+    output = structure.task_map["y"]
+    config = structure.nodes[output].node_info.node_config
+    return float(config.get("output_energy_scale", 1.0))
 
 
 def hidden_nodes(structure: GraphStructure) -> list[str]:
@@ -274,9 +342,7 @@ def node_energies(
     )
     nodes = hidden_nodes(structure)
     mask = batch["loss_mask"].astype(jnp.result_type(float))
-    scale = float(
-        structure.nodes[output].node_info.node_config.get("output_energy_scale", 1.0)
-    )
+    scale = output_energy_scale(structure)
 
     def head(error: jax.Array) -> jax.Array:
         return scale**2 * _half_square(error)
@@ -365,6 +431,25 @@ def bp_signal_energies(
 
     grads = jax.grad(loss)(zeros)
     return {n: output_energy_scale**2 * _half_square(grads[n]) for n in nodes}
+
+
+def learner_signal_energies(
+    params: GraphParams,
+    structure: GraphStructure,
+    batch: Mapping[str, jax.Array],
+    field: str,
+) -> dict[str, jax.Array]:
+    """Return the learner's ``½‖e_m‖² / (s² N²)`` per sample and hidden node.
+
+    ``e_m`` is the ``field`` error of ``node_energies`` after the structure's
+    inference, ``s`` the output-energy scale and ``N`` the batch's masked
+    tokens, so the units are ``bp_signal_energies``' at output scale 1, which
+    it equals under the spike-only schedule.
+    """
+    result = node_energies(params, structure, batch)
+    scale = output_energy_scale(structure)
+    count = jnp.maximum(result["batch_masked_tokens"], 1.0)
+    return {n: v / (scale**2 * count**2) for n, v in result[field].items()}
 
 
 def map_specs(domains: Sequence[str]) -> list[dict[str, Any]]:
@@ -485,6 +570,101 @@ def aggregate_map(
     }
 
 
+def map_setting(
+    context: RunContext, setting: str, config: ErrorMapConfig
+) -> tuple[GraphStructure, str, float, dict[str, Any]]:
+    """Return a setting's graph, primary energy, output scale and its record."""
+    if setting == LEARNER:
+        structure = learner_map_structure(context.model_config, context.config)
+        primary = learner_energy_field(context.config)
+        scale = output_energy_scale(structure)
+    else:
+        structure = build_map_structure(context, setting, config)
+        primary = PRIMARY_ENERGY[setting]
+        scale = config.output_energy_scale
+    inference = structure.config["inference"]
+    record = {
+        "inference": type(inference).__name__,
+        **{k: v for k, v in dict(inference.config).items()},
+        "primary_energy": primary,
+    }
+    if setting == LEARNER:
+        record.update(
+            mode=context.config.mode,
+            pc_inference=(
+                context.config.pc_inference if context.config.mode == "pc" else None
+            ),
+            output_energy_scale=scale,
+        )
+    return structure, primary, scale, record
+
+
+def _shared_fields(config: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in config.items() if k != "settings"}
+
+
+def missing_settings(
+    existing: Mapping[str, Any],
+    context: RunContext,
+    config: ErrorMapConfig,
+) -> tuple[str, ...]:
+    """Return the settings of ``config`` that ``existing`` lacks.
+
+    Raises ``ValueError`` when ``existing`` was computed from other stages,
+    windows or head energy, or holds one of the settings with another
+    inference record, since merging would change it.
+    """
+    if existing.get("provenance") != run_provenance(context):
+        raise ValueError("existing error maps were computed from other stages")
+    if existing.get("head_energy") != HEAD_ENERGY:
+        raise ValueError("existing error maps use another head energy")
+    requested = _shared_fields(json.loads(json.dumps(asdict(config))))
+    if _shared_fields(existing.get("config", {})) != requested:
+        raise ValueError(
+            f"existing error maps use config {_shared_fields(existing['config'])}, "
+            f"not {requested}"
+        )
+    missing = []
+    for setting in config.settings:
+        if setting not in existing.get("settings", {}):
+            missing.append(setting)
+            continue
+        record = json.loads(json.dumps(map_setting(context, setting, config)[3]))
+        if existing["settings"][setting] != record:
+            raise ValueError(
+                f"existing error maps hold setting {setting!r} as "
+                f"{existing['settings'][setting]}, not {record}"
+            )
+    return tuple(missing)
+
+
+def merge_error_maps(
+    existing: Mapping[str, Any], new: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Add ``new``'s settings to ``existing``, refusing to change any of its keys.
+
+    Both must share provenance, head energy and every config field but
+    ``settings``; ``new`` must not repeat a setting of ``existing``.
+    """
+    new = json.loads(json.dumps(new))
+    for key in ("provenance", "head_energy", "domains", "modules"):
+        if existing.get(key) != new.get(key):
+            raise ValueError(f"error maps differ in {key}; refusing to merge")
+    if _shared_fields(existing["config"]) != _shared_fields(new["config"]):
+        raise ValueError("error maps differ in their config; refusing to merge")
+    repeated = sorted(set(existing["settings"]) & set(new["settings"]))
+    if repeated:
+        raise ValueError(f"settings {repeated} already exist; refusing to change them")
+    merged = dict(existing)
+    merged["settings"] = {**existing["settings"], **new["settings"]}
+    merged["config"] = {
+        **existing["config"],
+        "settings": [*existing["config"]["settings"], *new["config"]["settings"]],
+    }
+    merged["maps"] = [*existing["maps"], *new["maps"]]
+    return merged
+
+
 def compute_error_maps(
     context: RunContext,
     config: ErrorMapConfig = ErrorMapConfig(),
@@ -497,13 +677,9 @@ def compute_error_maps(
     settings: dict[str, Any] = {}
     maps = []
     for setting in config.settings:
-        structure = build_map_structure(context, setting, config)
-        inference = structure.config["inference"]
-        settings[setting] = {
-            "inference": type(inference).__name__,
-            **{k: v for k, v in dict(inference.config).items()},
-            "primary_energy": PRIMARY_ENERGY[setting],
-        }
+        structure, primary, scale, settings[setting] = map_setting(
+            context, setting, config
+        )
         trace = setting == STANDARD_PC
         step = jax.jit(
             lambda p, b, s=structure, t=trace: node_energies(p, s, b, trace=t)
@@ -517,10 +693,10 @@ def compute_error_maps(
                 config.batch_size,
             )
             results = [jax.device_get(step(params, batch)) for batch in batches]
-            aggregated = aggregate_map(results, modules, config.output_energy_scale)
+            aggregated = aggregate_map(results, modules, scale)
             for module, values in aggregated["modules"].items():
-                values["energy"] = values[PRIMARY_ENERGY[setting]]
-                values["energy_sum_ce"] = values[f"{PRIMARY_ENERGY[setting]}_sum_ce"]
+                values["energy"] = values[primary]
+                values["energy_sum_ce"] = values[f"{primary}_sum_ce"]
                 values["output_dim"] = dims[module]
                 values["energy_sum_ce_per_dim"] = values["energy_sum_ce"] / dims[module]
             if trace:

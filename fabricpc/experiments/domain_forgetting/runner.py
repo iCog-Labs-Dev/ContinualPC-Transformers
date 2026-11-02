@@ -165,8 +165,10 @@ GATES = (
     *ONLINE_GATES,
 )
 GATE_VARIANTS = ("live", "type", "shuffle", "inverse", "replay")
+GATE_MAP_SOURCES = ("bp", "learner")
 ONLINE_SETTINGS = (
     "gate_map_windows",
+    "gate_map_source",
     "gate_seed",
     "gate_source",
     "gate_interval",
@@ -175,10 +177,10 @@ ONLINE_SETTINGS = (
 )
 GATE_SETTINGS = {
     "none": (),
-    "map": ("gate_beta", "gate_map_windows"),
-    "inverse": ("gate_beta", "gate_map_windows"),
-    "type": ("gate_beta", "gate_map_windows"),
-    "random": ("gate_beta", "gate_map_windows", "gate_seed"),
+    "map": ("gate_beta", "gate_map_windows", "gate_map_source"),
+    "inverse": ("gate_beta", "gate_map_windows", "gate_map_source"),
+    "type": ("gate_beta", "gate_map_windows", "gate_map_source"),
+    "random": ("gate_beta", "gate_map_windows", "gate_seed", "gate_map_source"),
     "oracle": ("gate_beta", "gate_source"),
     "freeze": ("gate_modules",),
     "uniform": ("gate_scale",),
@@ -305,6 +307,12 @@ class RunConfig:
     applies only to ``shuffle`` and ``gate_source`` (one run) only to
     ``replay`` (``gates.OnlineGate``).
 
+    ``gate_map_source`` (map-derived and online gates) selects the energy the
+    gate reads: ``"bp"`` BP's backward signal (``bp_signal_energies``) in
+    every mode, ``"learner"`` the run's own learner errors
+    (``error_maps.learner_signal_energies``; ePC at its starting rate
+    ``pc_eta_infer``), which for backprop runs is the BP signal.
+
     ``pc_error_norm_penalty`` γ (0 = off) adds γ·P to every update's
     objective, P the error-norm penalty of ``make_error_norm_penalty_fn``
     normalised by the update's masked-token count; it applies to every mode
@@ -375,6 +383,7 @@ class RunConfig:
     gate_interval: int = 50
     gate_ema: float = 0.3
     gate_variant: str = "live"
+    gate_map_source: str = "bp"
     pc_error_norm_penalty: float = 0.0
     update_scale_modules: tuple[str, ...] = ()
     update_scale: float = 1.0
@@ -609,6 +618,11 @@ class RunConfig:
             return
         if self.training != "sequential":
             raise ValueError("gates need training 'sequential'")
+        if self.gate_map_source not in GATE_MAP_SOURCES:
+            raise ValueError(
+                f"gate_map_source must be one of {GATE_MAP_SOURCES}, got "
+                f"{self.gate_map_source!r}"
+            )
         if "gate_beta" in used and not (
             math.isfinite(self.gate_beta) and self.gate_beta > 0
         ):
@@ -724,7 +738,8 @@ class RunConfig:
         identity is unchanged from before joint training, gates, the
         controller and gradient noise existed; ``pc_mupc`` is left out when
         off. ``gate_scale`` is kept only for ``uniform`` and the online gate
-        settings only for ``ONLINE_GATES``. ``pc_error_norm_penalty`` is left
+        settings only for ``ONLINE_GATES``; ``gate_map_source`` is left out at
+        ``"bp"``. ``pc_error_norm_penalty`` is left
         out at 0 and both update-scale settings without
         ``update_scale_modules``, so runs from before they existed resume.
         """
@@ -744,6 +759,8 @@ class RunConfig:
             if values["gate"] not in ONLINE_GATES:
                 for key in ("gate_interval", "gate_ema", "gate_variant"):
                     values.pop(key)
+            if values["gate_map_source"] == GATE_DEFAULTS["gate_map_source"]:
+                values.pop("gate_map_source")
         if values["pc_eta_control"] == "none":
             for key in ("pc_eta_control", *CONTROL_DEFAULTS):
                 values.pop(key)

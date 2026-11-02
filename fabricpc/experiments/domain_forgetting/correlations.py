@@ -41,6 +41,7 @@ from scipy import stats
 
 from fabricpc.core.types import GraphParams
 from fabricpc.experiments.domain_forgetting.error_maps import (
+    LEARNER,
     SPIKE_ONLY,
     STANDARD_PC,
     window_batches,
@@ -433,7 +434,7 @@ def run_predictor_table(run_dir: str | Path) -> dict[str, dict[str, Any]]:
 
 
 def _is_map_predictor(name: str) -> bool:
-    return name.startswith(f"{SPIKE_ONLY}_") or name.startswith(f"{STANDARD_PC}_")
+    return name.startswith((f"{SPIKE_ONLY}_", f"{STANDARD_PC}_", f"{LEARNER}_"))
 
 
 def correlate_run(
