@@ -61,6 +61,28 @@ same normalisation; backprop runs keep ``bp_signal_energies``, so their
 multipliers are those of ``"bp"``. The gate records and schedules of such a
 run carry ``map_source``, and a replay needs a source run of the same map
 source.
+
+``online_influence`` multiplies the ``online_surprise`` multiplier ``g_i`` of
+each refresh by ``(1 − α) + α h_i`` and clips the product to ``[0, 1]``
+(``plasticity_gates.weighted_gates``, α = ``gate_influence_alpha``), the bound
+every other gate's multipliers already satisfy. From a stage's second refresh
+on, ``h_i`` comes from ``I_i = L(θ with module i at the previous refresh's
+params) − L(θ)``, ``L`` the masked CE of the validation evaluator on a fixed
+probe of ``INFLUENCE_PROBE_WINDOWS`` windows (``influence_weights``,
+``InfluenceProbe``); the onset and the stage's first refresh have no window
+and use ``h = 1``. The probe is windows evenly spaced over the stage's train
+stream (variant ``past``: the previous domain's), masked once, since nearby
+windows share a few documents and give noisier influence. Train streams share
+no document with any validation set (``data.DEDUP_POLICY``), so the probe is
+disjoint from the reported metrics; every train window is also trained on once
+per stage. It skips the first ``INFLUENCE_PROBE_SKIP`` windows, past the map and
+refresh windows, when the stream is long enough, as in the benchmark. Each
+refresh logs the split-half Spearman of ``I`` over alternate probe windows, the
+floored and positive fractions, and ``I_i`` over the multiplier held during its
+window, since the realised update already carries it. A stage starts with no
+window, so nothing is differenced across stages, and the window is not stored:
+a stage is resumed whole or retrained whole. Stage 1 is ungated in both
+variants, so a stage without a previous domain never evaluates a probe.
 """
 
 from __future__ import annotations
@@ -76,9 +98,13 @@ from typing import Any, Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from scipy import stats
 
 from fabricpc.core.types import GraphParams, GraphStructure
-from fabricpc.experiments.domain_forgetting.artifacts import file_sha256
+from fabricpc.experiments.domain_forgetting.artifacts import (
+    arrays_sha256,
+    file_sha256,
+)
 from fabricpc.experiments.domain_forgetting.error_maps import (
     bp_signal_energies,
     hidden_nodes,
@@ -104,14 +130,22 @@ from fabricpc.experiments.domain_forgetting.runner import (
     flatten_params,
     num_stage_updates,
 )
+from fabricpc.experiments.domain_forgetting.validation import MultiDomainEvaluator
 from fabricpc.experiments.forgetting_benchmark.sequential_trainer import params_hash
 from fabricpc.training.plasticity_gates import (
     module_multipliers,
     set_module_multipliers,
+    weighted_gates,
 )
 
 GATE_MAP_BATCH = 8
 SCORE_FLOOR = 1e-6
+INFLUENCE_PROBE_WINDOWS = 256
+INFLUENCE_PROBE_BATCH = 64
+INFLUENCE_PROBE_SKIP = 1024
+INFLUENCE_REL_FLOOR = 1e-6
+INFLUENCE_WEIGHT_MAX = 2.0
+INFLUENCE_PROBE_TAG = 0x696E66
 MAP_GATES = ("map", "random", "inverse", "type")
 MLP_PATTERN = re.compile(r"^L\d+_mlp\d*$")
 EnergyFn = Callable[[GraphParams, dict[str, jax.Array]], dict[str, jax.Array]]
@@ -472,7 +506,7 @@ def online_multipliers(
     inverse = variant == "inverse"
     if gate == "online_protect":
         block = map_multipliers(scores, beta, inverse=inverse)
-    elif gate == "online_surprise":
+    elif gate in ("online_surprise", "online_influence"):
         block = surprise_multipliers(scores, tau, inverse=inverse)
     else:
         raise ValueError(f"{gate!r} is not an online gate")
@@ -482,6 +516,225 @@ def online_multipliers(
             raise ValueError("variant 'shuffle' needs an rng")
         block, permutation = permute_multipliers(block, list(scores), rng)
     return block, permutation
+
+
+def influence_weights(
+    influence: Mapping[str, float], floor: float = 0.0
+) -> dict[str, float]:
+    """Positive influence over the mean positive influence, clipped to [0, 2].
+
+    Entries with ``|I| < floor`` carry no signal and get the neutral weight 1.
+    Among the rest, non-positive entries get 0; all ones when no entry at or
+    above the floor is positive.
+    """
+    values = np.asarray(list(influence.values()), dtype=np.float64)
+    if values.size and not np.all(np.isfinite(values)):
+        raise ValueError("non-finite influence")
+    positive = values[(np.abs(values) >= floor) & (values > 0)]
+    if positive.size == 0:
+        return {m: 1.0 for m in influence}
+    mean_positive = float(positive.mean())
+    weights = {}
+    for module, value in influence.items():
+        if abs(value) < floor:
+            weights[module] = 1.0
+        elif value > 0:
+            weights[module] = float(
+                np.clip(value / mean_positive, 0.0, INFLUENCE_WEIGHT_MAX)
+            )
+        else:
+            weights[module] = 0.0
+    return weights
+
+
+def influence_multipliers(
+    surprise: Mapping[str, float], h: Mapping[str, float], alpha: float
+) -> dict[str, float]:
+    """``clip(g_i ((1 − α) + α h_i), 0, 1)`` per module, as Python floats."""
+    weighted = weighted_gates(
+        {m: jnp.asarray(v) for m, v in surprise.items()},
+        {m: jnp.asarray(h[m]) for m in surprise},
+        alpha,
+    )
+    return {m: float(v) for m, v in weighted.items()}
+
+
+def spaced_windows(stream: np.ndarray, seq_len: int, count: int) -> np.ndarray:
+    """``count`` evenly spaced full windows of ``stream``, skipping the first ones.
+
+    The skip applies only when ``count`` windows remain after it; a stream with
+    fewer than ``count`` full windows repeats some.
+    """
+    total = len(stream) // (seq_len - 1)
+    first = INFLUENCE_PROBE_SKIP if total - INFLUENCE_PROBE_SKIP >= count else 0
+    return np.linspace(first, total - 1, count).astype(np.int64)
+
+
+def spaced_probe(
+    stream: np.ndarray,
+    structure: GraphStructure,
+    special_ids: Mapping[str, int],
+    *,
+    num_windows: int,
+    mask_prob: float,
+    seed: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """``spaced_windows`` of the stream as evaluator arrays, and the window indices.
+
+    Masks are drawn with ``seed`` (``map_batches``) and no other random state
+    is read, so the probe depends only on its arguments.
+    """
+    seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
+    windows = spaced_windows(stream, seq_len, num_windows)
+    tokens = np.concatenate(
+        [
+            window_stream(
+                stream,
+                seq_len,
+                offset=int(window),
+                count=1,
+                pad_id=special_ids["[PAD]"],
+            )
+            for window in windows
+        ]
+    )
+    batches = map_batches(
+        tokens,
+        structure,
+        special_ids,
+        num_windows=num_windows,
+        mask_prob=mask_prob,
+        seed=seed,
+    )
+    joined = {
+        key: np.concatenate([np.asarray(b[key]) for b in batches]) for key in batches[0]
+    }
+    arrays = {
+        "input_ids": joined["x"],
+        "masked_input_ids": joined["x"],
+        "labels": joined["y"],
+        "loss_mask": joined["loss_mask"],
+        "attention_mask": joined["attention_mask"],
+    }
+    return arrays, windows
+
+
+def with_module_from(
+    params: GraphParams, source: GraphParams, module: str
+) -> GraphParams:
+    """``params`` with ``module``'s parameters taken from ``source``."""
+    return GraphParams(nodes={**params.nodes, module: source.nodes[module]})
+
+
+class InfluenceProbe:
+    """One stage's leave-one-module-out influence on a fixed probe.
+
+    ``measure`` reads the params it is given and holds a reference to them
+    (JAX arrays are immutable) as the start of the next window. The loss is
+    the jitted forward pass of ``MultiDomainEvaluator``, dropout off with its
+    own fixed key, so no training state or random stream is read or written.
+    Restoring module ``i`` to the window's start params is ``θ − Δθ_i``
+    without the rounding of a subtraction.
+    """
+
+    def __init__(
+        self,
+        structure: GraphStructure,
+        arrays: Mapping[str, np.ndarray],
+        modules: Sequence[str],
+    ) -> None:
+        """``arrays`` is the probe (``spaced_probe``), ``modules`` the block modules."""
+        self.evaluator = MultiDomainEvaluator(
+            structure,
+            {
+                "probe": arrays,
+                "half_a": {k: v[::2] for k, v in arrays.items()},
+                "half_b": {k: v[1::2] for k, v in arrays.items()},
+            },
+            min(INFLUENCE_PROBE_BATCH, len(arrays["input_ids"])),
+        )
+        self.modules = list(modules)
+        self.start: GraphParams | None = None
+
+    def losses(self, params: GraphParams) -> dict[str, float]:
+        """Masked CE of ``params`` on the probe and on each half of it."""
+        return {
+            name: float(result["masked_ce"])
+            for name, result in self.evaluator(params).items()
+        }
+
+    def loss(self, params: GraphParams) -> float:
+        """Masked CE of ``params`` on the probe."""
+        return self.losses(params)["probe"]
+
+    def measure(self, params: GraphParams) -> dict[str, Any]:
+        """``influence``, ``influence_h``, floor and probe loss of one refresh.
+
+        The stage's first call has no window: ``influence`` is ``None`` and
+        ``h`` is 1, with no forward pass.
+        """
+        start, self.start = self.start, params
+        if start is None:
+            return {
+                "influence": None,
+                "influence_h": {m: 1.0 for m in self.modules},
+                "influence_floor": None,
+                "influence_probe_loss": None,
+                "influence_split_half_spearman": None,
+                "influence_floored_fraction": None,
+                "influence_positive_fraction": None,
+            }
+        base_losses = self.losses(params)
+        base = base_losses["probe"]
+        removed = {
+            m: self.losses(with_module_from(params, start, m)) for m in self.modules
+        }
+        influence = {m: removed[m]["probe"] - base for m in self.modules}
+        floor = INFLUENCE_REL_FLOOR * abs(base)
+        values = np.asarray(list(influence.values()))
+        halves = [
+            [removed[m][half] - base_losses[half] for m in self.modules]
+            for half in ("half_a", "half_b")
+        ]
+        agreement = (
+            float(stats.spearmanr(*halves).statistic)
+            if len(self.modules) > 2 and np.isfinite(halves).all()
+            else math.nan
+        )
+        return {
+            "influence_split_half_spearman": (
+                agreement if math.isfinite(agreement) else None
+            ),
+            "influence_floored_fraction": float(np.mean(np.abs(values) < floor)),
+            "influence_positive_fraction": float(np.mean(values >= floor)),
+            "influence": influence,
+            "influence_h": influence_weights(influence, floor),
+            "influence_floor": floor,
+            "influence_probe_loss": base,
+        }
+
+
+def signal_energy_fn(
+    config: RunConfig, model_config: Mapping[str, Any], *, learner: bool
+) -> tuple[GraphStructure, EnergyFn, str | None]:
+    """The map's graph, jitted energies and field: the learner's errors or BP's signal."""
+    if learner:
+        structure = learner_map_structure(model_config, config)
+        field = learner_energy_field(config)
+        return (
+            structure,
+            jax.jit(lambda p, b: learner_signal_energies(p, structure, b, field)),
+            field,
+        )
+    run = replace(config, mode="backprop", dropout_rate=0.0)
+    structure = build_structure(
+        model_config, run, build_inference(run, model_config)[0]
+    )
+    return (
+        structure,
+        jax.jit(lambda p, b: bp_signal_energies(p, structure, b, 1.0)),
+        None,
+    )
 
 
 def schedule_name(stage: int) -> str:
@@ -537,7 +790,10 @@ def load_replay_schedules(
             f"{source}: replay needs a live source, not variant "
             f"{values.get('gate_variant')!r}"
         )
-    for name in ("mode", "gate_beta", "gate_ema", "gate_map_windows"):
+    names = ["mode", "gate_beta", "gate_ema", "gate_map_windows"]
+    if config.gate == "online_influence":
+        names.append("gate_influence_alpha")
+    for name in names:
         if values.get(name) != getattr(config, name):
             raise ValueError(
                 f"{source}: {name} {values.get(name)!r} differs from "
@@ -609,6 +865,8 @@ class GatePlan:
         """``streams`` are the domains' train streams, used by the map gates."""
         self.config = config
         self.special_ids = dict(base.special_ids)
+        self.base_structure = base.structure
+        self.streams = streams
         self.modules = module_names(base.structure, flatten_params(base.params))
         self.blocks = block_modules(self.modules)
         if config.gate != "freeze" and not self.blocks:
@@ -644,28 +902,14 @@ class GatePlan:
         self.structure: GraphStructure | None = None
         self.energy_fn: EnergyFn | None = None
         self.energy_field: str | None = None
-        if self.uses_map and self.learner_map:
-            structure = learner_map_structure(base.model_config, config)
-            field = learner_energy_field(config)
-            self.structure = structure
-            self.energy_field = field
-            self.energy_fn = jax.jit(
-                lambda p, b: learner_signal_energies(p, structure, b, field)
-            )
-        elif self.uses_map:
-            run = replace(config, mode="backprop", dropout_rate=0.0)
-            structure = build_structure(
-                base.model_config, run, build_inference(run, base.model_config)[0]
-            )
-            self.structure = structure
-            self.energy_fn = jax.jit(
-                lambda p, b: bp_signal_energies(p, structure, b, 1.0)
-            )
         if self.uses_map:
+            self.structure, self.energy_fn, self.energy_field = signal_energy_fn(
+                config, base.model_config, learner=self.learner_map
+            )
             for stage in range(2, len(config.domains) + 1):
                 map_batches(
                     streams[config.domains[stage - 1]],
-                    structure,
+                    self.structure,
                     self.special_ids,
                     num_windows=config.gate_map_windows,
                     mask_prob=config.mask_prob,
@@ -743,7 +987,49 @@ class GatePlan:
                 )
             if self.config.gate_variant == "replay":
                 info["sources"] = {k: dict(v) for k, v in self.sources.items()}
+            if self.config.gate == "online_influence":
+                info["online"]["influence"] = {
+                    "alpha": self.config.gate_influence_alpha,
+                    "rule": "clip(g * ((1 - alpha) + alpha * h), 0, 1)",
+                    "relative_floor": INFLUENCE_REL_FLOOR,
+                    "probe_windows": INFLUENCE_PROBE_WINDOWS,
+                    "probe": "evenly spaced windows of the "
+                    + (
+                        "previous domain's"
+                        if self.config.gate_variant == "past"
+                        else "stage's"
+                    )
+                    + " train stream, masked once per stage",
+                    "mask_seed": f"SeedSequence([seed, stage, {INFLUENCE_PROBE_TAG}]) "
+                    ">> 1",
+                }
         return info
+
+    def influence_probe(self, stage: int) -> tuple[InfluenceProbe, dict[str, Any]]:
+        """The stage's probe and its record: domain, windows, mask seed and SHA-256."""
+        config = self.config
+        index = stage - (2 if config.gate_variant == "past" else 1)
+        if index < 0:
+            raise ValueError(f"stage {stage} has no previous domain to probe")
+        domain = config.domains[index]
+        seed = probe_seed(config.seed, stage, INFLUENCE_PROBE_TAG)
+        arrays, windows = spaced_probe(
+            self.streams[domain],
+            self.base_structure,
+            self.special_ids,
+            num_windows=INFLUENCE_PROBE_WINDOWS,
+            mask_prob=config.mask_prob,
+            seed=seed,
+        )
+        return InfluenceProbe(self.base_structure, arrays, self.blocks), {
+            "domain": domain,
+            "first_window": int(windows[0]),
+            "last_window": int(windows[-1]),
+            "windows": INFLUENCE_PROBE_WINDOWS,
+            "mask_seed": seed,
+            "masked_tokens": int(np.asarray(arrays["loss_mask"]).sum()),
+            "sha256": arrays_sha256(dict(arrays)),
+        }
 
     def _onset_map(
         self,
@@ -891,13 +1177,31 @@ class OnlineGate:
         self.num_windows = stream_windows(stream, plan.base_seq_len)
         self.schedule: list[dict[str, Any]] = []
         self.seconds = 0.0
+        self.influence: InfluenceProbe | None = None
+        self.influence_record: dict[str, Any] | None = None
+        if self.config.gate == "online_influence" and self.replay is None:
+            self.influence, self.influence_record = plan.influence_probe(self.stage)
 
     def __call__(self, update: int, params: GraphParams, opt_state: Any) -> Any:
         """Record the onset at update 0; refresh after each ``gate_interval`` updates."""
         config = self.config
         interval = config.gate_interval
         if update == 0:
-            self._append(-1, None, None, None, opt_state)
+            onset_audit = None
+            if self.influence is not None:
+                onset_audit = {
+                    "influence_probe": self.influence_record,
+                    "influence": None,
+                    "influence_h": {m: 1.0 for m in self.plan.blocks},
+                    "influence_floor": None,
+                    "influence_probe_loss": None,
+                    "influence_split_half_spearman": None,
+                    "influence_floored_fraction": None,
+                    "influence_positive_fraction": None,
+                    "influence_per_multiplier": None,
+                    "surprise_multipliers": None,
+                }
+            self._append(-1, None, None, None, opt_state, onset_audit)
             return opt_state
         if update % interval or update >= self.plan.num_updates:
             return opt_state
@@ -906,6 +1210,7 @@ class OnlineGate:
         raw = None
         offset = seed = None
         permutation = None
+        audit: dict[str, Any] | None = None
         if self.replay is not None:
             multipliers = self.replay[refresh + 1]["multipliers"]
         else:
@@ -936,10 +1241,22 @@ class OnlineGate:
                 beta=config.gate_beta,
                 rng=shuffle_rng(config.gate_seed, config.seed, self.stage, refresh),
             )
+            if self.influence is not None:
+                audit = self.influence.measure(params)
+                held = self.schedule[-1]["multipliers"]
+                audit["influence_per_multiplier"] = (
+                    None
+                    if audit["influence"] is None
+                    else {m: v / held[m] for m, v in audit["influence"].items()}
+                )
+                audit["surprise_multipliers"] = dict(block)
+                block = influence_multipliers(
+                    block, audit["influence_h"], config.gate_influence_alpha
+                )
             multipliers = {**{m: 1.0 for m in self.plan.modules}, **block}
         self.permutation = permutation
         opt_state = set_module_multipliers(opt_state, multipliers)
-        self._append(refresh, raw, offset, seed, opt_state)
+        self._append(refresh, raw, offset, seed, opt_state, audit)
         self.seconds += time.time() - started
         return opt_state
 
@@ -950,6 +1267,7 @@ class OnlineGate:
         offset: int | None,
         seed: int | None,
         opt_state: Any,
+        audit: Mapping[str, Any] | None = None,
     ) -> None:
         held = module_multipliers(opt_state)
         _, first, last = self.periods[refresh + 1]
@@ -971,5 +1289,6 @@ class OnlineGate:
                 "permutation": self.permutation,
                 "probe_offset": offset,
                 "probe_seed": seed,
+                **(audit or {}),
             }
         )

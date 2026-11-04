@@ -152,7 +152,7 @@ BERT_MINI_SHAPE = {
 MODES = ("backprop", "pc")
 TRAINING = ("sequential", "joint")
 JOINT_STAGE = "joint"
-ONLINE_GATES = ("online_protect", "online_surprise")
+ONLINE_GATES = ("online_protect", "online_surprise", "online_influence")
 GATES = (
     "none",
     "map",
@@ -164,7 +164,8 @@ GATES = (
     "uniform",
     *ONLINE_GATES,
 )
-GATE_VARIANTS = ("live", "type", "shuffle", "inverse", "replay")
+GATE_VARIANTS = ("live", "type", "shuffle", "inverse", "replay", "past")
+INFLUENCE_VARIANTS = ("live", "past", "replay")
 GATE_MAP_SOURCES = ("bp", "learner")
 ONLINE_SETTINGS = (
     "gate_map_windows",
@@ -186,6 +187,7 @@ GATE_SETTINGS = {
     "uniform": ("gate_scale",),
     "online_protect": ("gate_beta", *ONLINE_SETTINGS),
     "online_surprise": ONLINE_SETTINGS,
+    "online_influence": (*ONLINE_SETTINGS, "gate_influence_alpha"),
 }
 PC_INFERENCE = ("spiking", "standard", "epc")
 ITERATIVE_PC = ("standard", "epc")
@@ -305,7 +307,9 @@ class RunConfig:
     ``gate_interval`` updates from an energy smoothed with ``gate_ema``;
     ``gate_variant`` selects the control (``GATE_VARIANTS``), ``gate_seed``
     applies only to ``shuffle`` and ``gate_source`` (one run) only to
-    ``replay`` (``gates.OnlineGate``).
+    ``replay`` (``gates.OnlineGate``). ``online_influence`` takes the variants
+    ``INFLUENCE_VARIANTS``, where ``past`` probes the previous domain, and
+    ``gate_influence_alpha`` α in [0, 1) (``gates.InfluenceProbe``).
 
     ``gate_map_source`` (map-derived and online gates) selects the energy the
     gate reads: ``"bp"`` BP's backward signal (``bp_signal_energies``) in
@@ -384,6 +388,7 @@ class RunConfig:
     gate_ema: float = 0.3
     gate_variant: str = "live"
     gate_map_source: str = "bp"
+    gate_influence_alpha: float = 0.5
     pc_error_norm_penalty: float = 0.0
     update_scale_modules: tuple[str, ...] = ()
     update_scale: float = 1.0
@@ -662,6 +667,16 @@ class RunConfig:
             and self.gate_seed != GATE_DEFAULTS["gate_seed"]
         ):
             raise ValueError("gate_seed applies only to gate_variant 'shuffle'")
+        if self.gate == "online_influence":
+            if self.gate_variant not in INFLUENCE_VARIANTS:
+                raise ValueError(
+                    f"gate 'online_influence' takes gate_variant in "
+                    f"{INFLUENCE_VARIANTS}, got {self.gate_variant!r}"
+                )
+            if not 0.0 <= self.gate_influence_alpha < 1.0:
+                raise ValueError("gate_influence_alpha must be in [0, 1)")
+        elif self.gate_variant == "past":
+            raise ValueError("gate_variant 'past' applies only to 'online_influence'")
         if self.gate_variant == "replay":
             if len(self.gate_source) != 1:
                 raise ValueError(
@@ -737,8 +752,9 @@ class RunConfig:
         runs and both gradient-noise settings for runs without it, so their
         identity is unchanged from before joint training, gates, the
         controller and gradient noise existed; ``pc_mupc`` is left out when
-        off. ``gate_scale`` is kept only for ``uniform`` and the online gate
-        settings only for ``ONLINE_GATES``; ``gate_map_source`` is left out at
+        off. ``gate_scale`` is kept only for ``uniform``, the online gate
+        settings only for ``ONLINE_GATES`` and ``gate_influence_alpha`` only
+        for ``online_influence``; ``gate_map_source`` is left out at
         ``"bp"``. ``pc_error_norm_penalty`` is left
         out at 0 and both update-scale settings without
         ``update_scale_modules``, so runs from before they existed resume.
@@ -759,6 +775,8 @@ class RunConfig:
             if values["gate"] not in ONLINE_GATES:
                 for key in ("gate_interval", "gate_ema", "gate_variant"):
                     values.pop(key)
+            if values["gate"] != "online_influence":
+                values.pop("gate_influence_alpha")
             if values["gate_map_source"] == GATE_DEFAULTS["gate_map_source"]:
                 values.pop("gate_map_source")
         if values["pc_eta_control"] == "none":

@@ -51,6 +51,9 @@ Usage:
     --gate_interval updates from the live energy smoothed with --gate_ema
     (schedules in gate_schedule_stage_<s>.jsonl), with --gate_variant live,
     type, shuffle (--gate_seed), inverse or replay (one --gate_source run).
+    online_influence weights the surprise gate by each block module's measured
+    influence on a probe (--gate_influence_alpha); variant past probes the
+    previous domain.
     --gate_map_source learner makes the map-derived and online gates read the
     run's own learner errors (ePC's relaxed errors) instead of BP's signal.
 
@@ -368,6 +371,12 @@ def build_parser(output_required: bool = True) -> argparse.ArgumentParser:
         help="Online gate variant",
     )
     parser.add_argument(
+        "--gate_influence_alpha",
+        type=float,
+        default=defaults.gate_influence_alpha,
+        help="online_influence: weight α of the influence factor (1 - α) + α h",
+    )
+    parser.add_argument(
         "--gate_map_source",
         choices=GATE_MAP_SOURCES,
         default=defaults.gate_map_source,
@@ -587,6 +596,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         gate_interval=args.gate_interval,
         gate_ema=args.gate_ema,
         gate_variant=args.gate_variant,
+        gate_influence_alpha=args.gate_influence_alpha,
         gate_map_source=args.gate_map_source,
         pc_error_norm_penalty=args.pc_error_norm_penalty,
         update_scale_modules=tuple(args.update_scale_modules),
