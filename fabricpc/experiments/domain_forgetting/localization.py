@@ -311,6 +311,7 @@ class RunContext:
     snapshots: list[dict[str, np.ndarray]]
     valid_sets: dict[str, dict[str, np.ndarray]]
     mupc_conversion: dict[str, str] | None = None
+    tokenizer_json: str | None = None
 
     def params(self, stage_or_flat: int | FlatParams) -> GraphParams:
         """Return graph params for a stage index or a flat parameter dict."""
@@ -420,6 +421,7 @@ def load_run(
         snapshots=snapshots,
         valid_sets=valid_sets,
         mupc_conversion=conversion,
+        tokenizer_json=base.tokenizer_json,
     )
 
 

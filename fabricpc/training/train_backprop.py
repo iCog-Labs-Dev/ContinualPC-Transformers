@@ -65,6 +65,7 @@ def compute_forward_pass(
     batch: Dict[str, jnp.ndarray],
     rng_key: jax.Array,
     training: bool = False,
+    extra_clamps: Optional[Dict[str, jnp.ndarray]] = None,
 ) -> GraphState:
     """
     Compute forward pass for backpropagation training.
@@ -77,6 +78,7 @@ def compute_forward_pass(
         structure: Graph structure
         batch: Batch data with keys matching task_map (e.g., 'x', 'y')
         rng_key: JAX random key for state initialization
+        extra_clamps: Node values that override the computed ones
 
     Returns:
         graph state after feedforward pass
@@ -95,6 +97,7 @@ def compute_forward_pass(
     clamps.update(
         create_dropout_clamps(structure, batch_size, dropout_key, training=training)
     )
+    clamps.update(extra_clamps or {})
 
     # Single forward pass via initialize_state with feedforward init
     state = initialize_graph_state(
