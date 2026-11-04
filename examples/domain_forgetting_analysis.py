@@ -13,6 +13,10 @@ every run under ``--results_dir``) and writes ``frontier.json``,
 ``frontier.pdf`` and ``frontier.png``; ``commutator`` reads the stage
 snapshots and training logs of the ``--run_dirs`` (both domain orders per
 seed and condition) and writes ``commutator.json``; ``all`` leaves both out.
+``influence`` reads the stage snapshots, ``rollback.json`` and train streams
+of the ``--run_dirs``, ablates and perturbs each module at each stage onset,
+writes ``influence.json`` per run and a table of Spearman correlations to
+``--output_dir``; it fails on any missing snapshot.
 ``architecture`` reads the predictor tables of the ``--run_dirs``, groups
 them by domain order and writes ``architecture_baseline.json`` (the
 leave-one-order-out test of onset energy beyond type + depth).
@@ -52,6 +56,9 @@ Usage:
     PYTHONPATH=. python examples/domain_forgetting_analysis.py commutator \\
         --run_dirs results/domain_forgetting/commutator_*_seed* \\
         --output_dir results/domain_forgetting/commutator_bert
+    PYTHONPATH=. python examples/domain_forgetting_analysis.py influence \\
+        --run_dirs results/domain_forgetting/g9_*_lr3e-5_seed* \\
+        --output_dir results/domain_forgetting/influence_bp
     PYTHONPATH=. python examples/domain_forgetting_analysis.py all \\
         --run_dir results/domain_forgetting/bp_seed0
 """
@@ -73,6 +80,7 @@ set_jax_flags_before_importing_jax()
 from fabricpc.experiments.domain_forgetting import architecture_baseline
 from fabricpc.experiments.domain_forgetting.artifacts import atomic_write_json
 from fabricpc.experiments.domain_forgetting.commutator import (
+    commutator_test,
     compute_commutator,
 )
 from fabricpc.experiments.domain_forgetting.commutator import (
@@ -102,6 +110,10 @@ from fabricpc.experiments.domain_forgetting.frontier import (
     format_table,
     plot_frontier,
 )
+from fabricpc.experiments.domain_forgetting.influence import (
+    compute_influence_runs,
+    format_influence_table,
+)
 from fabricpc.experiments.domain_forgetting.runner import PC_INFERENCE
 from fabricpc.experiments.domain_forgetting.localization import (
     RANDOM_DRAWS,
@@ -113,7 +125,14 @@ from fabricpc.experiments.domain_forgetting.localization import (
 
 DEVELOPMENT = architecture_baseline.DEVELOPMENT_ORDERS
 RUN_COMMANDS = ("drift", "rollback", "error_maps", "predictors", "correlations")
-COMMANDS = (*RUN_COMMANDS, "frontier", "architecture", "commutator", "all")
+COMMANDS = (
+    *RUN_COMMANDS,
+    "frontier",
+    "architecture",
+    "commutator",
+    "influence",
+    "all",
+)
 REFERENCE_MODES = ("backprop", "pc")
 MAP_SETTING = {"bp": SPIKE_ONLY, "learner": LEARNER}
 
@@ -168,6 +187,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--output_dir",
         help="where correlations (default: the first run directory) or "
         "frontier (default: <results_dir>/frontier) writes",
+    )
+    parser.add_argument(
+        "--influence_verdict",
+        nargs=3,
+        action="append",
+        default=[],
+        metavar=("GATE", "MATCHED", "SURPRISE"),
+        help="frontier: condition labels to judge on the frontier, against the "
+        "matched control and against surprise only; repeatable",
+    )
+    parser.add_argument(
+        "--descriptive_verdict",
+        nargs=3,
+        action="append",
+        default=[],
+        metavar=("GATE", "MATCHED", "SURPRISE"),
+        help="frontier: as --influence_verdict, marked as not deciding the test",
+    )
+    parser.add_argument(
+        "--commutator_test",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("GATE", "CONTROL"),
+        help="commutator: condition labels of a D_gate < D_control test on each "
+        "pair holding both; repeatable",
     )
     parser.add_argument("--checkpoint", help="override the run's checkpoint path")
     parser.add_argument("--data_dir", help="override the run's data directory")
@@ -256,7 +301,11 @@ def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
         run_dirs = [Path(p) for p in args.run_dirs]
     else:
         root = Path(args.results_dir)
-        run_dirs = sorted(p for p in root.iterdir() if (p / "run_config.json").exists())
+        run_dirs = sorted(
+            p
+            for p in root.iterdir()
+            if (p / "run_config.json").exists() and not p.name.startswith("infl_")
+        )
     output = Path(args.output_dir or Path(args.results_dir) / "frontier")
     output.mkdir(parents=True, exist_ok=True)
     if args.pc_inference is not None and args.reference_mode != "pc":
@@ -271,6 +320,8 @@ def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
         seq_lr=args.seq_lr,
         map_source=args.map_source,
         expected_seeds=args.expected_seeds,
+        influence_verdicts=args.influence_verdict,
+        descriptive_verdicts=args.descriptive_verdict,
     )
     if args.reference_mode != "backprop" or args.map_source != "bp":
         result["reference"] = {
@@ -411,9 +462,49 @@ def run_commutator(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint=args.checkpoint,
         data_dir=args.data_dir,
     )
+    tests = []
+    for gate, control in args.commutator_test:
+        pairs = [
+            row["pair"]
+            for row in result["results"]
+            if row["condition"] == gate
+            and any(
+                other["condition"] == control and other["pair"] == row["pair"]
+                for other in result["results"]
+            )
+        ]
+        if not pairs:
+            raise SystemExit(f"no pair holds conditions {gate} and {control}")
+        tests.extend(commutator_test(result, gate, control, pair) for pair in pairs)
+    if tests:
+        result["tests"] = tests
     atomic_write_json(output / "commutator.json", result)
     if not args.quiet:
         print(format_commutator_table(result))
+        for test in tests:
+            print(
+                f"test {test['gate']} < {test['control']} {'/'.join(test['pair'])}: "
+                f"passed={test['passed']} mean_gap={test['mean_gap']} "
+                f"control_sd={test['control_sd']} verdict={test.get('verdict')}"
+            )
+    return result
+
+
+def run_influence(args: argparse.Namespace) -> dict[str, Any]:
+    """Ablation and perturbation influence at each stage onset of finished runs."""
+    if not args.run_dirs:
+        raise SystemExit("influence needs --run_dirs")
+    output = Path(args.output_dir or Path(args.results_dir) / "influence")
+    output.mkdir(parents=True, exist_ok=True)
+    result = compute_influence_runs(
+        args.run_dirs,
+        checkpoint=args.checkpoint,
+        data_dir=args.data_dir,
+        verbose=not args.quiet,
+    )
+    atomic_write_json(output / "influence.json", result)
+    if not args.quiet:
+        print(format_influence_table(result))
     return result
 
 
@@ -434,6 +525,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             results[command] = run_architecture(args)
         elif command == "commutator":
             results[command] = run_commutator(args)
+        elif command == "influence":
+            results[command] = run_influence(args)
         else:
             context = context or _context(args)
             output = Path(args.run_dir)
