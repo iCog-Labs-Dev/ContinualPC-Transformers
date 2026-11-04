@@ -339,7 +339,13 @@ def compute_commutator(
 def commutator_test(
     result: Mapping[str, Any], gate: str, control: str, pair: Sequence[str]
 ) -> dict[str, Any]:
-    """Test ``D_gate < D_control`` on one pair (seeds paired by seed)."""
+    """Test ``D_gate < D_control`` on one pair (seeds paired by seed).
+
+    With function-space distances, ``function_space_gap`` is the mean over
+    seeds and domains of the control's symmetric KL minus the gate's, and
+    ``verdict`` is ``"supported"`` for a pass whose gap is positive,
+    ``"parameter-only"`` for a pass whose gap is not, else ``"null"``.
+    """
     rows = {r["condition"]: r for r in result["results"] if r["pair"] == sorted(pair)}
     if gate not in rows or control not in rows:
         raise ValueError(f"{sorted(pair)}: needs conditions {gate} and {control}")
@@ -356,7 +362,7 @@ def commutator_test(
         and mean_gap is not None
         and mean_gap > control_sd
     )
-    return {
+    test = {
         "gate": gate,
         "control": control,
         "pair": sorted(pair),
@@ -366,6 +372,19 @@ def commutator_test(
         "control_sd": control_sd,
         "passed": passed,
     }
+    gate_kl = {e["seed"]: e.get("symmetric_kl") for e in rows[gate]["per_seed"]}
+    control_kl = {e["seed"]: e.get("symmetric_kl") for e in rows[control]["per_seed"]}
+    if seeds and all(gate_kl[s] and control_kl[s] for s in seeds):
+        kl_gap = float(
+            np.mean(
+                [control_kl[s][d] - gate_kl[s][d] for s in seeds for d in gate_kl[s]]
+            )
+        )
+        test["function_space_gap"] = kl_gap
+        test["verdict"] = (
+            "null" if not passed else "supported" if kl_gap > 0 else "parameter-only"
+        )
+    return test
 
 
 def format_table(result: Mapping[str, Any]) -> str:
