@@ -36,6 +36,28 @@ curve (it interpolates between the others) and are listed per order under
 test, which needs every expected seed (by default every seed with a
 reference run in that order).
 
+The **lower envelope** of a curve (``lower_envelope``) drops every point
+dominated by another (gain ≥ x and CE ≤ y) and interpolates along the rest,
+``bwt`` included. It is a post hoc reference, added because the pre-registered
+linear interpolation is not a frontier on a non-monotone curve. Every run also
+reports ``d_envelope`` and ``d_bwt_envelope`` on it and every primary test an
+``envelope`` entry; the pre-registered fields are unchanged. Below the first
+retained point but inside the curve's range, the reference is that point: it has
+the curve's lowest CE and more gain, and the measured points there all have
+higher CE, so the reference is conservative. Outside the curve's range there is
+no envelope distance.
+
+An **influence verdict** (``influence_verdict``) applies one rule to a gate on
+the frontier, against its matched control and against surprise only: the
+per-seed value (``d``, or ``d`` of the gate minus ``d`` of the control paired by
+seed) is < 0 in every expected seed and ``|mean|`` exceeds the order's sequential
+seed SD, in both orders. It is reported under both computations whatever it
+shows. Each comparison's ``status`` is ``pass``, ``fail`` (a measured value is
+>= 0, or the mean does not exceed the SD) or ``undefined`` (no measured value
+rules it out, but one is missing or off the curve). An undefined comparison is
+not a pass. A verdict across learning rates, or one asked for as descriptive, is
+marked ``descriptive_only``; its rows are reported but do not decide the test.
+
 Means are over seeds; SDs are sample SDs (``ddof=1``), ``None`` for one seed.
 """
 
@@ -48,12 +70,17 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from fabricpc.experiments.domain_forgetting.runner import GATE_SETTINGS, ONLINE_GATES
+from fabricpc.experiments.domain_forgetting.runner import (
+    GATE_DEFAULTS,
+    GATE_SETTINGS,
+    ONLINE_GATES,
+)
 
 SEQ_LR = 1e-4
 PRIMARY_GATE = "map"
 CONTRASTS = (("map", "random"), ("map", "type"))
 REFERENCE = "none"
+ALPHA_KEY = "gate_influence_alpha"
 OKABE_ITO = {
     "none": "#000000",
     "map": "#0072B2",
@@ -74,6 +101,10 @@ DEFINITIONS = {
     "d_bwt": "bwt - bwt_ref(x) on the same curve; positive = less forgetting",
     "gap_closed": "(y_seq - y) / (y_seq - y_joint); y_seq the same order and "
     "seed's sequential run at seq_lr, y_joint the mean over joint seeds",
+    "d_envelope": "post hoc: y - y_env(x) on the curve's lower envelope (points "
+    "not dominated by gain >= x and CE <= y), held at its first point below "
+    "that point; None outside the curve's range",
+    "d_bwt_envelope": "post hoc: bwt - bwt_env(x) on the same retained points",
     "primary_test": "d < 0 in every seed and |mean d| > seed SD of y of the "
     "order's seq_lr sequential runs",
     "contrast": "per seed a - b on y and on d; fraction_negative over seeds",
@@ -126,8 +157,9 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"``,
     ``"online_protect_b2"``, ``"online_surprise"`` (``"_learner"`` appended
     for ``gate_map_source="learner"``, then a non-live variant, as in
-    ``"online_protect_b2_learner_replay"``) and, for ungated runs,
-    ``"lr3e-05"``. An error-norm penalty or update scale appends
+    ``"online_protect_b2_learner_replay"``, then an ``online_influence`` α
+    other than the default, as in ``"online_influence_a0"``) and, for ungated
+    runs, ``"lr3e-05"``. An error-norm penalty or update scale appends
     ``intervention_label``, as in ``"lr3e-05_pen0.001"``.
     """
     gate = config.get("gate", REFERENCE)
@@ -149,6 +181,10 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     variant = config.get("gate_variant", "live")
     if gate in ONLINE_GATES and variant != "live":
         label += f"_{variant}"
+    if gate == "online_influence":
+        alpha = float(config.get("gate_influence_alpha", GATE_DEFAULTS[ALPHA_KEY]))
+        if alpha != GATE_DEFAULTS[ALPHA_KEY]:
+            label += f"_a{alpha:g}"
     if not math.isclose(float(config["lr"]), SEQ_LR):
         label += f"@lr{lr_text(float(config['lr']))}"
     return gate, beta, label + intervention
@@ -291,6 +327,65 @@ def frontier_distance(
     }
 
 
+def lower_envelope(curve: Mapping[str, Sequence[Any]]) -> dict[str, list]:
+    """The curve's points not dominated by another with gain ≥ x and CE ≤ y.
+
+    Sorted by ``x`` with the curve's ``lr``, ``x``, ``y`` and ``bwt``, so ``bwt``
+    interpolates along the same points. Of two points with equal ``x`` only the
+    lower ``y`` stays, of two with equal ``y`` only the higher ``x``, and of
+    exact duplicates only the first.
+    """
+    rows = sorted(
+        zip(curve["lr"], curve["x"], curve["y"], curve["bwt"]), key=lambda r: r[1]
+    )
+    kept: list[tuple[Any, ...]] = []
+    seen: set[tuple[float, float]] = set()
+    for row in rows:
+        point = (row[1], row[2])
+        if point in seen:
+            continue
+        seen.add(point)
+        dominated = any(
+            other[1] >= point[0]
+            and other[2] <= point[1]
+            and (other[1], other[2]) != point
+            for other in rows
+        )
+        if not dominated:
+            kept.append(row)
+    return {
+        key: [row[index] for row in kept]
+        for index, key in enumerate(("lr", "x", "y", "bwt"))
+    }
+
+
+def envelope_distance(
+    point: Mapping[str, Any], curve: Mapping[str, Sequence[Any]]
+) -> dict[str, Any]:
+    """``frontier_distance`` on the curve's lower envelope, under its own keys.
+
+    A point below the envelope's first point and inside the curve's range is
+    measured against that first point; ``below_envelope`` marks it.
+    """
+    envelope = lower_envelope(curve)
+    below = min(curve["x"]) <= point["x"] < envelope["x"][0]
+    if below:
+        envelope = {
+            "lr": [envelope["lr"][0]] * 2,
+            "x": [point["x"], envelope["x"][0]],
+            "y": [envelope["y"][0]] * 2,
+            "bwt": [envelope["bwt"][0]] * 2,
+        }
+    distance = frontier_distance(point, envelope)
+    return {
+        "below_envelope": below,
+        "d_envelope": distance["d"],
+        "d_bwt_envelope": distance["d_bwt"],
+        "y_ref_envelope": distance["y_ref"],
+        "outside_range_envelope": distance["outside_range"],
+    }
+
+
 def gap_closed(y: float, y_seq: float, y_joint: float) -> float:
     """Return ``(y_seq - y) / (y_seq - y_joint)``."""
     if y_seq == y_joint:
@@ -342,12 +437,17 @@ def compute_frontier(
     seq_lr: float = SEQ_LR,
     map_source: str = "bp",
     expected_seeds: Sequence[int] | None = None,
+    influence_verdicts: Sequence[Sequence[str]] = (),
+    descriptive_verdicts: Sequence[Sequence[str]] = (),
 ) -> dict[str, Any]:
     """Run the frontier analysis on loaded run points (``collect_runs``).
 
     The primary test and contrasts use the gate runs of ``map_source``; the
     primary test needs every seed of ``expected_seeds`` (default: the seeds
-    with a reference run in the order).
+    with a reference run in the order). ``influence_verdicts`` holds
+    ``(gate, matched, surprise)`` condition labels to judge
+    (``influence_verdict``); ``descriptive_verdicts`` are reported the same way
+    and marked as not deciding the test.
     """
     joint = [p for p in points if p["training"] == "joint" and not p.get("diverged")]
     sequential = [dict(p) for p in points if p["training"] != "joint"]
@@ -384,6 +484,12 @@ def compute_frontier(
 
         for point in members:
             curve = curves.get(point["seed"])
+            point.update(
+                d_envelope=None,
+                d_bwt_envelope=None,
+                y_ref_envelope=None,
+                outside_range_envelope=None,
+            )
             if point.get("diverged"):
                 point.update(d=None, d_bwt=None, y_ref=None, outside_range=None)
             elif curve is None:
@@ -391,6 +497,7 @@ def compute_frontier(
                 point["no_reference"] = True
             else:
                 point.update(frontier_distance(point, curve))
+                point.update(envelope_distance(point, curve))
             y_seq = seq_y.get(point["seed"])
             point["gap_closed"] = (
                 gap_closed(point["y"], y_seq, y_joint)
@@ -403,6 +510,7 @@ def compute_frontier(
         result_orders[name] = {
             "domains": list(domains),
             "curves": {str(s): c for s, c in curves.items()},
+            "envelope_curves": {str(s): lower_envelope(c) for s, c in curves.items()},
             "failed_reference_runs": failed,
             "expected_seeds": expected,
             "mean_curve": _seed_mean_curve(references),
@@ -415,7 +523,14 @@ def compute_frontier(
             "contrasts": _contrasts(members, seq_lr, map_source),
         }
 
+    verdicts = [
+        influence_verdict(result_orders, *labels) for labels in influence_verdicts
+    ] + [
+        influence_verdict(result_orders, *labels, descriptive=True)
+        for labels in descriptive_verdicts
+    ]
     return {
+        **({"influence_verdicts": verdicts} if verdicts else {}),
         "definitions": DEFINITIONS,
         "seq_lr": seq_lr,
         "joint": {
@@ -442,7 +557,21 @@ def _aggregate(members: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "n": len(group),
             **{
                 key: mean_sd([p[key] for p in group])
-                for key in ("x", "y", "bwt", "d", "d_bwt", "gap_closed")
+                for key in (
+                    "x",
+                    "y",
+                    "bwt",
+                    "d",
+                    "d_bwt",
+                    "gap_closed",
+                    "d_envelope",
+                    "d_bwt_envelope",
+                )
+            },
+            "outside_range_envelope": {
+                str(p["seed"]): p["outside_range_envelope"]
+                for p in group
+                if p.get("outside_range_envelope")
             },
             "outside_range": {
                 str(p["seed"]): p["outside_range"]
@@ -507,8 +636,185 @@ def _primary_tests(
             "all_seeds_negative": all_negative,
             "exceeds_seq_sd": bool(exceeds),
             "pass": bool(all_negative and exceeds),
+            "envelope": {
+                "post_hoc": True,
+                **pass_rule(
+                    [
+                        runs[s].get("d_envelope") if s in runs else None
+                        for s in sorted({*runs, *expected})
+                    ],
+                    seq_sd,
+                ),
+            },
         }
     return tests
+
+
+def pass_rule(values: Sequence[float | None], seq_sd: float | None) -> dict[str, Any]:
+    """Every value < 0 and ``|mean|`` above ``seq_sd``; a missing value never passes.
+
+    ``status`` separates a measured failure from a comparison with values
+    missing: a measured value >= 0 fails whatever the others are.
+    """
+    stats = mean_sd(values)
+    complete = bool(values) and all(v is not None for v in values)
+    all_negative = complete and all(v < 0 for v in values)  # type: ignore[operator]
+    exceeds = (
+        complete
+        and seq_sd is not None
+        and stats["mean"] is not None
+        and abs(stats["mean"]) > seq_sd
+    )
+    passed = bool(all_negative and exceeds)
+    if passed:
+        status = "pass"
+    elif complete or any(v is not None and v >= 0 for v in values):
+        status = "fail"
+    else:
+        status = "undefined"
+    return {
+        "status": status,
+        "values": list(values),
+        "mean": stats["mean"],
+        "sd": stats["sd"],
+        "seq_y_sd": seq_sd,
+        "all_negative": all_negative,
+        "exceeds_seq_sd": bool(exceeds),
+        "pass": passed,
+    }
+
+
+def _combined_status(rows: Sequence[Mapping[str, Any]]) -> str:
+    """``fail`` if any order fails, ``pass`` if all pass, else ``undefined``."""
+    statuses = [row["status"] for row in rows]
+    if "fail" in statuses:
+        return "fail"
+    return "pass" if statuses and set(statuses) == {"pass"} else "undefined"
+
+
+def _difference(first: float | None, second: float | None) -> float | None:
+    return None if first is None or second is None else first - second
+
+
+def _seed_values(
+    by_label: Mapping[str, Mapping[int, Mapping[str, Any]]],
+    label: str,
+    key: str,
+    seeds: Sequence[int],
+) -> list[float | None]:
+    runs = by_label.get(label, {})
+    return [runs[s][key] if s in runs else None for s in seeds]
+
+
+def influence_verdict(
+    orders: Mapping[str, Mapping[str, Any]],
+    gate: str,
+    matched: str,
+    surprise: str,
+    *,
+    descriptive: bool = False,
+) -> dict[str, Any]:
+    """Judge ``gate`` on the frontier, against ``matched`` and against ``surprise``.
+
+    Applies ``pass_rule`` per order over its expected seeds, paired by seed,
+    under both computations: ``pre_registered`` (``d``) and
+    ``envelope_post_hoc`` (``d_envelope``). ``lr`` holds each condition's lr per
+    order, and ``lr_mismatch`` is true when the conditions present differ
+    anywhere: such a comparison also differs in base rate, so it is
+    ``descriptive_only``. ``missing_conditions`` lists conditions with no run.
+    ``paired_y`` is the per-seed final CE difference from each control, defined
+    even when a run is off the curve.
+    """
+    out: dict[str, Any] = {
+        "gate": gate,
+        "matched": matched,
+        "surprise": surprise,
+        "rule": "value < 0 in every expected seed and |mean| > the order's "
+        "sequential seed SD, in both orders; values are d of the gate, then d "
+        "of the gate minus d of the control paired by seed",
+        "lr": {},
+    }
+    for name, key, post_hoc in (
+        ("pre_registered", "d", False),
+        ("envelope_post_hoc", "d_envelope", True),
+    ):
+        per_order: dict[str, dict[str, Any]] = {}
+        for order_key, order in orders.items():
+            by_label: dict[str, dict[int, Mapping[str, Any]]] = {}
+            for run in order["runs"]:
+                by_label.setdefault(run["label"], {})[run["seed"]] = run
+            seeds = order["expected_seeds"]
+            seq_sd = order["seq"]["y"]["sd"]
+
+            own = _seed_values(by_label, gate, key, seeds)
+            per_order[order_key] = {
+                "seeds": list(seeds),
+                "frontier": pass_rule(own, seq_sd),
+                "vs_matched": pass_rule(
+                    [
+                        _difference(a, b)
+                        for a, b in zip(
+                            own, _seed_values(by_label, matched, key, seeds)
+                        )
+                    ],
+                    seq_sd,
+                ),
+                "vs_surprise": pass_rule(
+                    [
+                        _difference(a, b)
+                        for a, b in zip(
+                            own, _seed_values(by_label, surprise, key, seeds)
+                        )
+                    ],
+                    seq_sd,
+                ),
+            }
+            for comparison, control in (
+                ("vs_matched", matched),
+                ("vs_surprise", surprise),
+            ):
+                per_order[order_key][comparison]["paired_y"] = [
+                    _difference(a, b)
+                    for a, b in zip(
+                        _seed_values(by_label, gate, "y", seeds),
+                        _seed_values(by_label, control, "y", seeds),
+                    )
+                ]
+            out["lr"][order_key] = {
+                label: sorted({r["lr"] for r in by_label.get(label, {}).values()})
+                for label in (gate, matched, surprise)
+            }
+        passes = {
+            comparison: len(per_order) >= 2
+            and all(entry[comparison]["pass"] for entry in per_order.values())
+            for comparison in ("frontier", "vs_matched", "vs_surprise")
+        }
+        out[name] = {
+            "post_hoc": post_hoc,
+            "orders": per_order,
+            "passes": passes,
+            "status": {
+                comparison: _combined_status(
+                    [entry[comparison] for entry in per_order.values()]
+                )
+                for comparison in passes
+            },
+            "pass": all(passes.values()),
+        }
+    out["lr_mismatch"] = any(
+        len({tuple(lrs) for lrs in entry.values() if lrs}) > 1
+        for entry in out["lr"].values()
+    )
+    out["missing_conditions"] = sorted(
+        {
+            label
+            for entry in out["lr"].values()
+            for label, lrs in entry.items()
+            if not lrs
+        }
+    )
+    out["descriptive_only"] = descriptive or out["lr_mismatch"]
+    return out
 
 
 def _both_orders(orders: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -522,6 +828,12 @@ def _both_orders(orders: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         out[beta] = {
             "per_order": per_order,
             "pass": len(per_order) >= 2 and all(v is True for v in per_order.values()),
+            "envelope_pass_post_hoc": len(per_order) >= 2
+            and all(
+                beta in o["primary_test"]
+                and o["primary_test"][beta]["envelope"]["pass"]
+                for o in orders.values()
+            ),
         }
     return out
 
@@ -576,7 +888,7 @@ def format_table(result: Mapping[str, Any]) -> str:
         lines.append(f"joint: y = {_fmt(joint)} (n={joint['n']})")
     header = (
         f"{'condition':<28}{'n':>3}  {'x (gain)':>14}  {'y (final CE)':>14}  "
-        f"{'bwt':>14}  {'d':>14}  {'gap closed':>14}"
+        f"{'bwt':>14}  {'d':>14}  {'gap closed':>14}  {'d env (post hoc)':>16}"
     )
     for name, order in result["orders"].items():
         lines += ["", f"order {name}", header]
@@ -585,7 +897,7 @@ def format_table(result: Mapping[str, Any]) -> str:
             lines.append(
                 f"{label:<28}{c['n']:>3}  {_fmt(c['x']):>14}  {_fmt(c['y']):>14}  "
                 f"{_fmt(c['bwt']):>14}  {_fmt(c['d'], 4):>14}  "
-                f"{_fmt(c['gap_closed']):>14}{flag}"
+                f"{_fmt(c['gap_closed']):>14}  {_fmt(c['d_envelope'], 4):>16}{flag}"
             )
         for failed in order.get("failed_reference_runs", []):
             lines.append(
@@ -618,6 +930,31 @@ def format_table(result: Mapping[str, Any]) -> str:
             )
     for beta, test in result["primary_test_both_orders"].items():
         lines.append(f"primary map b{beta} both orders: pass={test['pass']}")
+    for verdict in result.get("influence_verdicts", []):
+        lines += [
+            "",
+            f"verdict {verdict['gate']} vs {verdict['matched']} and "
+            f"{verdict['surprise']} (lr mismatch: {verdict['lr_mismatch']}, "
+            f"descriptive only: {verdict['descriptive_only']}, "
+            f"missing: {verdict['missing_conditions']})",
+        ]
+        for name in ("pre_registered", "envelope_post_hoc"):
+            entry = verdict[name]
+            lines.append(f"  {name}: pass={entry['pass']} {entry['status']}")
+            for order, rows in entry["orders"].items():
+                for comparison in ("frontier", "vs_matched", "vs_surprise"):
+                    row = rows[comparison]
+                    shown = " ".join(
+                        "-" if v is None else f"{v:+.4f}" for v in row["values"]
+                    )
+                    paired = " ".join(
+                        "-" if v is None else f"{v:+.4f}"
+                        for v in row.get("paired_y", [])
+                    )
+                    lines.append(
+                        f"    {order} {comparison}: {shown} {row['status']}"
+                        + (f" (paired y: {paired})" if paired else "")
+                    )
     return "\n".join(lines)
 
 
