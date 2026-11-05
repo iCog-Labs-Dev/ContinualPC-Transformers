@@ -9,8 +9,10 @@ validation SHA-256s it used. ``correlations`` reads ``rollback.json``,
 refuses any computed from other stage snapshots, and writes
 ``correlations.json`` and ``correlations.png``. ``frontier`` reads only
 ``run_config.json`` and ``summary.json`` of the ``--run_dirs`` (default:
-every run under ``--results_dir``) and writes ``frontier.json``,
-``frontier.pdf`` and ``frontier.png``; ``commutator`` reads the stage
+every run under ``--results_dir``), plus training logs for baseline verdicts,
+and writes ``frontier.json``, ``frontier.pdf`` and ``frontier.png``;
+``retention_select`` reads the same of one learner's retention pilot runs and
+its ungated runs and writes ``retention_selection.json``; ``commutator`` reads the stage
 snapshots and training logs of the ``--run_dirs`` (both domain orders per
 seed and condition) and writes ``commutator.json``; ``all`` leaves both out.
 ``influence`` reads the stage snapshots, ``rollback.json`` and train streams
@@ -107,8 +109,10 @@ from fabricpc.experiments.domain_forgetting.frontier import (
     SEQ_LR,
     collect_runs,
     compute_frontier,
+    format_selection,
     format_table,
     plot_frontier,
+    select_retention,
 )
 from fabricpc.experiments.domain_forgetting.influence import (
     compute_influence_runs,
@@ -131,6 +135,7 @@ COMMANDS = (
     "architecture",
     "commutator",
     "influence",
+    "retention_select",
     "all",
 )
 REFERENCE_MODES = ("backprop", "pc")
@@ -206,6 +211,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="frontier: as --influence_verdict, marked as not deciding the test",
     )
     parser.add_argument(
+        "--baseline_verdict",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("BASELINE", "MATCHED"),
+        help="frontier: condition labels of a retention baseline to judge on the "
+        "frontier and against its matched control; repeatable",
+    )
+    parser.add_argument(
+        "--descriptive_baseline_verdict",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("BASELINE", "CONTROL"),
+        help="frontier: as --baseline_verdict, marked as not deciding the test",
+    )
+    parser.add_argument(
+        "--confirmation_seeds",
+        nargs="+",
+        type=int,
+        default=[],
+        help="frontier: also judge the baseline verdicts on these seeds alone",
+    )
+    parser.add_argument(
         "--commutator_test",
         nargs=2,
         action="append",
@@ -219,7 +248,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_valid_windows", type=int)
     parser.add_argument("--eval_batch_size", type=int)
     parser.add_argument("--random_draws", type=int, default=RANDOM_DRAWS)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed", type=int, default=0, help="also the pilot seed of retention_select"
+    )
     parser.add_argument("--no_groups", action="store_true")
     parser.add_argument("--map_windows", type=int, default=256)
     parser.add_argument("--map_batch_size", type=int, default=8)
@@ -304,7 +335,8 @@ def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
         run_dirs = sorted(
             p
             for p in root.iterdir()
-            if (p / "run_config.json").exists() and not p.name.startswith("infl_")
+            if (p / "run_config.json").exists()
+            and not p.name.startswith(("infl_", "ret_"))
         )
     output = Path(args.output_dir or Path(args.results_dir) / "frontier")
     output.mkdir(parents=True, exist_ok=True)
@@ -322,6 +354,9 @@ def run_frontier(args: argparse.Namespace) -> dict[str, Any]:
         expected_seeds=args.expected_seeds,
         influence_verdicts=args.influence_verdict,
         descriptive_verdicts=args.descriptive_verdict,
+        baseline_verdicts=args.baseline_verdict,
+        descriptive_baselines=args.descriptive_baseline_verdict,
+        confirmation_seeds=args.confirmation_seeds,
     )
     if args.reference_mode != "backprop" or args.map_source != "bp":
         result["reference"] = {
@@ -508,6 +543,24 @@ def run_influence(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def run_retention_select(args: argparse.Namespace) -> dict[str, Any]:
+    """Select each retention method's strength from one learner's pilot runs."""
+    if not args.run_dirs or not args.output_dir:
+        raise SystemExit("retention_select needs --run_dirs and --output_dir")
+    if args.reference_mode == "pc" and args.pc_inference is None:
+        raise SystemExit("--reference_mode pc needs --pc_inference")
+    points = collect_runs(
+        args.run_dirs, mode=args.reference_mode, pc_inference=args.pc_inference
+    )
+    result = select_retention(points, args.seq_lr, args.seed)
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output / "retention_selection.json", result)
+    if not args.quiet:
+        print(format_selection(result))
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     """Run one analysis command, or ``all`` of them in order."""
     args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
@@ -527,6 +580,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             results[command] = run_commutator(args)
         elif command == "influence":
             results[command] = run_influence(args)
+        elif command == "retention_select":
+            results[command] = run_retention_select(args)
         else:
             context = context or _context(args)
             output = Path(args.run_dir)

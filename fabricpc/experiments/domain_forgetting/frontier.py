@@ -21,6 +21,10 @@ and ``bwt`` the run's ``bwt_ce``. Runs are grouped by (domain order, seed).
   ``seq_lr`` sequential runs.
 - **Contrasts** ``map - random`` and ``map - type`` are paired by seed per
   order and ``beta``, on ``y`` and on ``d``.
+- A **baseline verdict** (``baseline_verdict``) judges a retention baseline
+  against its frontier and matched uniform with ``influence_verdict``, on every
+  expected seed and on the seeds that did not select its strength; the strength
+  comes from ``select_retention``.
 
 The reference runs are those of one learner: ``collect_runs`` keeps the
 runs of ``mode`` (backprop by default) and, for PC, optionally of one
@@ -80,6 +84,8 @@ SEQ_LR = 1e-4
 PRIMARY_GATE = "map"
 CONTRASTS = (("map", "random"), ("map", "type"))
 REFERENCE = "none"
+RETENTION_GRIDS = {"l2sp": (1e-3, 1e-2, 1e-1, 1.0), "ewc": (1.0, 1e2, 1e4, 1e6)}
+SELECTION_GAIN_FRACTION = 0.9
 ALPHA_KEY = "gate_influence_alpha"
 OKABE_ITO = {
     "none": "#000000",
@@ -133,11 +139,12 @@ def lr_text(lr: float) -> str:
 
 
 def intervention_label(config: Mapping[str, Any]) -> str:
-    """Return the suffix naming a run's error-norm penalty and update scale.
+    """Return the suffix naming a run's interventions.
 
-    ``"_pen0.001"`` for ``pc_error_norm_penalty`` 0.001 and
-    ``"_scale0.5[embeddings,L0_mha]"`` for an update scale on those modules;
-    empty for a run with neither.
+    ``"_pen0.001"`` for ``pc_error_norm_penalty`` 0.001,
+    ``"_scale0.5[embeddings,L0_mha]"`` for an update scale on those modules,
+    ``"_l2sp0.01"`` or ``"_ewc100"`` for a retention penalty of that strength
+    and ``"_keepopt"`` for ``keep_optimizer_state``; empty for a run with none.
     """
     label = ""
     penalty = float(config.get("pc_error_norm_penalty", 0.0))
@@ -147,6 +154,11 @@ def intervention_label(config: Mapping[str, Any]) -> str:
     if modules:
         scale = float(config.get("update_scale", 1.0))
         label += f"_scale{scale:g}[{','.join(modules)}]"
+    method = config.get("retention", "none")
+    if method != "none":
+        label += f"_{method}{float(config.get('retention_lambda', 0.0)):g}"
+    if config.get("keep_optimizer_state", False):
+        label += "_keepopt"
     return label
 
 
@@ -155,12 +167,13 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
 
     ``beta`` is ``None`` for gates that do not use it. Labels are
     ``"map_b1"``, ``"freeze[embeddings,L0]"``, ``"uniform_s0.5"``,
+    ``"uniform_all_s0.5"``,
     ``"online_protect_b2"``, ``"online_surprise"`` (``"_learner"`` appended
     for ``gate_map_source="learner"``, then a non-live variant, as in
     ``"online_protect_b2_learner_replay"``, then an ``online_influence`` α
     other than the default, as in ``"online_influence_a0"``) and, for ungated
-    runs, ``"lr3e-05"``. An error-norm penalty or update scale appends
-    ``intervention_label``, as in ``"lr3e-05_pen0.001"``.
+    runs, ``"lr3e-05"``. An intervention appends ``intervention_label``, as in
+    ``"lr3e-05_pen0.001"`` or ``"lr3e-05_l2sp0.01"``.
     """
     gate = config.get("gate", REFERENCE)
     intervention = intervention_label(config)
@@ -170,8 +183,8 @@ def describe_gate(config: Mapping[str, Any]) -> tuple[str, float | None, str]:
     beta = float(config["gate_beta"]) if "gate_beta" in settings else None
     if gate == "freeze":
         label = f"freeze[{','.join(config.get('gate_modules', []))}]"
-    elif gate == "uniform":
-        label = f"uniform_s{float(config['gate_scale']):g}"
+    elif gate in ("uniform", "uniform_all"):
+        label = f"{gate}_s{float(config['gate_scale']):g}"
     elif beta is not None:
         label = f"{gate}_b{beta:g}"
     else:
@@ -224,6 +237,9 @@ def load_run_point(run_dir: str | Path) -> dict[str, Any] | None:
         "beta": beta,
         "label": label,
         "intervention": bool(intervention_label(config)),
+        "retention": config.get("retention", "none"),
+        "retention_lambda": float(config.get("retention_lambda", 0.0)),
+        "keep_optimizer_state": bool(config.get("keep_optimizer_state", False)),
         "diverged": diverged,
         "x": None if diverged else _mean(gains[d] for d in domains),
         "y": None if diverged else _mean(final[d] for d in domains),
@@ -403,7 +419,7 @@ def mean_sd(values: Sequence[float | None]) -> dict[str, Any]:
 
 
 def _is_reference(point: Mapping[str, Any]) -> bool:
-    """Ungated sequential runs without an error-norm penalty or update scale."""
+    """Ungated sequential runs without any intervention (``intervention_label``)."""
     return (
         point["training"] != "joint"
         and point["gate"] == REFERENCE
@@ -439,6 +455,9 @@ def compute_frontier(
     expected_seeds: Sequence[int] | None = None,
     influence_verdicts: Sequence[Sequence[str]] = (),
     descriptive_verdicts: Sequence[Sequence[str]] = (),
+    baseline_verdicts: Sequence[Sequence[str]] = (),
+    descriptive_baselines: Sequence[Sequence[str]] = (),
+    confirmation_seeds: Sequence[int] = (),
 ) -> dict[str, Any]:
     """Run the frontier analysis on loaded run points (``collect_runs``).
 
@@ -447,7 +466,9 @@ def compute_frontier(
     with a reference run in the order). ``influence_verdicts`` holds
     ``(gate, matched, surprise)`` condition labels to judge
     (``influence_verdict``); ``descriptive_verdicts`` are reported the same way
-    and marked as not deciding the test.
+    and marked as not deciding the test. ``baseline_verdicts`` and
+    ``descriptive_baselines`` hold ``(gate, matched)`` labels
+    (``baseline_verdict``), also judged on ``confirmation_seeds``.
     """
     joint = [p for p in points if p["training"] == "joint" and not p.get("diverged")]
     sequential = [dict(p) for p in points if p["training"] != "joint"]
@@ -529,8 +550,21 @@ def compute_frontier(
         influence_verdict(result_orders, *labels, descriptive=True)
         for labels in descriptive_verdicts
     ]
+    baselines = [
+        baseline_verdict(result_orders, *labels, confirmation_seeds=confirmation_seeds)
+        for labels in baseline_verdicts
+    ] + [
+        baseline_verdict(
+            result_orders,
+            *labels,
+            confirmation_seeds=confirmation_seeds,
+            descriptive=True,
+        )
+        for labels in descriptive_baselines
+    ]
     return {
         **({"influence_verdicts": verdicts} if verdicts else {}),
+        **({"baseline_verdicts": baselines} if baselines else {}),
         "definitions": DEFINITIONS,
         "seq_lr": seq_lr,
         "joint": {
@@ -710,11 +744,16 @@ def influence_verdict(
     orders: Mapping[str, Mapping[str, Any]],
     gate: str,
     matched: str,
-    surprise: str,
+    surprise: str | None,
     *,
     descriptive: bool = False,
+    seeds: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Judge ``gate`` on the frontier, against ``matched`` and against ``surprise``.
+
+    ``surprise`` None drops that comparison, which is then absent from the
+    result and from what must pass. ``seeds`` replaces each order's expected
+    seeds; the sequential seed SD stays that of all the order's sequential runs.
 
     Applies ``pass_rule`` per order over its expected seeds, paired by seed,
     under both computations: ``pre_registered`` (``d``) and
@@ -734,6 +773,9 @@ def influence_verdict(
         "of the gate minus d of the control paired by seed",
         "lr": {},
     }
+    controls = [("vs_matched", matched)]
+    if surprise is not None:
+        controls.append(("vs_surprise", surprise))
     for name, key, post_hoc in (
         ("pre_registered", "d", False),
         ("envelope_post_hoc", "d_envelope", True),
@@ -743,51 +785,40 @@ def influence_verdict(
             by_label: dict[str, dict[int, Mapping[str, Any]]] = {}
             for run in order["runs"]:
                 by_label.setdefault(run["label"], {})[run["seed"]] = run
-            seeds = order["expected_seeds"]
+            judged = order["expected_seeds"] if seeds is None else seeds
             seq_sd = order["seq"]["y"]["sd"]
 
-            own = _seed_values(by_label, gate, key, seeds)
+            own = _seed_values(by_label, gate, key, judged)
             per_order[order_key] = {
-                "seeds": list(seeds),
+                "seeds": list(judged),
                 "frontier": pass_rule(own, seq_sd),
-                "vs_matched": pass_rule(
-                    [
-                        _difference(a, b)
-                        for a, b in zip(
-                            own, _seed_values(by_label, matched, key, seeds)
-                        )
-                    ],
-                    seq_sd,
-                ),
-                "vs_surprise": pass_rule(
-                    [
-                        _difference(a, b)
-                        for a, b in zip(
-                            own, _seed_values(by_label, surprise, key, seeds)
-                        )
-                    ],
-                    seq_sd,
-                ),
             }
-            for comparison, control in (
-                ("vs_matched", matched),
-                ("vs_surprise", surprise),
-            ):
-                per_order[order_key][comparison]["paired_y"] = [
+            for comparison, control in controls:
+                row = pass_rule(
+                    [
+                        _difference(a, b)
+                        for a, b in zip(
+                            own, _seed_values(by_label, control, key, judged)
+                        )
+                    ],
+                    seq_sd,
+                )
+                row["paired_y"] = [
                     _difference(a, b)
                     for a, b in zip(
-                        _seed_values(by_label, gate, "y", seeds),
-                        _seed_values(by_label, control, "y", seeds),
+                        _seed_values(by_label, gate, "y", judged),
+                        _seed_values(by_label, control, "y", judged),
                     )
                 ]
+                per_order[order_key][comparison] = row
             out["lr"][order_key] = {
                 label: sorted({r["lr"] for r in by_label.get(label, {}).values()})
-                for label in (gate, matched, surprise)
+                for label in (gate, *(control for _, control in controls))
             }
         passes = {
             comparison: len(per_order) >= 2
             and all(entry[comparison]["pass"] for entry in per_order.values())
-            for comparison in ("frontier", "vs_matched", "vs_surprise")
+            for comparison in ("frontier", *(name for name, _ in controls))
         }
         out[name] = {
             "post_hoc": post_hoc,
@@ -815,6 +846,230 @@ def influence_verdict(
     )
     out["descriptive_only"] = descriptive or out["lr_mismatch"]
     return out
+
+
+def _stage_path(run: Mapping[str, Any]) -> float | None:
+    """Update path of stages 2 on, ``None`` without the run's training logs."""
+    from fabricpc.experiments.domain_forgetting.commutator import read_paths
+
+    try:
+        stages = read_paths(run["run_dir"], len(run["domains"]))
+    except (FileNotFoundError, ValueError):
+        return None
+    return float(sum(stage["total"] for stage in stages[1:]))
+
+
+def baseline_verdict(
+    orders: Mapping[str, Mapping[str, Any]],
+    gate: str,
+    matched: str,
+    *,
+    confirmation_seeds: Sequence[int] = (),
+    descriptive: bool = False,
+) -> dict[str, Any]:
+    """Judge ``gate`` against its frontier and ``matched``, without surprise.
+
+    ``all_seeds`` uses each order's expected seeds and ``confirmation_seeds`` (if
+    any) only those. ``paired`` gives per order and seed each run's final CE,
+    BWT and path of stages 2 on, with the differences from ``matched`` and the
+    path ratio; they are defined even when a run is off the curve. Each scope's
+    ``pass_both`` is true only when both computations pass.
+    """
+
+    def judged(seeds: Sequence[int] | None) -> dict[str, Any]:
+        verdict = influence_verdict(
+            orders, gate, matched, None, descriptive=descriptive, seeds=seeds
+        )
+        verdict["pass_both"] = bool(
+            verdict["pre_registered"]["pass"] and verdict["envelope_post_hoc"]["pass"]
+        )
+        return verdict
+
+    paired: dict[str, list[dict[str, Any]]] = {}
+    for order_key, order in orders.items():
+        by_label: dict[str, dict[int, Mapping[str, Any]]] = {}
+        for run in order["runs"]:
+            by_label.setdefault(run["label"], {})[run["seed"]] = run
+        rows = []
+        for seed in order["expected_seeds"]:
+            own = by_label.get(gate, {}).get(seed)
+            control = by_label.get(matched, {}).get(seed)
+            path = None if own is None else _stage_path(own)
+            control_path = None if control is None else _stage_path(control)
+            rows.append(
+                {
+                    "seed": seed,
+                    "y": None if own is None else own["y"],
+                    "y_matched": None if control is None else control["y"],
+                    "paired_y": _difference(
+                        None if own is None else own["y"],
+                        None if control is None else control["y"],
+                    ),
+                    "paired_bwt": _difference(
+                        None if own is None else own["bwt"],
+                        None if control is None else control["bwt"],
+                    ),
+                    "path": path,
+                    "path_matched": control_path,
+                    "path_ratio": (
+                        path / control_path
+                        if path is not None and control_path
+                        else None
+                    ),
+                }
+            )
+        paired[order_key] = rows
+    return {
+        "gate": gate,
+        "matched": matched,
+        "descriptive_only": descriptive,
+        "all_seeds": judged(None),
+        "confirmation_seeds": (
+            judged(list(confirmation_seeds)) if confirmation_seeds else None
+        ),
+        "paired": paired,
+    }
+
+
+def select_retention(
+    points: Sequence[Mapping[str, Any]], seq_lr: float, seed: int = 0
+) -> dict[str, Any]:
+    """Pick each method's strength from its pilot runs of one learner at ``seq_lr``.
+
+    A strength qualifies when its mean learning gain over the orders is at least
+    ``SELECTION_GAIN_FRACTION`` of the same mean over the learner's ungated runs
+    of ``seed`` and no run diverged; the qualifying strength with the lowest mean
+    final CE over the orders is selected, the weaker one on an exact tie. A
+    selected end of ``RETENTION_GRIDS`` is flagged under ``endpoint``, not
+    extended. Raises unless every grid strength has one run per order of the
+    ungated runs.
+    """
+    kept = [p for p in points if p["seed"] == seed and math.isclose(p["lr"], seq_lr)]
+    references: dict[tuple[str, ...], Mapping[str, Any]] = {}
+    for point in kept:
+        if _is_reference(point):
+            order = tuple(point["domains"])
+            if order in references:
+                raise ValueError(f"two ungated runs of order {order_name(order)}")
+            references[order] = point
+    if not references:
+        raise ValueError(f"no ungated run at lr {seq_lr:g}, seed {seed}")
+    diverged = [p["run_dir"] for p in references.values() if p.get("diverged")]
+    if diverged:
+        raise ValueError(f"ungated runs diverged: {diverged}")
+    reference_gain = _mean(p["x"] for p in references.values())
+    threshold = SELECTION_GAIN_FRACTION * reference_gain
+    methods: dict[str, Any] = {}
+    for method, grid in RETENTION_GRIDS.items():
+        pilots = [
+            p
+            for p in kept
+            if p.get("retention") == method and not p.get("keep_optimizer_state")
+        ]
+        if not pilots:
+            continue
+        off_grid = sorted(
+            {p["retention_lambda"] for p in pilots} - {float(v) for v in grid}
+        )
+        if off_grid:
+            raise ValueError(
+                f"{method} strengths {off_grid} are not on the grid {grid}"
+            )
+        strengths: list[dict[str, Any]] = []
+        for strength in grid:
+            runs = {
+                order_name(order): [
+                    p
+                    for p in pilots
+                    if tuple(p["domains"]) == order
+                    and p["retention_lambda"] == float(strength)
+                ]
+                for order in references
+            }
+            bad = {k: len(v) for k, v in runs.items() if len(v) != 1}
+            if bad:
+                raise ValueError(
+                    f"{method} lambda {strength:g}: expected one pilot run per "
+                    f"order, found {bad}"
+                )
+            members = [group[0] for group in runs.values()]
+            finished = not any(p.get("diverged") for p in members)
+            gain = _mean(p["x"] for p in members) if finished else None
+            strengths.append(
+                {
+                    "lambda": float(strength),
+                    "mean_gain": gain,
+                    "mean_final_ce": (
+                        _mean(p["y"] for p in members) if finished else None
+                    ),
+                    "gain_fraction": None if gain is None else gain / reference_gain,
+                    "qualifies": gain is not None and gain >= threshold,
+                    "diverged": not finished,
+                    "orders": {
+                        name: {
+                            "run_dir": group[0]["run_dir"],
+                            "x": group[0]["x"],
+                            "y": group[0]["y"],
+                        }
+                        for name, group in runs.items()
+                    },
+                }
+            )
+        qualifying = [row for row in strengths if row["qualifies"]]
+        best = min((row["mean_final_ce"] for row in qualifying), default=None)
+        tied = [row["lambda"] for row in qualifying if row["mean_final_ce"] == best]
+        methods[method] = {
+            "status": "selected" if qualifying else "no_qualifying_strength",
+            "selected": tied[0] if tied else None,
+            "tied": tied if len(tied) > 1 else [],
+            "endpoint": bool(tied) and tied[0] in (float(grid[0]), float(grid[-1])),
+            "strengths": strengths,
+        }
+    return {
+        "seed": seed,
+        "seq_lr": seq_lr,
+        "gain_fraction": SELECTION_GAIN_FRACTION,
+        "reference_gain": reference_gain,
+        "threshold": threshold,
+        "references": {
+            order_name(order): p["run_dir"] for order, p in references.items()
+        },
+        "methods": methods,
+    }
+
+
+def format_selection(selection: Mapping[str, Any]) -> str:
+    """Return every strength of each method, with the selection and its flags."""
+    lines = [
+        f"ungated gain {selection['reference_gain']:.4f}, threshold "
+        f"{selection['threshold']:.4f} (seed {selection['seed']})"
+    ]
+    for method, entry in selection["methods"].items():
+        lines.append(f"{method}:")
+        for row in entry["strengths"]:
+            gain = "-" if row["mean_gain"] is None else f"{row['mean_gain']:.4f}"
+            final = (
+                "-" if row["mean_final_ce"] is None else f"{row['mean_final_ce']:.4f}"
+            )
+            fraction = (
+                "-" if row["gain_fraction"] is None else f"{row['gain_fraction']:.3f}"
+            )
+            mark = " <- selected" if row["lambda"] == entry["selected"] else ""
+            lines.append(
+                f"  lambda {row['lambda']:<8g} gain {gain} ({fraction}) "
+                f"final CE {final} qualifies {row['qualifies']}"
+                f"{' diverged' if row['diverged'] else ''}{mark}"
+            )
+        if entry["selected"] is None:
+            lines.append(f"  {method}: NO QUALIFYING STRENGTH, no confirmation")
+        else:
+            if entry["endpoint"]:
+                lines.append(
+                    f"  {method}: ENDPOINT selected ({entry['selected']:g}), not extended"
+                )
+            if entry["tied"]:
+                lines.append(f"  {method}: exact tie {entry['tied']}, weakest selected")
+    return "\n".join(lines)
 
 
 def _both_orders(orders: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -943,6 +1198,8 @@ def format_table(result: Mapping[str, Any]) -> str:
             lines.append(f"  {name}: pass={entry['pass']} {entry['status']}")
             for order, rows in entry["orders"].items():
                 for comparison in ("frontier", "vs_matched", "vs_surprise"):
+                    if comparison not in rows:
+                        continue
                     row = rows[comparison]
                     shown = " ".join(
                         "-" if v is None else f"{v:+.4f}" for v in row["values"]
@@ -955,7 +1212,47 @@ def format_table(result: Mapping[str, Any]) -> str:
                         f"    {order} {comparison}: {shown} {row['status']}"
                         + (f" (paired y: {paired})" if paired else "")
                     )
+    for baseline in result.get("baseline_verdicts", []):
+        lines += ["", *_format_baseline(baseline)]
     return "\n".join(lines)
+
+
+def _format_baseline(baseline: Mapping[str, Any]) -> list[str]:
+    """The status table of one ``baseline_verdict``, then its paired values."""
+
+    def text(value: float | None) -> str:
+        return "-" if value is None else f"{value:+.4f}"
+
+    lines = [
+        f"baseline {baseline['gate']} vs {baseline['matched']}"
+        + (" (descriptive only)" if baseline["descriptive_only"] else "")
+    ]
+    for scope in ("all_seeds", "confirmation_seeds"):
+        verdict = baseline[scope]
+        if verdict is None:
+            continue
+        lines.append(f"  {scope} pass under both: {verdict['pass_both']}")
+        for name in ("pre_registered", "envelope_post_hoc"):
+            entry = verdict[name]
+            lines.append(f"  {scope} {name}: pass={entry['pass']} {entry['status']}")
+            for order, rows in entry["orders"].items():
+                for comparison in ("frontier", "vs_matched"):
+                    row = rows[comparison]
+                    shown = " ".join(text(v) for v in row["values"])
+                    lines.append(
+                        f"    {order} {comparison} seeds {rows['seeds']}: {shown} "
+                        f"{row['status']}"
+                    )
+    for order, rows in baseline["paired"].items():
+        for row in rows:
+            path = "-" if row["path"] is None else f"{row['path']:.4g}"
+            ratio = "-" if row["path_ratio"] is None else f"{row['path_ratio']:.4f}"
+            lines.append(
+                f"  {order} seed {row['seed']}: paired final CE "
+                f"{text(row['paired_y'])}, paired BWT {text(row['paired_bwt'])}, "
+                f"path {path}, path ratio {ratio}"
+            )
+    return lines
 
 
 def _marker(beta: float | None, label: str, others: list[str]) -> str:
