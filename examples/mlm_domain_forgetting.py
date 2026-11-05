@@ -47,6 +47,7 @@ Usage:
     other domain order), freeze for --gate_modules (module or group names:
     embeddings, blocks_0-1, blocks_2-3, blocks, head, mlp), uniform for a
     constant --gate_scale on every block module (the step-size control),
+    uniform_all for it on every parameterised module,
     online_protect / online_surprise for block multipliers refreshed every
     --gate_interval updates from the live energy smoothed with --gate_ema
     (schedules in gate_schedule_stage_<s>.jsonl), with --gate_variant live,
@@ -61,6 +62,11 @@ Usage:
     adds GAMMA times the backpropagated error norm at eps = 0 to the
     objective; --update_scale_modules NAME... --update_scale KAPPA multiplies
     those modules' final AdamW update by KAPPA (composes with --gate).
+
+    Retention baselines (ungated, stage 2 on): --retention l2sp|ewc
+    --retention_lambda LAMBDA adds the penalty's gradient before the clip for
+    every learner; --keep_optimizer_state carries AdamW's moments and its
+    bias-correction count across stages, the schedule restarting.
 
     $ETA has no default worth reusing. The MLM head energy is
     s * sum(masked CE) (a fixed per-token precision), so latent gradients, and
@@ -127,6 +133,7 @@ from fabricpc.experiments.domain_forgetting.runner import (
     MODES,
     MUPC_MODES,
     PC_INFERENCE,
+    RETENTION,
     GATES,
     GATE_MAP_SOURCES,
     GATE_VARIANTS,
@@ -350,7 +357,7 @@ def build_parser(output_required: bool = True) -> argparse.ArgumentParser:
         "--gate_scale",
         type=float,
         default=defaults.gate_scale,
-        help="Block-module multiplier of --gate uniform",
+        help="Multiplier of --gate uniform (block modules) or uniform_all (all)",
     )
     parser.add_argument(
         "--gate_interval",
@@ -408,6 +415,26 @@ def build_parser(output_required: bool = True) -> argparse.ArgumentParser:
         metavar="KAPPA",
         help="Multiplier of the --update_scale_modules updates, after AdamW and "
         "any gate",
+    )
+    parser.add_argument(
+        "--retention",
+        choices=RETENTION,
+        default=defaults.retention,
+        help="Weight penalty from stage 2 on: l2sp anchors at the current stage's "
+        "start, ewc keeps an anchor and diagonal Fisher per finished stage",
+    )
+    parser.add_argument(
+        "--retention_lambda",
+        type=float,
+        default=defaults.retention_lambda,
+        metavar="LAMBDA",
+        help="Penalty strength; 0 leaves the run unchanged",
+    )
+    parser.add_argument(
+        "--keep_optimizer_state",
+        action="store_true",
+        help="Keep AdamW's moments and bias-correction count across stages; the "
+        "learning-rate schedule still restarts in each stage",
     )
     parser.add_argument("--log_interval", type=int, default=defaults.log_interval)
     resume = parser.add_mutually_exclusive_group()
@@ -601,6 +628,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         pc_error_norm_penalty=args.pc_error_norm_penalty,
         update_scale_modules=tuple(args.update_scale_modules),
         update_scale=args.update_scale,
+        retention=args.retention,
+        retention_lambda=args.retention_lambda,
+        keep_optimizer_state=args.keep_optimizer_state,
         log_interval=args.log_interval,
     )
 

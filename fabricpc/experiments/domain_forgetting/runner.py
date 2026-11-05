@@ -162,6 +162,7 @@ GATES = (
     "oracle",
     "freeze",
     "uniform",
+    "uniform_all",
     *ONLINE_GATES,
 )
 GATE_VARIANTS = ("live", "type", "shuffle", "inverse", "replay", "past")
@@ -185,6 +186,7 @@ GATE_SETTINGS = {
     "oracle": ("gate_beta", "gate_source"),
     "freeze": ("gate_modules",),
     "uniform": ("gate_scale",),
+    "uniform_all": ("gate_scale",),
     "online_protect": ("gate_beta", *ONLINE_SETTINGS),
     "online_surprise": ONLINE_SETTINGS,
     "online_influence": (*ONLINE_SETTINGS, "gate_influence_alpha"),
@@ -239,6 +241,7 @@ COMPARE_IGNORED_KEYS = (
     *GRAD_NOISE_SETTINGS,
 )
 COMPARE_KEPT_PC_KEYS = ("pc_error_norm_penalty",)
+RETENTION = ("none", "l2sp", "ewc")
 ANALYSIS_FILES = (
     "drift.json",
     "rollback.json",
@@ -262,12 +265,14 @@ RUN_ARTIFACT_FILES = (
     "alignment.jsonl",
     "regime.jsonl",
     "gates.jsonl",
+    "retention.jsonl",
     *ANALYSIS_FILES,
 )
 RUN_ARTIFACT_PATTERNS = (
     "stage_*.npz",
     "training_log_stage_*.jsonl",
     "gate_schedule_stage_*.jsonl",
+    "optimizer_state_stage_*.npz",
 )
 
 
@@ -325,6 +330,18 @@ class RunConfig:
     (finite, positive) multiply those modules' final AdamW update by κ in
     every stage, composing with any gate by multiplication; κ = 1 or no
     modules leaves the run unchanged.
+
+    ``retention`` (``RETENTION``) and ``retention_lambda`` λ add a weight
+    penalty's gradient to every update of stage 2 on (``retention_penalty``):
+    ``"l2sp"`` anchors at the start of the current stage (Li, Grandvalet &
+    Davoine 2018), ``"ewc"`` keeps one anchor and diagonal Fisher per finished
+    stage (Kirkpatrick et al. 2017; ``retention.stage_fisher``); λ = 0 leaves
+    the run unchanged. ``keep_optimizer_state`` carries AdamW's moments and its
+    bias-correction count across stages, the learning-rate schedule restarting
+    as usual (``OptimizerCarry``). These need an ungated sequential run without
+    the other interventions, and ``retention`` needs
+    ``pc_output_energy_scale`` 1, because λ and the Fisher are in units of the
+    mean-CE gradient.
     """
 
     checkpoint: str
@@ -392,6 +409,9 @@ class RunConfig:
     pc_error_norm_penalty: float = 0.0
     update_scale_modules: tuple[str, ...] = ()
     update_scale: float = 1.0
+    retention: str = "none"
+    retention_lambda: float = 0.0
+    keep_optimizer_state: bool = False
     log_interval: int = 10
 
     def validate(self) -> None:
@@ -439,6 +459,45 @@ class RunConfig:
         self._validate_mupc()
         self._validate_gate()
         self._validate_intervention()
+        self._validate_retention()
+
+    def _validate_retention(self) -> None:
+        """Retention and the moment carry apply to plain sequential runs."""
+        if self.retention not in RETENTION:
+            raise ValueError(
+                f"retention must be one of {RETENTION}, got {self.retention!r}"
+            )
+        weight = self.retention_lambda
+        if not (math.isfinite(weight) and weight >= 0.0):
+            raise ValueError("retention_lambda must be finite and non-negative")
+        if self.retention == "none" and weight != 0.0:
+            raise ValueError("retention_lambda needs retention 'l2sp' or 'ewc'")
+        if self.retention == "none" and not self.keep_optimizer_state:
+            return
+        if self.training != "sequential":
+            raise ValueError("retention and keep_optimizer_state need sequential runs")
+        others = [
+            name
+            for name, used in (
+                ("gate", self.gate != "none"),
+                ("grad_noise_cosine", self.grad_noise_cosine is not None),
+                ("pc_mupc", self.pc_mupc != "off"),
+                ("pc_error_norm_penalty", self.pc_error_norm_penalty != 0.0),
+                ("update_scale_modules", bool(self.update_scale_modules)),
+            )
+            if used
+        ]
+        if others:
+            raise ValueError(
+                f"retention and keep_optimizer_state do not combine with "
+                f"{', '.join(others)}"
+            )
+        if (
+            self.retention != "none"
+            and self.mode == "pc"
+            and self.pc_output_energy_scale != 1.0
+        ):
+            raise ValueError("retention needs pc_output_energy_scale 1")
 
     def _validate_intervention(self) -> None:
         """The error-norm penalty and the per-module update scale."""
@@ -752,12 +811,14 @@ class RunConfig:
         runs and both gradient-noise settings for runs without it, so their
         identity is unchanged from before joint training, gates, the
         controller and gradient noise existed; ``pc_mupc`` is left out when
-        off. ``gate_scale`` is kept only for ``uniform``, the online gate
-        settings only for ``ONLINE_GATES`` and ``gate_influence_alpha`` only
+        off. ``gate_scale`` is kept only for ``uniform`` and ``uniform_all``, the
+        online gate settings only for ``ONLINE_GATES`` and ``gate_influence_alpha`` only
         for ``online_influence``; ``gate_map_source`` is left out at
         ``"bp"``. ``pc_error_norm_penalty`` is left
         out at 0 and both update-scale settings without
-        ``update_scale_modules``, so runs from before they existed resume.
+        ``update_scale_modules``, so runs from before they existed resume;
+        likewise both retention settings at ``"none"`` and
+        ``keep_optimizer_state`` when off.
         """
         values = asdict(self)
         for key in RESUME_IGNORED_KEYS:
@@ -770,7 +831,7 @@ class RunConfig:
         else:
             values["gate_modules"] = list(self.gate_modules)
             values["gate_source"] = list(self.gate_source)
-            if values["gate"] != "uniform":
+            if values["gate"] not in ("uniform", "uniform_all"):
                 values.pop("gate_scale")
             if values["gate"] not in ONLINE_GATES:
                 for key in ("gate_interval", "gate_ema", "gate_variant"):
@@ -798,6 +859,11 @@ class RunConfig:
             values.pop("update_scale")
         else:
             values["update_scale_modules"] = list(self.update_scale_modules)
+        if values["retention"] == "none":
+            values.pop("retention")
+            values.pop("retention_lambda")
+        if not values["keep_optimizer_state"]:
+            values.pop("keep_optimizer_state")
         values["domains"] = list(self.domains)
         return values
 
@@ -1074,6 +1140,72 @@ def build_stage_optimizer(
         optimizer = optax.chain(optimizer, scale_module_updates(update_scales))
         info["update_scale"] = {k: float(v) for k, v in update_scales.items()}
     return optimizer, info
+
+
+@dataclass
+class OptimizerCarry:
+    """AdamW's state between stages, for ``keep_optimizer_state``.
+
+    ``moments`` holds ``mu``, ``nu`` and ``count``, the update count Adam's bias
+    correction reads, which keeps counting across stages: update ``n`` of a
+    later stage corrects with ``1 − β^(c + n)``, ``c`` the updates so far. The
+    schedule has its own count in the fresh optimizer state, so it restarts at
+    0 and the warmup and cosine run again in every stage.
+    """
+
+    moments: optax.ScaleByAdamState | None = None
+
+
+def adam_moments(opt_state: Any) -> optax.ScaleByAdamState:
+    """The single ``ScaleByAdamState`` of a stage optimizer's state."""
+    found = [
+        leaf
+        for leaf in jax.tree_util.tree_leaves(
+            opt_state, is_leaf=lambda x: isinstance(x, optax.ScaleByAdamState)
+        )
+        if isinstance(leaf, optax.ScaleByAdamState)
+    ]
+    if len(found) != 1:
+        raise ValueError(f"expected one Adam state, found {len(found)}")
+    return found[0]
+
+
+def with_adam_moments(opt_state: Any, moments: optax.ScaleByAdamState) -> Any:
+    """``opt_state`` with its Adam state replaced and every other count kept."""
+    return jax.tree_util.tree_map(
+        lambda leaf: moments if isinstance(leaf, optax.ScaleByAdamState) else leaf,
+        opt_state,
+        is_leaf=lambda x: isinstance(x, optax.ScaleByAdamState),
+    )
+
+
+def save_adam_moments(path: str | Path, moments: optax.ScaleByAdamState) -> str:
+    """Atomically save ``count``, ``mu`` and ``nu``; return the file's SHA-256."""
+    atomic_save_npz(
+        path,
+        {
+            "count": np.asarray(moments.count),
+            **{f"mu/{k}": v for k, v in flatten_params(moments.mu).items()},
+            **{f"nu/{k}": v for k, v in flatten_params(moments.nu).items()},
+        },
+    )
+    return file_sha256(path)
+
+
+def load_adam_moments(
+    path: str | Path, structure: GraphStructure
+) -> optax.ScaleByAdamState:
+    """Load a ``save_adam_moments`` file."""
+    flat = load_npz(path)
+    return optax.ScaleByAdamState(
+        count=jnp.asarray(flat["count"]),
+        mu=params_from_flat(
+            {k[3:]: v for k, v in flat.items() if k.startswith("mu/")}, structure
+        ),
+        nu=params_from_flat(
+            {k[3:]: v for k, v in flat.items() if k.startswith("nu/")}, structure
+        ),
+    )
 
 
 def resolve_update_scale_modules(
@@ -1381,6 +1513,39 @@ def module_grad_norms(grads: GraphParams) -> dict[str, jax.Array]:
         for name, node in grads.nodes.items()
         if jax.tree_util.tree_leaves(node)
     }
+
+
+@jax.jit
+def retention_penalty(
+    params: GraphParams,
+    terms: Sequence[tuple[GraphParams, GraphParams | None]],
+    weight: jax.Array,
+) -> tuple[jax.Array, GraphParams]:
+    """Return ``½λ Σ_k Σ_i F_k,i (θ_i − θ_k,i)²`` and its gradient in θ.
+
+    ``terms`` holds one ``(θ_k, F_k)`` per anchor; ``F_k`` None is the identity,
+    which gives L2-SP's ``½λ‖θ − θ_k‖²`` (Li, Grandvalet & Davoine 2018) and
+    otherwise EWC with separate per-stage terms (Kirkpatrick et al. 2017).
+    λ is traced and a change in the number of terms retraces, so this compiles
+    at most once per stage.
+    """
+    value = jnp.zeros(())
+    total = jax.tree_util.tree_map(jnp.zeros_like, params)
+    for anchor, fisher in terms:
+        delta = jax.tree_util.tree_map(jnp.subtract, params, anchor)
+        curvature = (
+            delta
+            if fisher is None
+            else jax.tree_util.tree_map(jnp.multiply, fisher, delta)
+        )
+        for left, right in zip(
+            jax.tree_util.tree_leaves(curvature),
+            jax.tree_util.tree_leaves(delta),
+            strict=True,
+        ):
+            value = value + 0.5 * jnp.vdot(left, right).astype(value.dtype)
+        total = jax.tree_util.tree_map(jnp.add, total, curvature)
+    return weight * value, _scaled(total, weight)
 
 
 def error_norm_penalty_gradient(
@@ -1888,6 +2053,8 @@ def train_stage(
     regime_fn: Callable[[int, int, GraphParams, float | None], None] | None = None,
     gate_fn: Callable[[int, GraphParams, Any], Any] | None = None,
     penalty_fn: PenaltyFn | None = None,
+    retention_terms: Sequence[tuple[GraphParams, GraphParams | None]] = (),
+    carry: OptimizerCarry | None = None,
     verbose: bool = True,
 ) -> tuple[GraphParams, dict[str, Any], list[dict[str, Any]]]:
     """Train one domain from ``params`` with a fresh optimizer and schedule.
@@ -1936,6 +2103,17 @@ def train_stage(
     per-module versions ``module_task_grad_norms`` and
     ``module_penalty_grad_norms``. The update scale
     (``update_scale_multipliers``) applies in every stage.
+    With ``retention_terms`` (``retention_penalty``, weighted by
+    ``retention_lambda``) each update's accumulated gradient adds the
+    penalty's gradient before the clip, for every learner, so ``grad_norm`` and
+    ``clipped`` describe the sum; the learner's inference and the ePC rate
+    controller never see it. Each log entry adds ``retention_penalty``
+    (λ included), ``task_grad_norm`` and ``retention_grad_norm`` and their
+    per-module versions ``module_task_grad_norms`` and
+    ``module_retention_grad_norms``.
+    ``carry`` (``OptimizerCarry``) starts the stage from the moments it holds
+    and receives the stage's last ones; the exposure's optimizer record adds
+    ``adam_count_start`` and ``adam_count_end``.
     Returns the params, the exposure record and the log.
     """
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
@@ -1969,8 +2147,11 @@ def train_stage(
     if penalty_weight and penalty_fn is None:
         penalty_fn = make_error_norm_penalty_fn(structure)
     opt_state = optimizer.init(params)
+    if carry is not None and carry.moments is not None:
+        opt_state = with_adam_moments(opt_state, carry.moments)
     if gate_fn is not None:
         opt_state = gate_fn(0, params, opt_state)
+    retention_weight = jnp.asarray(config.retention_lambda, jnp.float32)
     update_fn = jax.jit(
         lambda p, o, g, c: _apply_optimizer_update_when_masked(
             params=p, opt_state=o, grads=g, optimizer=optimizer, masked_count=c
@@ -2055,6 +2236,24 @@ def train_stage(
                     },
                 }
                 pending_grads = _tree_sum(pending_grads, penalty_grads)
+            retention_record = None
+            if retention_terms:
+                retention_value, retention_grads = retention_penalty(
+                    params, tuple(retention_terms), retention_weight
+                )
+                retention_record = {
+                    "retention_penalty": float(retention_value),
+                    "task_grad_norm": float(clip_norm_fn(pending_grads)),
+                    "retention_grad_norm": float(clip_norm_fn(retention_grads)),
+                    "module_task_grad_norms": {
+                        k: float(v) for k, v in module_grad_norms(pending_grads).items()
+                    },
+                    "module_retention_grad_norms": {
+                        k: float(v)
+                        for k, v in module_grad_norms(retention_grads).items()
+                    },
+                }
+                pending_grads = _tree_sum(pending_grads, retention_grads)
             noise_achieved = None
             if config.grad_noise_cosine is not None:
                 pending_grads, achieved = noise_gradients(
@@ -2094,6 +2293,8 @@ def train_stage(
                 entry["error_norm_penalty"] = penalty
                 entry["error_norm_penalty_weighted"] = penalty_weight * penalty
                 entry.update(components)
+            if retention_record is not None:
+                entry.update(retention_record)
             if noise_achieved is not None:
                 entry["grad_noise_cosine"] = config.noise_cosine(stage)
                 entry["grad_noise_mode"] = config.grad_noise_mode
@@ -2176,6 +2377,11 @@ def train_stage(
             pending_keys = []
             if updates >= num_updates:
                 break
+    if carry is not None:
+        start = 0 if carry.moments is None else int(carry.moments.count)
+        carry.moments = adam_moments(opt_state)
+        optimizer_info["adam_count_start"] = start
+        optimizer_info["adam_count_end"] = int(carry.moments.count)
     tokens_per_update = config.batch_size * (seq_len - 1)
     exposure = {
         "updates": updates,
@@ -2515,6 +2721,16 @@ def run_domain_forgetting(
     record judges the controller's current rate and marks
     ``eta_controlled``; ``run_config.json`` holds the controller under
     ``pc.eta_control``.
+    With ``retention`` and λ > 0, every stage from the second trains with the
+    penalty's terms in its exposure record and ``retention.jsonl`` holds one
+    record per Fisher computed. A stage's Fisher is computed from its final
+    weights just before the next stage trains, so the last stage has none and a
+    resumed run recomputes it from the verified snapshot, the same computation
+    whether or not the run was interrupted; a recomputed Fisher whose SHA-256
+    differs from its record raises. With ``keep_optimizer_state`` every trained
+    stage writes ``optimizer_state_stage_<s>.npz`` (``save_adam_moments``) and
+    records its SHA-256 in its manifest entry; a stage whose file does not
+    verify is retrained.
     """
     config.validate()
     domains = list(config.domains)
@@ -2643,6 +2859,34 @@ def run_domain_forgetting(
             "placement": "after AdamW and any gate (scales the final update, "
             "weight decay included); every stage",
         }
+    if config.retention != "none":
+        run_config["retention"] = {
+            "method": config.retention,
+            "lambda": config.retention_lambda,
+            "penalty": (
+                "0.5 * lambda * |theta - theta_s|^2, theta_s the weights at the "
+                "start of the current stage"
+                if config.retention == "l2sp"
+                else "0.5 * lambda * sum over finished stages k of "
+                "sum_i F_k,i (theta_i - theta_k,i)^2, theta_k the end of stage k"
+            ),
+            "applied": "lambda-weighted gradient added after accumulation, "
+            "before the clip, in stages 2 on, all modules",
+            **(
+                {
+                    "fisher": "mean over batches of the squared batch mean-CE "
+                    "gradient, a batch approximation, backprop graph, dropout off, "
+                    "256 spaced train windows, batch 8, fixed masks"
+                }
+                if config.retention == "ewc"
+                else {}
+            ),
+        }
+    if config.keep_optimizer_state:
+        run_config["optimizer_state"] = {
+            "kept": ["mu", "nu", "adam count"],
+            "restarted": ["schedule count"],
+        }
     run_config_path = output / "run_config.json"
     previous_config = _read_json(run_config_path) if resume else None
     if previous_config is not None and json.loads(
@@ -2672,6 +2916,7 @@ def run_domain_forgetting(
     previous_alignment = _read_jsonl(output / "alignment.jsonl") if resume else []
     previous_gates = _read_jsonl(output / "gates.jsonl") if resume else []
     previous_regime = _read_jsonl(output / "regime.jsonl") if resume else []
+    previous_retention = _read_jsonl(output / "retention.jsonl") if resume else []
     regime_records: list[dict[str, Any]] = []
     regime_probe = None
     if config.pc_regime_interval:
@@ -2771,6 +3016,56 @@ def run_domain_forgetting(
         else None
     )
     alignment_records: list[dict[str, Any]] = []
+    retention_on = config.retention != "none" and config.retention_lambda > 0.0
+    retention_records: list[dict[str, Any]] = []
+    fisher_terms: list[tuple[GraphParams, GraphParams | None]] = []
+    finished_params: dict[int, GraphParams] = {}
+    fisher_step: tuple[GraphStructure, Any] | None = None
+    carry = OptimizerCarry() if config.keep_optimizer_state else None
+
+    def stage_retention_terms(
+        stage: int, stage_params: GraphParams
+    ) -> tuple[list[tuple[GraphParams, GraphParams | None]], float]:
+        """The penalty's terms for ``stage`` and the seconds spent on Fishers."""
+        nonlocal fisher_step
+        if not retention_on or stage < 2:
+            return [], 0.0
+        if config.retention == "l2sp":
+            return [(stage_params, None)], 0.0
+        from fabricpc.experiments.domain_forgetting.retention import (
+            fisher_structure,
+            make_squared_gradient_fn,
+            stage_fisher,
+        )
+
+        started = time.time()
+        if fisher_step is None:
+            structure = fisher_structure(base.model_config, config)
+            fisher_step = structure, make_squared_gradient_fn(structure)
+        for finished in range(len(fisher_terms) + 1, stage):
+            domain_name = stage_domains[finished - 1]
+            fisher, record = stage_fisher(
+                finished_params[finished],
+                caches[domain_name].train,
+                fisher_step[0],
+                fisher_step[1],
+                base.special_ids,
+                config=config,
+                stage=finished,
+                domain=domain_name,
+            )
+            fisher_terms.append((finished_params[finished], fisher))
+            known = [r for r in retention_records if int(r["stage"]) == finished]
+            if not known:
+                retention_records.append(record)
+            elif known[0]["fisher_sha256"] != record["fisher_sha256"]:
+                raise ValueError(
+                    f"stage {finished}: the recomputed Fisher differs from the one "
+                    "the run trained with (retention.jsonl); was the run moved to "
+                    "another device? rerun it with --overwrite"
+                )
+        _write_jsonl(output / "retention.jsonl", retention_records)
+        return list(fisher_terms), time.time() - started
 
     def record_alignment(
         stage: int,
@@ -2865,9 +3160,19 @@ def run_domain_forgetting(
                     output=output,
                 ):
                     reused = None
+            if reused is not None and carry is not None and domain is not None:
+                moments_path = output / f"optimizer_state_stage_{stage}.npz"
+                if moments_path.is_file() and file_sha256(
+                    moments_path
+                ) == previous_stages[stage].get("optimizer_state_sha256"):
+                    carry.moments = load_adam_moments(moments_path, base.structure)
+                else:
+                    reused = None
             reusing = reused is not None
         if reused is not None:
             params = reused
+            if config.retention == "ewc":
+                finished_params[stage] = params
             entry = previous_stages[stage]
             stages.append(entry)
             for name in domains:
@@ -2885,6 +3190,9 @@ def run_domain_forgetting(
             gate_records.extend(r for r in previous_gates if int(r["stage"]) == stage)
             regime_records.extend(
                 r for r in previous_regime if int(r["stage"]) == stage
+            )
+            retention_records.extend(
+                r for r in previous_retention if int(r["stage"]) == stage
             )
             if verbose:
                 print(f"stage={stage} reused params_sha256={parent_sha[:12]}")
@@ -2925,6 +3233,7 @@ def run_domain_forgetting(
                 if regime_probe is not None
                 else (None, [0.0])
             )
+            retention_terms, retention_seconds = stage_retention_terms(stage, params)
             train_start = time.time()
             params, stage_exposure, log = train_stage(
                 params,
@@ -2938,9 +3247,17 @@ def run_domain_forgetting(
                 regime_fn=regime_fn,
                 gate_fn=online_gate,
                 penalty_fn=penalty_fn,
+                retention_terms=retention_terms,
+                carry=carry,
                 verbose=verbose,
             )
             train_seconds = time.time() - train_start - regime_seconds[0]
+            if retention_on:
+                stage_exposure["retention"] = {
+                    "method": config.retention,
+                    "lambda": config.retention_lambda,
+                    "terms": len(retention_terms),
+                }
             if online_gate is not None:
                 train_seconds -= online_gate.seconds
                 schedule_path = output / schedule_name(stage)
@@ -2966,6 +3283,13 @@ def run_domain_forgetting(
                 )
                 _write_jsonl(output / "alignment.jsonl", alignment_records)
         snapshot = save_stage_snapshot(output / f"stage_{stage}.npz", params)
+        if config.retention == "ewc":
+            finished_params[stage] = params
+        moments_sha = None
+        if carry is not None and domain is not None:
+            moments_sha = save_adam_moments(
+                output / f"optimizer_state_stage_{stage}.npz", carry.moments
+            )
         eval_start = time.time()
         results = evaluate_domains(
             params, base.structure, valid_sets, evaluator=evaluator
@@ -2999,6 +3323,8 @@ def run_domain_forgetting(
             **snapshot,
             "exposure": exposure.get(domain) if domain is not None else None,
         }
+        if moments_sha is not None:
+            entry["optimizer_state_sha256"] = moments_sha
         stages.append(entry)
         stage_runtime[str(stage)] = {
             "train_seconds": train_seconds,
@@ -3011,6 +3337,8 @@ def run_domain_forgetting(
             stage_runtime[str(stage)]["regime_seconds"] = regime_seconds[0]
         if gate_plan is not None and domain is not None:
             stage_runtime[str(stage)]["gate_seconds"] = gate_records[-1]["seconds"]
+        if retention_on and domain is not None:
+            stage_runtime[str(stage)]["retention_seconds"] = retention_seconds
         atomic_write_json(output / "exposure.json", exposure)
         atomic_write_json(
             manifest_path,

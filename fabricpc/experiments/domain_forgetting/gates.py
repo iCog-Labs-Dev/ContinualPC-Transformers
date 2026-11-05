@@ -33,6 +33,8 @@ other module keeps 1.
 - ``freeze``: the ``gate_modules`` modules or groups get 0, all others 1.
 - ``uniform``: every block module gets ``gate_scale``, all others 1; the
   step-size control matched to a gate's update path.
+- ``uniform_all``: every parameterised module gets ``gate_scale``; the control
+  for methods that also slow the embeddings and the head.
 
 The online gates (``online_protect``, ``online_surprise``) refresh their
 block multipliers inside a stage (``OnlineGate``). The smoothed energy
@@ -570,7 +572,7 @@ def spaced_windows(stream: np.ndarray, seq_len: int, count: int) -> np.ndarray:
     return np.linspace(first, total - 1, count).astype(np.int64)
 
 
-def spaced_probe(
+def spaced_batches(
     stream: np.ndarray,
     structure: GraphStructure,
     special_ids: Mapping[str, int],
@@ -578,12 +580,8 @@ def spaced_probe(
     num_windows: int,
     mask_prob: float,
     seed: int,
-) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """``spaced_windows`` of the stream as evaluator arrays, and the window indices.
-
-    Masks are drawn with ``seed`` (``map_batches``) and no other random state
-    is read, so the probe depends only on its arguments.
-    """
+) -> tuple[list[dict[str, jax.Array]], np.ndarray]:
+    """``spaced_windows`` of the stream as ``map_batches``, and the window indices."""
     seq_len = int(structure.nodes[structure.task_map["y"]].node_info.shape[0])
     windows = spaced_windows(stream, seq_len, num_windows)
     tokens = np.concatenate(
@@ -600,6 +598,31 @@ def spaced_probe(
     )
     batches = map_batches(
         tokens,
+        structure,
+        special_ids,
+        num_windows=num_windows,
+        mask_prob=mask_prob,
+        seed=seed,
+    )
+    return batches, windows
+
+
+def spaced_probe(
+    stream: np.ndarray,
+    structure: GraphStructure,
+    special_ids: Mapping[str, int],
+    *,
+    num_windows: int,
+    mask_prob: float,
+    seed: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """``spaced_batches`` of the stream as evaluator arrays, and the window indices.
+
+    Masks are drawn with ``seed`` (``map_batches``) and no other random state
+    is read, so the probe depends only on its arguments.
+    """
+    batches, windows = spaced_batches(
+        stream,
         structure,
         special_ids,
         num_windows=num_windows,
@@ -1093,6 +1116,8 @@ class GatePlan:
                 multipliers.update({m: 0.0 for m in self.frozen})
             elif config.gate == "uniform":
                 multipliers.update({m: config.gate_scale for m in self.blocks})
+            elif config.gate == "uniform_all":
+                multipliers.update({m: config.gate_scale for m in self.modules})
             elif config.gate == "oracle":
                 raw = oracle_scores(self.rollbacks, stage, self.blocks)
                 scores = {m: max(v, SCORE_FLOOR) for m, v in raw.items()}
