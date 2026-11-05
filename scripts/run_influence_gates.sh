@@ -16,6 +16,10 @@
 #                orders, seeds 0-2 per learner (24 runs), BP calibration (8 runs),
 #                then infl_commutator_<learner>/commutator.json; ePC calibrates on
 #                epcsuite_commutator_uniform_s* and epcsuite_commutator_none
+#   commutator_surprise  news/wiki 2-stage: online_surprise and its matched uniform,
+#                both orders, seeds 0-2 per learner (24 runs), then
+#                infl_commutator_surprise_<learner>/commutator.json; reuses the
+#                calibration of the commutator step
 #   surprise_bp  BP online_surprise at BP_LR (6 runs), run before verdict: the
 #                reused online_surprise_* runs are at lr 1e-4, so BP's comparison
 #                with surprise is judged on these
@@ -124,7 +128,7 @@ calibration_run() {
 }
 
 matched_scale() {
-  local learner=$1 prefix=$2 stages=$3 order runs=() scale
+  local learner=$1 prefix=$2 stages=$3 gated=${4:-live} order runs=() scale
   local orders=(fwd rev)
   if [ "$stages" = 2 ]; then
     orders=(pair_fwd pair_rev)
@@ -134,7 +138,7 @@ matched_scale() {
       runs+=("$scale=$(calibration_run "$learner" "$prefix" "$scale" "$order")")
     done
   done
-  "$PYTHON" - "$ROOT" "infl_${learner}_${prefix}live" "$stages" "$SEEDS" "${orders[*]}" \
+  "$PYTHON" - "$ROOT" "infl_${learner}_${prefix}${gated}" "$stages" "$SEEDS" "${orders[*]}" \
     "${runs[@]}" <<'PY'
 import sys
 from pathlib import Path
@@ -275,6 +279,37 @@ case "${1:-}" in
         tee -a "$ROOT/infl_commutator_$learner.log"
     done
     ;;
+  commutator_surprise)
+    for learner in $LEARNERS; do
+      source_args=""
+      if [ "$learner" = epc ]; then
+        source_args="--gate_map_source learner"
+      fi
+      for order in pair_fwd pair_rev; do
+        for seed in $SEEDS; do
+          # shellcheck disable=SC2086
+          run "$learner" pair_surprise "$order" "$seed" no --gate online_surprise \
+            "${ONLINE[@]}" $source_args
+        done
+      done
+      c=$(matched_scale "$learner" pair_ 2 surprise)
+      echo "$learner surprise commutator matched gate_scale=$c"
+      for order in pair_fwd pair_rev; do
+        for seed in $SEEDS; do
+          run "$learner" pair_surprise_matched "$order" "$seed" no --gate uniform --gate_scale "$c"
+        done
+      done
+      seed=$(first_seed)
+      gate=$(label_of "$ROOT/infl_${learner}_pair_surprise_pair_fwd_seed${seed}")
+      control=$(label_of "$ROOT/infl_${learner}_pair_surprise_matched_pair_fwd_seed${seed}")
+      "$PYTHON" examples/domain_forgetting_analysis.py commutator \
+        --run_dirs "$ROOT/infl_${learner}_pair_surprise"_pair_*_seed? \
+          "$ROOT/infl_${learner}_pair_surprise_matched"_pair_*_seed? \
+        --commutator_test "$gate" "$control" \
+        --output_dir "$ROOT/infl_commutator_surprise_$learner" 2>&1 |
+        tee -a "$ROOT/infl_commutator_surprise_$learner.log"
+    done
+    ;;
   verdict)
     shopt -s nullglob
     seed=$(first_seed)
@@ -368,7 +403,7 @@ PY
     done
     ;;
   *)
-    sed -n 2,28p "$0"
+    sed -n 2,32p "$0"
     exit 1
     ;;
 esac
