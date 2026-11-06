@@ -21,6 +21,7 @@ import math
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import Any, Callable, Mapping, Sequence
 
 import jax
@@ -61,14 +62,30 @@ UNRESOLVED_STATUSES = (NONFINITE, NOT_STATIONARY, CURVATURE_UNRESOLVED, CENSORED
 SATISFIED_STATUSES = (ACCEPTED, ZERO_SIGNAL)
 
 
+@jax.jit
+def _tree_dot(a: Pytree, b: Pytree) -> jax.Array:
+    """Compiled inner product of two pytrees."""
+    return sum(
+        jnp.sum(x * y)
+        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+    )
+
+
+@jax.jit
+def _tree_axpy(alpha: jax.Array, x: Pytree, y: Pytree) -> Pytree:
+    """Compiled alpha·x + y."""
+    return jax.tree_util.tree_map(lambda xi, yi: alpha * xi + yi, x, y)
+
+
+@jax.jit
+def _tree_scale(alpha: jax.Array, x: Pytree) -> Pytree:
+    """Compiled alpha·x."""
+    return jax.tree_util.tree_map(lambda xi: alpha * xi, x)
+
+
 def tree_dot(a: Pytree, b: Pytree) -> float:
     """Inner product of two pytrees."""
-    return float(
-        sum(
-            jnp.sum(x * y)
-            for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
-        )
-    )
+    return float(_tree_dot(a, b))
 
 
 def tree_norm(a: Pytree) -> float:
@@ -79,12 +96,12 @@ def tree_norm(a: Pytree) -> float:
 
 def tree_axpy(alpha: float, x: Pytree, y: Pytree) -> Pytree:
     """Return alpha·x + y."""
-    return jax.tree_util.tree_map(lambda xi, yi: alpha * xi + yi, x, y)
+    return _tree_axpy(alpha, x, y)
 
 
 def tree_scale(alpha: float, x: Pytree) -> Pytree:
     """Return alpha·x."""
-    return jax.tree_util.tree_map(lambda xi: alpha * xi, x)
+    return _tree_scale(alpha, x)
 
 
 @dataclass(frozen=True)
@@ -562,16 +579,35 @@ def lanczos_memory_bytes(dimension: int, iterations: int) -> int:
     return 8 * dimension * min(iterations, dimension)
 
 
+@partial(jax.jit, donate_argnums=0)
+def _lanczos_step(
+    basis: jax.Array, j: jax.Array, v: jax.Array, w: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Store ``v`` as column ``j`` and orthogonalise ``w`` twice against the basis.
+
+    Basis rows after ``j`` are masked, so one compilation serves every iteration.
+    Returns the basis, the orthogonalised vector, alpha, beta and whether the
+    incoming ``w`` was finite.
+    """
+    finite = jnp.all(jnp.isfinite(w))
+    alpha = v @ w
+    basis = basis.at[j].set(v)
+    mask = (jnp.arange(basis.shape[0]) <= j).astype(w.dtype)
+    for _ in range(2):
+        w = w - basis.T @ ((basis @ w) * mask)
+    return basis, w, alpha, jnp.linalg.norm(w), finite
+
+
 def lanczos_full_reorth(
-    operator: Callable[[np.ndarray], np.ndarray],
+    operator: Callable[[jax.Array], jax.Array],
     start: np.ndarray,
     iterations: int,
     deadline: float | None = None,
 ) -> SpectrumResult:
     """Lanczos with two passes of full reorthogonalisation against the basis.
 
-    Holds the whole basis, ``lanczos_memory_bytes``. Stops early when the Krylov
-    space is exhausted, or at the deadline.
+    Holds the whole basis on the default device, ``lanczos_memory_bytes``. Stops
+    early when the Krylov space is exhausted, or at the deadline.
     """
     started = time.monotonic()
     dimension = start.size
@@ -613,29 +649,27 @@ def lanczos_full_reorth(
             bool(np.all(np.isfinite(values))),
             censored,
             breakdown,
-            basis[:count].T @ vectors[:, 0],
+            np.asarray(basis[:count].T @ jnp.asarray(vectors[:, 0])),
             time.monotonic() - started,
         )
 
     if not math.isfinite(norm) or norm == 0.0:
         return result([], [], None, False, False, False)
-    basis = np.zeros((iterations, dimension), dtype=np.float64)
-    tolerance = math.sqrt(float(np.finfo(np.float64).eps))
-    v = start / norm
+    float_type = jnp.result_type(float)
+    basis = jnp.zeros((iterations, dimension), dtype=float_type)
+    tolerance = math.sqrt(float(jnp.finfo(float_type).eps))
+    v = jnp.asarray(start / norm, dtype=float_type)
     alphas: list[float] = []
     betas: list[float] = []
     for j in range(iterations):
         if deadline is not None and time.monotonic() >= deadline:
             return result(alphas, betas, basis, True, True, False)
-        basis[j] = v
-        w = np.asarray(operator(v), dtype=np.float64)
-        if not np.all(np.isfinite(w)):
+        w = jnp.asarray(operator(v), dtype=float_type)
+        basis, w, alpha, beta, finite = _lanczos_step(basis, j, v, w)
+        if not bool(finite):
             return result(alphas, betas, basis, False, False, False)
-        alpha = float(v @ w)
-        active = basis[: j + 1]
-        for _ in range(2):
-            w = w - active.T @ (active @ w)
-        beta = float(np.linalg.norm(w))
+        alpha = float(alpha)
+        beta = float(beta)
         alphas.append(alpha)
         betas.append(beta)
         scale = max(max(abs(a) for a in alphas), max(betas))
@@ -656,8 +690,8 @@ def tree_spectrum(
     """``lanczos_full_reorth`` of the objective's Hessian at ``x``."""
     flat_start, unravel = ravel_pytree(start)
 
-    def operator(v: np.ndarray) -> np.ndarray:
-        return np.asarray(ravel_pytree(objective.hvp(x, unravel(jnp.asarray(v))))[0])
+    def operator(v: jax.Array) -> jax.Array:
+        return ravel_pytree(objective.hvp(x, unravel(v)))[0]
 
     return lanczos_full_reorth(
         operator, np.asarray(flat_start, dtype=np.float64), iterations, deadline

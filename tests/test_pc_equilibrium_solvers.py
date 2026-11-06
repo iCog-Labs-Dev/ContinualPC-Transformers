@@ -765,7 +765,8 @@ def test_lanczos_matches_dense_eigenvalues_and_reports_the_lowest_vector():
     q, _ = np.linalg.qr(rng.normal(size=(60, 60)))
     values = np.concatenate([[-3.0], np.linspace(0.5, 40.0, 59)])
     matrix = q @ np.diag(values) @ q.T
-    result = lanczos_full_reorth(lambda v: matrix @ v, rng.normal(size=60), 60)
+    with jax.enable_x64(True):
+        result = lanczos_full_reorth(lambda v: matrix @ v, rng.normal(size=60), 60)
     assert result.finite and not result.censored
     assert result.lambda_min == pytest.approx(-3.0, abs=1e-8)
     assert result.lambda_max == pytest.approx(40.0, abs=1e-8)
@@ -779,7 +780,8 @@ def test_lanczos_matches_dense_eigenvalues_and_reports_the_lowest_vector():
 def test_lanczos_keeps_the_basis_orthogonal_past_where_plain_lanczos_fails():
     values = np.concatenate([np.geomspace(1.0, 1e6, 40), np.linspace(0.8, 1.2, 1000)])
     start = np.random.default_rng(0).normal(size=values.size)
-    result = lanczos_full_reorth(lambda v: values * v, start, 150)
+    with jax.enable_x64(True):
+        result = lanczos_full_reorth(lambda v: values * v, start, 150)
     distinct = np.sum(np.diff(result.ritz_values) < 1e-8)
     assert distinct == 0
     assert result.lambda_max == pytest.approx(1e6, rel=1e-8)

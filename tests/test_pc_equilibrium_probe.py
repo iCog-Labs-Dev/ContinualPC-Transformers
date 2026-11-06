@@ -634,7 +634,7 @@ def test_h3_truth_table(records, expected):
 
 
 def test_reorthogonalisation_estimate_counts_all_passes():
-    assert probe.reorth_seconds(10, 5, 1000.0) == pytest.approx(4.0 * 10 * 25 / 1000.0)
+    assert probe.reorth_seconds(10, 5, 1000.0) == pytest.approx(8.0 * 10 * 25 / 1000.0)
     assert probe.measure_flop_rate(100) > 0.0
 
 

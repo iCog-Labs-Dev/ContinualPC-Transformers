@@ -1301,21 +1301,26 @@ def _peak_rss_bytes() -> int:
 
 
 def measure_flop_rate(dimension: int, vectors: int = 20) -> float:
-    """Measured speed of the reorthogonalisation's matrix-vector products, flop/s."""
-    basis = np.ones((vectors, dimension), dtype=np.float64)
-    v = np.ones(dimension, dtype=np.float64)
+    """Measured device speed of the reorthogonalisation's products, flop/s.
+
+    Times a second call so compilation is excluded.
+    """
+    basis = jnp.ones((vectors, dimension), dtype=jnp.result_type(float))
+    v = jnp.ones(dimension, dtype=jnp.result_type(float))
+    product = jax.jit(lambda b, w: b.T @ (b @ w))
+    jax.block_until_ready(product(basis, v))
     started = time.monotonic()
-    np.asarray(basis.T @ (basis @ v))
+    jax.block_until_ready(product(basis, v))
     return 4.0 * vectors * dimension / max(time.monotonic() - started, 1e-9)
 
 
 def reorth_seconds(dimension: int, iterations: int, flop_rate: float) -> float:
     """Reorthogonalisation time of one Lanczos run.
 
-    Two passes per iteration, each two matrix-vector products of 2·k·n flops,
-    summed over k up to the iteration count: 4·n·iterations² flops.
+    Two passes per iteration over the full masked basis, each two matrix-vector
+    products of 2·m·n flops, over m iterations: 8·n·m² flops.
     """
-    return 4.0 * dimension * iterations**2 / flop_rate
+    return 8.0 * dimension * iterations**2 / flop_rate
 
 
 def timing_smoke(
@@ -1370,12 +1375,13 @@ def timing_smoke(
                 Budget(max_passes=timing_passes),
             )
         lanczos_probe = 10
-        spectrum = tree_spectrum(
-            objective,
-            solves["trust_region"].x,
-            _random_like(0, sample.zero_errors),
-            lanczos_probe,
-        )
+        for _ in range(2):
+            spectrum = tree_spectrum(
+                objective,
+                solves["trust_region"].x,
+                _random_like(0, sample.zero_errors),
+                lanczos_probe,
+            )
         per_iter = spectrum.seconds / max(spectrum.iterations, 1)
         reorth = 2.0 * reorth_seconds(dimension, lanczos_iters, flop_rate)
         lanczos_seconds = per_iter * (lanczos_iters * 2 + start_lanczos_iters) + reorth
