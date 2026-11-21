@@ -70,6 +70,8 @@ class LinearExplicitGrad(Linear):
         self_grad = type(energy_obj).grad_latent(
             state.z_latent, state.z_mu, energy_obj.config
         )
+        if state.dual is not None:
+            self_grad = self_grad + state.dual
 
         # Gain-modulated error for input gradients
         gain_mod_error = node_class.compute_gain_mod_error(state, node_info)
@@ -154,9 +156,12 @@ class LinearExplicitGrad(Linear):
     def compute_gain_mod_error(state: NodeState, node_info: NodeInfo) -> jnp.ndarray:
         """Compute gain-modulated error for this node.
 
+        With a PC-ALM dual, -dE/dz_mu is ``error + dual``.
+
         Returns:
-            gain_mod_error array (error * activation derivative)
+            gain_mod_error array ((error + dual) * activation derivative)
         """
         activation = node_info.activation
         f_prime = type(activation).derivative(state.pre_activation, activation.config)
-        return state.error * f_prime
+        error = state.error if state.dual is None else state.error + state.dual
+        return error * f_prime

@@ -324,7 +324,8 @@ class NodeBase(ABC):
            functionals assume this sign (latent minus prediction).
         4. Write the fields back:
            ``state = state._replace(z_mu=..., pre_activation=..., error=...)``.
-           NodeState is a fixed-schema NamedTuple; no other fields may be added.
+           NodeState is a fixed-schema NamedTuple; no other fields may be added,
+           and ``dual`` belongs to the inference algorithm.
         5. Populate energy:
            ``state = node_info.node_class.energy_functional(state, node_info)``.
            This sets ``state.energy`` from ``energy(z_latent, z_mu)``, so ``z_mu``
@@ -537,6 +538,11 @@ class NodeBase(ABC):
         """
         Compute energy E(z_latent, z_mu) and update state.
 
+        When ``state.dual`` is set (InferencePCALM), the constraint term is
+        added via ``add_dual_energy``. Overrides must add it too, and
+        explicit-gradient overrides must add its gradients (``+dual`` on
+        dE/dz_latent, ``-dual`` on dE/dz_mu).
+
         The self-latent gradient (dE/dz_latent) is NOT computed here — it
         is obtained via autodiff in forward_and_latent_grads(). For explicit
         gradient overrides, use ``energy.grad_latent()`` directly.
@@ -558,7 +564,28 @@ class NodeBase(ABC):
         config = energy_obj.config
 
         energy = energy_cls.energy(state.z_latent, state.z_mu, config)
-        return state._replace(energy=energy)
+        return state._replace(energy=add_dual_energy(energy, state))
+
+
+def add_dual_energy(energy: jnp.ndarray, state: NodeState) -> jnp.ndarray:
+    """
+    Add the augmented-Lagrangian term sum(dual * (z_latent - z_mu)) per sample.
+
+    For Gaussian energy with precision p, E + dual . (z - mu) equals
+    p/2 ||z - mu + dual/p||^2 up to a constant; p = 1 is the rho = 1 form of
+    Seely & Gould 2026, arXiv 2605.31022.
+
+    Args:
+        energy: Per-sample energy, shape ``(batch,)``
+        state: NodeState with ``z_latent`` and ``z_mu`` set
+
+    Returns:
+        ``energy`` unchanged when ``state.dual`` is None, else the augmented energy
+    """
+    if state.dual is None:
+        return energy
+    residual = state.z_latent - state.z_mu
+    return energy + jnp.sum(state.dual * residual, axis=tuple(range(1, residual.ndim)))
 
 
 def compute_windowed_output_shape(

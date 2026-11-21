@@ -4,6 +4,8 @@ Core inference dynamics for JAX predictive coding networks.
 This module provides:
 - InferenceBase: Abstract base class for inference algorithms
 - InferenceSGD: Default SGD-based inference (z -= eta * grad)
+- InferenceSGDNormClip: SGD inference with per-node gradient norm clipping
+- InferencePCALM: Augmented Lagrangian PC with per-node dual ascent
 - run_inference: Convenience function wrapping the class-based API
 
 Inference algorithms control how latent states are updated during the
@@ -19,7 +21,7 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Tuple
 import types
 
 import jax
@@ -37,7 +39,7 @@ from fabricpc.core.types import (
     NodeInfo,
     NodeState,
 )
-from fabricpc.core.state_ops import update_node_in_state
+from fabricpc.core.state_ops import drop_duals, update_node_in_state, zero_duals
 
 # =============================================================================
 # Utility Functions
@@ -78,7 +80,12 @@ class InferenceBase(ABC):
     Custom inference algorithms extend this class:
 
     All computation methods are static for JAX compatibility (pure functions, no state).
+
+    Set ``uses_dual = True`` in algorithms that carry a ``NodeState.dual``;
+    ``initialize_graph_state`` then allocates it as zeros.
     """
+
+    uses_dual: bool = False
 
     def __init__(self, **config):
         self.config = types.MappingProxyType(config)  # Immutable dictionary
@@ -110,6 +117,28 @@ class InferenceBase(ABC):
         state = cls.update_latents(params, state, clamps, structure, config)
 
         return state
+
+    @staticmethod
+    def prepare_state(state: GraphState, structure: GraphStructure) -> GraphState:
+        """
+        Prepare the state once before the inference loop.
+
+        Drops any ``dual`` so leftover multipliers cannot enter the energy of
+        an algorithm without duals. Dual-carrying algorithms override this.
+        """
+        return drop_duals(state)
+
+    @staticmethod
+    def final_inference_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Last step of the inference loop; ``inference_step`` by default."""
+        cls = type(structure.config["inference"])
+        return cls.inference_step(params, state, clamps, structure, config)
 
     @staticmethod
     def zero_grads(
@@ -253,21 +282,32 @@ class InferenceBase(ABC):
         Outer inference loop using lax.fori_loop.
 
         Override for scan-based tracking, adaptive stopping, etc.
-        infer_steps is read from self.config['infer_steps'].
+        infer_steps is read from self.config['infer_steps']. Runs
+        ``prepare_state``, ``infer_steps - 1`` calls of ``inference_step``,
+        then ``final_inference_step``.
         """
         inference_obj = structure.config["inference"]
         inference_cls = type(inference_obj)
         config = inference_obj.config
         infer_steps = config["infer_steps"]
 
+        state = inference_cls.prepare_state(initial_state, structure)
+        if infer_steps < 1:
+            return state
+
         def body_fn(t, state):
             return inference_cls.inference_step(
                 params, state, clamps, structure, config
             )
 
-        # Use lax.fori_loop for efficiency
-        final_state = jax.lax.fori_loop(0, infer_steps, body_fn, initial_state)
-        return final_state
+        # A single fori_loop keeps the compiled program unchanged for algorithms
+        # without a distinct final step.
+        if inference_cls.final_inference_step is InferenceBase.final_inference_step:
+            return jax.lax.fori_loop(0, infer_steps, body_fn, state)
+        state = jax.lax.fori_loop(0, infer_steps - 1, body_fn, state)
+        return inference_cls.final_inference_step(
+            params, state, clamps, structure, config
+        )
 
 
 # =============================================================================
@@ -354,6 +394,170 @@ class InferenceSGDNormClip(InferenceBase):
             node_state.z_latent * (1.0 - eta_infer * latent_decay)
             - eta_infer * clipped_grad
         )
+
+
+class InferencePCALM(InferenceBase):
+    """
+    Augmented Lagrangian predictive coding (PC-ALM; Seely & Gould 2026,
+    arXiv 2605.31022).
+
+    Each free node (not clamped, in_degree > 0, out_degree > 0) carries a dual
+    ``lambda`` on the constraint ``z_latent = z_mu`` and its energy becomes
+    ``E(z, mu) + sum(lambda * (z - mu))``. Each step takes a primal SGD step on
+    the augmented energy, then a dual ascent step ``lambda += alpha * (z - mu)``.
+    Duals start at zero for every inference run. The final step is primal-only,
+    so the learning phase sees the duals used in the last primal step.
+
+    With ``alpha = 0`` this is ``InferenceSGD`` (``max_norm=None``) or
+    ``InferenceSGDNormClip`` (``max_norm`` set).
+
+    At a fixed point ``z = mu`` on free nodes and the duals are the negative
+    backprop adjoints, so weight gradients equal backprop's. This needs
+    hidden-node energies with dE/dz = 0 at z = mu (Gaussian, Huber; not
+    cross-entropy, Bernoulli or KL on free hidden nodes). Under muPC the dual
+    path picks up ``topdown_grad_scale``, so each node's adjoint and weight
+    gradient is scaled by the product of the ``jacobian_gain`` factors of the
+    nodes above it (direction unchanged; exact for identity/ReLU activations
+    or without muPC).
+
+    Args:
+        eta_infer: Inference rate (default: 0.1)
+        infer_steps: Number of inference iterations, >= 1 (default: 20)
+        alpha: Dual ascent rate, >= 0 (default: 1.0)
+        dual_timing: ``"sequential"`` evaluates the residual after the primal
+            step (one extra forward pass per step); ``"simultaneous"``
+            (Arrow-Hurwicz) reuses the residual from the step's forward pass.
+        latent_decay: Weight decay on latent states (default: 0.0)
+        max_norm: Per-node per-sample L2 clip on the primal gradient, or None
+            for no clipping (default: None)
+        eps: Small constant for numerical stability in clipping (default: 1e-8)
+    """
+
+    uses_dual = True
+    DUAL_TIMINGS = ("sequential", "simultaneous")
+
+    def __init__(
+        self,
+        eta_infer=0.1,
+        infer_steps=20,
+        alpha=1.0,
+        dual_timing="sequential",
+        latent_decay=0.0,
+        max_norm=None,
+        eps=1e-8,
+    ):
+        if alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {alpha}")
+        if int(infer_steps) != infer_steps or infer_steps < 1:
+            raise ValueError(f"infer_steps must be an integer >= 1, got {infer_steps}")
+        if dual_timing not in InferencePCALM.DUAL_TIMINGS:
+            raise ValueError(
+                f"dual_timing must be one of {InferencePCALM.DUAL_TIMINGS}, "
+                f"got {dual_timing!r}"
+            )
+        if max_norm is not None and max_norm <= 0:
+            raise ValueError(f"max_norm must be > 0 or None, got {max_norm}")
+        super().__init__(
+            eta_infer=eta_infer,
+            infer_steps=int(infer_steps),
+            alpha=alpha,
+            dual_timing=dual_timing,
+            latent_decay=latent_decay,
+            max_norm=max_norm,
+            eps=eps,
+        )
+
+    @staticmethod
+    def compute_new_latent(node_name, node_state, config):
+        if config["max_norm"] is None:
+            return InferenceSGD.compute_new_latent(node_name, node_state, config)
+        return InferenceSGDNormClip.compute_new_latent(node_name, node_state, config)
+
+    @staticmethod
+    def dual_nodes(
+        clamps: Dict[str, jnp.ndarray], structure: GraphStructure
+    ) -> Tuple[str, ...]:
+        """Nodes whose dual is updated: unclamped, with a parent and a child."""
+        return tuple(
+            name
+            for name, node in structure.nodes.items()
+            if name not in clamps
+            and node.node_info.in_degree > 0
+            and node.node_info.out_degree > 0
+        )
+
+    @staticmethod
+    def update_duals(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Dual ascent ``lambda += alpha * (z_latent - z_mu)`` on free nodes."""
+        alpha = config["alpha"]
+        if alpha == 0:
+            return state
+        sequential = config["dual_timing"] == "sequential"
+
+        for node_name in InferencePCALM.dual_nodes(clamps, structure):
+            node_state = state.nodes[node_name]
+            if sequential:
+                node_info = structure.nodes[node_name].node_info
+                in_edges_data = gather_inputs(node_info, structure, state)
+                scaled_inputs = scale_inputs(in_edges_data, node_info.scaling_config)
+                _, projected = node_info.node_class.forward(
+                    params.nodes[node_name], scaled_inputs, node_state, node_info
+                )
+                residual = node_state.z_latent - projected.z_mu
+            else:
+                residual = node_state.error
+            state = update_node_in_state(
+                state, node_name, dual=node_state.dual + alpha * residual
+            )
+
+        return state
+
+    @staticmethod
+    def prepare_state(state: GraphState, structure: GraphStructure) -> GraphState:
+        """Start every inference run with zero duals."""
+        return zero_duals(state)
+
+    @staticmethod
+    def primal_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """SGD step on the augmented energy (zero grads, forward, latent update)."""
+        return InferenceBase.inference_step(params, state, clamps, structure, config)
+
+    @staticmethod
+    def inference_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Primal step on the augmented energy, then dual ascent."""
+        cls = type(structure.config["inference"])
+        state = cls.primal_step(params, state, clamps, structure, config)
+        return cls.update_duals(params, state, clamps, structure, config)
+
+    @staticmethod
+    def final_inference_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Primal-only, so learning sees the duals of the last primal step."""
+        cls = type(structure.config["inference"])
+        return cls.primal_step(params, state, clamps, structure, config)
 
 
 # =============================================================================

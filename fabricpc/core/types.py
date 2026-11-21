@@ -119,6 +119,10 @@ class NodeState(NamedTuple):
         energy: Energy
         pre_activation: Pre-activation values (before activation function)
         latent_grad: Gradients w.r.t. latent states for inference updates
+        dual: Lagrange multipliers on z_latent = z_mu for dual-ascent
+            inference (InferencePCALM), or None for inference algorithms
+            without a dual. Present or absent for a whole inference run, so
+            loop carries keep a fixed pytree structure.
     """
 
     z_latent: jnp.ndarray
@@ -127,6 +131,7 @@ class NodeState(NamedTuple):
     energy: jnp.ndarray  # per-sample energy, shape (batch_size,)
     pre_activation: jnp.ndarray
     latent_grad: jnp.ndarray  # For local gradient accumulation
+    dual: Optional[jnp.ndarray] = None
 
 
 class GraphState(NamedTuple):
@@ -197,6 +202,7 @@ tree_util.register_pytree_node(
             ns.energy,
             ns.pre_activation,
             ns.latent_grad,
+            ns.dual,
         ),
         None,
     ),

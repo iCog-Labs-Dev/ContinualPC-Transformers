@@ -54,15 +54,10 @@ def run_inference_with_history(
     config = inference_obj.config
     infer_steps = config["infer_steps"]
 
-    def scan_fn(
-        state: GraphState, _: None
-    ) -> Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]]:
-        new_state = inference_cls.inference_step(
-            params, state, clamps, structure, config
-        )
+    def step_metrics(new_state: GraphState) -> Dict[str, Dict[str, jnp.ndarray]]:
         # Extract key metrics for history (lightweight)
         # Reduce over batch dimension to get scalar metrics per step
-        step_metrics = {
+        return {
             node_name: {
                 "energy": jnp.mean(node_state.energy),
                 "latent_grad_norm": jnp.mean(
@@ -74,15 +69,32 @@ def run_inference_with_history(
             }
             for node_name, node_state in new_state.nodes.items()
         }
-        return new_state, step_metrics
 
-    # Run inference with scan to collect history
+    def scan_fn(
+        state: GraphState, _: None
+    ) -> Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]]:
+        new_state = inference_cls.inference_step(
+            params, state, clamps, structure, config
+        )
+        return new_state, step_metrics(new_state)
+
+    # Same loop as run_inference: prepare, infer_steps - 1 steps, final step
+    state = inference_cls.prepare_state(initial_state, structure)
     final_state, all_metrics = jax.lax.scan(
         scan_fn,
-        initial_state,
+        state,
         xs=None,
-        length=infer_steps,
+        length=max(infer_steps - 1, 0),
     )
+    if infer_steps >= 1:
+        final_state = inference_cls.final_inference_step(
+            params, final_state, clamps, structure, config
+        )
+        all_metrics = jax.tree_util.tree_map(
+            lambda history, last: jnp.concatenate([history, last[None]]),
+            all_metrics,
+            step_metrics(final_state),
+        )
 
     # Return stacked metrics - unstacking must happen outside JIT
     # all_metrics is a nested dict with stacked arrays of shape (infer_steps,)
@@ -148,10 +160,15 @@ def run_inference_with_full_history(
     infer_steps = config["infer_steps"]
 
     history: List[GraphState] = []
-    state = initial_state
+    state = inference_cls.prepare_state(initial_state, structure)
 
-    for _ in range(infer_steps):
-        state = inference_cls.inference_step(params, state, clamps, structure, config)
+    for t in range(infer_steps):
+        step = (
+            inference_cls.final_inference_step
+            if t == infer_steps - 1
+            else inference_cls.inference_step
+        )
+        state = step(params, state, clamps, structure, config)
         history.append(state)
 
     return state, history

@@ -52,3 +52,30 @@ def set_latents_to_clamps(
                 state, node_name, z_latent=jnp.asarray(clamp_value)
             )
     return state
+
+
+def zero_duals(state: GraphState) -> GraphState:
+    """
+    Set every node's ``dual`` to zeros shaped and typed like ``latent_grad``.
+
+    ``latent_grad`` is the dtype source because a clamped source node's
+    ``z_latent`` may be integer.
+    """
+    return state._replace(
+        nodes={
+            name: node_state._replace(dual=jnp.zeros_like(node_state.latent_grad))
+            for name, node_state in state.nodes.items()
+        }
+    )
+
+
+def drop_duals(state: GraphState) -> GraphState:
+    """Set every node's ``dual`` to None."""
+    if all(node_state.dual is None for node_state in state.nodes.values()):
+        return state
+    return state._replace(
+        nodes={
+            name: node_state._replace(dual=None)
+            for name, node_state in state.nodes.items()
+        }
+    )

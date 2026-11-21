@@ -248,11 +248,11 @@ Within that constraint, every `forward()` must perform these six steps in order:
 1. **Predict `z_mu`**: produce the node's prediction of its own latent, with shape `(batch,) + node_info.shape`. *How* is up to the node — a convolution here, a matmul in `Linear`, an attention pipeline in `TransformerBlock`.
 2. **Record `pre_activation`**: the value before the activation function. If the node applies no activation, set `pre_activation = z_mu`. `pre_activation` is planned for deprecation as persistent attribute of NodeState; it's actually an ephemeral intermediate to `z_mu`.
 3. **Compute the error**: `error = state.z_latent - z_mu`. The energy functionals assume this sign (latent minus prediction).
-4. **Write the fields back**: `state = state._replace(z_mu=..., pre_activation=..., error=...)`. `NodeState` is a fixed-schema NamedTuple (`z_latent, z_mu, error, energy, pre_activation, latent_grad`); no other fields exist or may be added.
+4. **Write the fields back**: `state = state._replace(z_mu=..., pre_activation=..., error=...)`. `NodeState` is a fixed-schema NamedTuple (`z_latent, z_mu, error, energy, pre_activation, latent_grad, dual`); `dual` is owned by the inference algorithm, so leave it untouched. No other fields exist or may be added.
 5. **Populate energy**: `node_class = node_info.node_class; state = node_class.energy_functional(state, node_info)`. This sets `state.energy` from `energy(z_latent, z_mu)`, so `z_mu` must already be set. Extra energy terms (for example the Hopfield attractor term in `StorkeyHopfield`) are added by replacing `state.energy` after this call.
 6. **Return**: `return jnp.sum(state.energy), state` — the scalar total energy first, the updated state second.
 
-A node whose energy depends on one of its input slots (for example a loss mask that selects which positions count) may override the `energy_functional` staticmethod with extra arguments and pass that input at step 5, e.g. `node_class.energy_functional(state, node_info, loss_mask)`. It must still record `pre_activation` and the raw, unmasked `error = z_latent - z_mu`, and call its `energy_functional` at step 5. `MaskedVocabProjectionNode` (encoder_transformer.py) is the worked example: it computes masked cross-entropy from `log_softmax(state.pre_activation)`.
+A node whose energy depends on one of its input slots (for example a loss mask that selects which positions count) may override the `energy_functional` staticmethod with extra arguments and pass that input at step 5, e.g. `node_class.energy_functional(state, node_info, loss_mask)`. It must still record `pre_activation` and the raw, unmasked `error = z_latent - z_mu`, and call its `energy_functional` at step 5. The override must return `add_dual_energy(energy, state)` (from `fabricpc.nodes.base`) so the PC-ALM dual term `Σ dual·(z_latent − z_mu)` is included when `state.dual` is set. `MaskedVocabProjectionNode` (encoder_transformer.py) is the worked example: it computes masked cross-entropy from `log_softmax(state.pre_activation)`.
 
 The steps *between* predicting `z_mu` and writing it back are free: input aggregation, weights and biases, the choice of activation, and any internal sub-structure are all node-specific.
 
@@ -375,7 +375,7 @@ class MyNode(NodeBase):
         return state, NodeParams(weights=weight_grads, biases=bias_grads)
 ```
 
-Note that muPC scaling and accumulation into `state.latent_grad` are handled by the callsite, not inside these overrides. See `LinearExplicitGrad` (`fabricpc/nodes/linear_explicit_grad.py`) for a complete example, including its `compute_gain_mod_error()` helper that combines `state.error` with `activation.derivative()`.
+Note that muPC scaling and accumulation into `state.latent_grad` are handled by the callsite, not inside these overrides. Hand-written gradients must include the PC-ALM dual when `state.dual` is not None: add `+dual` to dE/dz_latent and `−dual` to dE/dz_mu (so the input and weight gradients use `error + dual` in place of `error` for Gaussian energy). See `LinearExplicitGrad` (`fabricpc/nodes/linear_explicit_grad.py`) for a complete example, including its `compute_gain_mod_error()` helper that combines `state.error` with `activation.derivative()`.
 
 ### Multiple Input Slots
 
@@ -411,6 +411,7 @@ class NodeState(NamedTuple):
     energy: jnp.ndarray         # per-sample energy, shape (batch,)
     pre_activation: jnp.ndarray # values before the activation function
     latent_grad: jnp.ndarray    # gradient accumulator for inference updates
+    dual: Optional[jnp.ndarray] = None  # PC-ALM multipliers, set by the inference algorithm
 ```
 
 You cannot add custom fields to it. `state._replace(...)` only updates these existing fields, so there is no place to stash arbitrary per-step memory (such as an RNN hidden vector) on the `NodeState`.
